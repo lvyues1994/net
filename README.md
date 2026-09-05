@@ -3,7 +3,8 @@
 `net` 是一个 C++14 的协程原生 I/O 库，实现 WG21 "Network Endeavor" 系列提案
 （P4003R3《A Minimal Coroutine Execution Model》、P4172R1、P4100R1、P4124R0）描述的
 **IoAwaitable 协议**及其上的 `task<T>`、启动函数、执行器、缓冲区、流概念、组合子，
-以及 Linux（epoll）平台层：`io_context`、TCP/UDP 套接字、定时器、DNS、信号。
+以及 Linux 平台层：`io_context`（epoll / poll / select 三种后端）、TCP/UDP 套接字、
+定时器、DNS、信号。
 
 无栈协程由姊妹库 [co2](../../coro/coro)（C++14 宏生成的状态机，协议与 C++20 协程
 规范同形）提供：提案里写 `co_await f()` 的地方，这里写 `CO2_AWAIT(f())`。
@@ -66,6 +67,7 @@ coroutine_handle<> await_suspend(coroutine_handle<> h, io_env const* env);
 | `when_all`, `when_any` | 同名，I/O 感知（P4124R0 §2 的表） | `when_all.hpp`, `when_any.hpp` |
 | `thread_pool`, `strand`, `any_executor` | 同名 | `thread_pool.hpp`, `strand.hpp`, `any_executor.hpp` |
 | `io_context`, `steady_timer`, `signal_set`, `tcp_socket`, `tcp_acceptor`, `udp_socket`, `resolver`, `ip::*` | 同名（Networking TS 形态去掉 `async_` 与完成令牌） | `io_context.hpp`, `timer.hpp`, `signal_set.hpp`, `tcp.hpp`, `udp.hpp`, `resolver.hpp`, `ip.hpp` |
+| `corosio::epoll` / `select` … 后端标签，`io_context(backend)` | `net::epoll` / `net::poll` / `net::select`，`io_context{net::poll}` | `backend.hpp` |
 
 ## 用法要点
 
@@ -85,6 +87,10 @@ coroutine_handle<> await_suspend(coroutine_handle<> h, io_env const* env);
 **取消**是协作式的：`stop_token` 请求停止 → 未完成的 I/O 以 `error::operation_aborted`
 完成 → 协程照常恢复、走到 `final_suspend` → 拥有者销毁。`when_all` 任一子任务返回 `ec`
 或抛出即向兄弟请求停止；`when_any` 第一个成功者胜出后取消其余。
+
+**后端**：`net::io_context ctx{net::poll};` 选择事件机制（默认 epoll；select 受
+`FD_SETSIZE` 限制）。套接字、定时器等 I/O 对象经抽象接口对接后端，代码与后端无关；
+后端的设计、与 Corosio 的对照以及 io_uring / IOCP 的接入方案见 `docs/backends.md`。
 
 **缓冲区描述符不拥有内存**：`net::buffer(std::string{"x"})` 指向的临时对象在 co_await
 表达式求值后就销毁——要发送的数据必须活到操作完成（帧局部或参数）。
@@ -118,16 +124,30 @@ add_subdirectory(path/to/net)
 target_link_libraries(my-target PRIVATE net::net)
 ```
 
-测试覆盖：task / 环境传播 / 帧分配器、执行器（多线程 `run()`、strand 串行化、服务）、
-缓冲区、流与 `any_stream`（零分配断言）、组合子（错误传播、取消、异常）、定时器、TCP
-回环（取消、EOF、超时、多线程）、UDP、DNS、信号，以及一个契约违规测试。全部测试在
-ASan+UBSan+LSan 与 TSan 下通过。
+测试覆盖：task / 环境传播 / 帧分配器、执行器（多线程 `run()`、strand 串行化、服务、后端
+选择）、缓冲区、流与 `any_stream`（零分配断言）、组合子（错误传播、取消、异常）、定时器、
+TCP 回环（取消、EOF、超时、多线程）、UDP、DNS、信号，以及一个契约违规测试。平台测试为
+epoll / poll / select 各编译一个变体（`<name>`、`<name>_poll`、`<name>_select`）。全部测试
+在 ASan+UBSan+LSan 与 TSan 下通过。
 
 `examples/`：`echo_server`（accept 循环 + `any_stream` 会话 + SIGINT 优雅退出）、
 `echo_client`（DNS + connect + `when_any` 超时读）、`http_get`（`read_until` +
 动态缓冲）、`timers`（组合子 / 线程池 / stop_token）。
 
+## 目录
+
+```
+include/net/            公共头：协议核心、执行器、缓冲区、流、组合子（仅头文件）；平台层的具体层接口
+src/                    具体层：io_context 调度器、套接字/定时器/DNS/信号（只依赖 detail/backend.hpp）
+src/detail/backend.hpp  后端接缝：io_backend / socket_impl / timer_impl（抽象）
+src/detail/posix/       POSIX 系统调用封装
+src/detail/reactor/     就绪型后端族：reactor_backend + epoll / poll / select 解复用器
+docs/                   architecture.md（分层与决策）、backends.md（后端设计与 io_uring / IOCP 接入）
+tests/  examples/
+```
+
 ## 尚未提供
 
 TLS、文件 I/O、Unix 域套接字、`system_context`、回调风格的流概念（`BufferSource` /
-`BufferSink`）、与 `std::execution` 的桥（P4092/P4093）、Windows/macOS 反应器。
+`BufferSink`）、与 `std::execution` 的桥（P4092/P4093）、io_uring / IOCP / kqueue 后端
+（接缝已就位，方案见 `docs/backends.md`）。

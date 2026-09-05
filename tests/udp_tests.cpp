@@ -41,7 +41,7 @@ auto send_one(net::udp_socket* sock, net::ip::udp::endpoint target, std::string 
 CO2_END
 
 void datagram_roundtrip() {
-    net::io_context ctx;
+    test_context ctx;
     net::udp_socket receiver{ctx, net::ip::udp::endpoint{net::ip::address_v4::loopback(), 0}};
     net::udp_socket sender{ctx, net::ip::udp::endpoint{net::ip::address_v4::loopback(), 0}};
     net::ip::udp::endpoint from;
@@ -77,7 +77,7 @@ auto reflect(net::udp_socket* sock) CO2_BEG(net::task<>, (sock), char buf[16]; n
 CO2_END
 
 void connected_socket_uses_send_and_receive() {
-    net::io_context ctx;
+    test_context ctx;
     net::udp_socket server{ctx, net::ip::udp::endpoint{net::ip::address_v4::loopback(), 0}};
     net::udp_socket client{ctx};
     CHECK(not client.connect(local_of(server)));
@@ -96,7 +96,7 @@ auto blocked_receive(net::udp_socket* sock) CO2_BEG((net::task<std::error_code>)
 CO2_END
 
 void cancel_aborts_a_pending_receive() {
-    net::io_context ctx;
+    test_context ctx;
     net::udp_socket sock{ctx, net::ip::udp::endpoint{net::ip::address_v4::loopback(), 0}};
     std::error_code ec;
     net::run_async(ctx.get_executor(), [&](std::error_code e) { ec = e; }, [](std::exception_ptr) { CHECK(false); })(blocked_receive(&sock));

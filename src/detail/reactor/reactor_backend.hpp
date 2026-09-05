@@ -1,0 +1,107 @@
+#pragma once
+
+#include <memory>
+#include <mutex>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+#include "net/execution_context.hpp"
+
+#include "detail/backend.hpp"
+#include "detail/reactor/demultiplexer.hpp"
+#include "detail/reactor/reactor_op.hpp"
+
+// 就绪型 io_backend：描述符表 + 就绪位 + 每方向一个操作的排队 + 定时器二叉堆 + 信号泵。
+// 等待机制由注入的 demultiplexer 提供。作为服务注册在 io_context 里（键 io_backend）。
+//
+// 工作计数：每个排队中的操作与定时器持有 io_context 的一份工作（counts_as_work 为假的
+// 常驻监听除外）。
+
+namespace net {
+namespace detail {
+
+struct reactor_backend final : execution_context::service, io_backend, event_sink {
+    using key_type = io_backend;
+
+    reactor_backend(execution_context& context, std::unique_ptr<demultiplexer> demux);
+    ~reactor_backend() override;
+
+    // ---- io_backend ----
+    void run(long timeout_ms) override;
+    void interrupt() noexcept override;
+    std::unique_ptr<socket_impl> create_socket(io_context& context) override;
+    std::unique_ptr<timer_impl> create_timer(io_context& context) override;
+    std::error_code register_signal_reader(int read_fd,
+                                           void (*deliver)(int signal_number)) noexcept override;
+    char const* name() const noexcept override { return demux_->name(); }
+
+    // ---- 就绪型内部协议（reactor_socket / reactor_timer 使用） ----
+
+    io_context& context() noexcept { return *context_; }
+
+    std::error_code register_descriptor(descriptor_state& state, int fd) noexcept;
+    // 从解复用器摘除并取消两个方向的操作（以 operation_aborted 完成）。
+    void deregister_descriptor(descriptor_state& state) noexcept;
+
+    // 启动操作。就绪位命中时先在调用线程上 perform()：完成则返回 true（调用方自己恢复
+    // 协程，不会再调用 complete()）；否则排队并返回 false。
+    bool start_op(descriptor_state& state, op_direction direction, reactor_op& op) noexcept;
+    // 仍排队时摘下并以 operation_aborted 完成，返回 true；否则返回 false。
+    bool cancel_op(descriptor_state& state, op_direction direction, reactor_op& op) noexcept;
+    void cancel_ops(descriptor_state& state) noexcept;
+
+    void add_timer(timer_op& op) noexcept;
+    bool cancel_timer(timer_op& op) noexcept;
+
+  protected:
+    void shutdown() override;
+
+  private:
+    struct pending_event {
+        descriptor_state* state;
+        unsigned bits;
+    };
+
+    struct completed_op {
+        reactor_op* op;
+        bool counts_as_work;
+    };
+
+    struct signal_pump final : reactor_op {
+        bool perform() noexcept override;
+        void complete() noexcept override {}
+        int fd = -1;
+        void (*deliver)(int) = nullptr;
+    };
+
+    // event_sink：wait 内（锁外）只记录。
+    void on_ready(descriptor_state& state, unsigned ready_bits) noexcept override;
+
+    // 锁内。
+    void process_event(descriptor_state& state, unsigned ready, std::vector<completed_op>& completed) noexcept;
+    void refresh_interest(descriptor_state& state) noexcept;
+    void detach_ops(descriptor_state& state, reactor_op* (&cancelled)[2]) noexcept;
+    long timer_timeout_ms(long limit) const noexcept;
+    void pop_expired_timers(std::vector<timer_op*>& expired) noexcept;
+    void heap_push(timer_op& op) noexcept;
+    void heap_remove(std::size_t index) noexcept;
+    void heap_up(std::size_t index) noexcept;
+    void heap_down(std::size_t index) noexcept;
+    void heap_swap(std::size_t a, std::size_t b) noexcept;
+
+    void finish_cancelled(reactor_op* const (&cancelled)[2]) noexcept;
+
+    io_context* context_;
+    std::unique_ptr<demultiplexer> demux_;
+    std::mutex mutex_;
+    std::unordered_set<descriptor_state*> registered_;
+    std::vector<timer_op*> timers_;
+    std::vector<pending_event> events_; // 只有运行 wait 的线程触碰
+    descriptor_state signal_state_;
+    signal_pump signal_pump_;
+    bool shut_down_ = false;
+};
+
+} // namespace detail
+} // namespace net

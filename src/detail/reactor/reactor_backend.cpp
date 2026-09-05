@@ -1,61 +1,31 @@
-#include "detail/epoll_reactor.hpp"
+#include "detail/reactor/reactor_backend.hpp"
 
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
-#include <cstdint>
 
-#include <sys/epoll.h>
-#include <sys/eventfd.h>
 #include <unistd.h>
 
 #include "co2/contract.hpp"
 
 #include "net/error.hpp"
+#include "net/io_context.hpp"
+
+#include "detail/reactor/reactor_socket.hpp"
+#include "detail/reactor/reactor_timer.hpp"
 
 namespace net {
 namespace detail {
 
-namespace {
-
-constexpr int max_events = 128;
-
-unsigned ready_bits_of(std::uint32_t const events) noexcept {
-    auto bits = 0U;
-    if (events & (EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLHUP)) bits |= 1U;
-    if (events & (EPOLLOUT | EPOLLERR | EPOLLHUP)) bits |= 2U;
-    return bits;
+reactor_backend::reactor_backend(execution_context& context, std::unique_ptr<demultiplexer> demux)
+    : context_{static_cast<io_context*>(&context)}, demux_{std::move(demux)} {
+    CO2_CONTRACT_CHECK(demux_ != nullptr);
+    events_.reserve(128U);
 }
 
-} // namespace
+reactor_backend::~reactor_backend() = default;
 
-epoll_reactor::epoll_reactor(execution_context& context)
-    : context_{static_cast<io_context*>(&context)} {
-    epoll_fd_ = ::epoll_create1(EPOLL_CLOEXEC);
-    if (epoll_fd_ < 0) throw std::system_error{errno, std::system_category(), "epoll_create1"};
-    event_fd_ = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-    if (event_fd_ < 0) {
-        auto const saved = errno;
-        ::close(epoll_fd_);
-        throw std::system_error{saved, std::system_category(), "eventfd"};
-    }
-    epoll_event event{};
-    event.events = EPOLLIN | EPOLLET;
-    event.data.ptr = nullptr; // 空指针标记中断用的 eventfd
-    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, event_fd_, &event) != 0) {
-        auto const saved = errno;
-        ::close(event_fd_);
-        ::close(epoll_fd_);
-        throw std::system_error{saved, std::system_category(), "epoll_ctl"};
-    }
-}
-
-epoll_reactor::~epoll_reactor() {
-    if (event_fd_ >= 0) ::close(event_fd_);
-    if (epoll_fd_ >= 0) ::close(epoll_fd_);
-}
-
-void epoll_reactor::shutdown() {
+void reactor_backend::shutdown() {
     // 未完成的操作被放弃：不再调用 complete()（等待它们的协程不会恢复）。
     std::lock_guard<std::mutex> lock{mutex_};
     shut_down_ = true;
@@ -63,6 +33,7 @@ void epoll_reactor::shutdown() {
         state->ops[0] = nullptr;
         state->ops[1] = nullptr;
         state->registered = false;
+        demux_->remove(*state);
     }
     registered_.clear();
     for (auto* const timer : timers_)
@@ -70,46 +41,79 @@ void epoll_reactor::shutdown() {
     timers_.clear();
 }
 
+// ---- 工厂 ----
+
+std::unique_ptr<socket_impl> reactor_backend::create_socket(io_context& context) {
+    return std::unique_ptr<socket_impl>{new reactor_socket{context, *this}};
+}
+
+std::unique_ptr<timer_impl> reactor_backend::create_timer(io_context& context) {
+    return std::unique_ptr<timer_impl>{new reactor_timer{context, *this}};
+}
+
+// ---- 信号泵 ----
+
+bool reactor_backend::signal_pump::perform() noexcept {
+    for (;;) {
+        int value = 0;
+        auto const n = ::read(fd, &value, sizeof(value));
+        if (n == static_cast<ssize_t>(sizeof(value))) {
+            deliver(value);
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        return false; // EAGAIN：保持排队等待下一次可读
+    }
+}
+
+std::error_code reactor_backend::register_signal_reader(int const read_fd,
+                                                        void (*const deliver)(int)) noexcept {
+    if (signal_state_.registered) return {};
+    signal_pump_.fd = read_fd;
+    signal_pump_.deliver = deliver;
+    signal_pump_.counts_as_work = false;
+    auto const ec = register_descriptor(signal_state_, read_fd);
+    if (ec) return ec;
+    start_op(signal_state_, op_direction::read, signal_pump_);
+    return {};
+}
+
 // ---- 描述符 ----
 
-std::error_code epoll_reactor::register_descriptor(descriptor_state& state,
-                                                   int const fd) noexcept {
+std::error_code reactor_backend::register_descriptor(descriptor_state& state, int const fd) noexcept {
     std::lock_guard<std::mutex> lock{mutex_};
     if (shut_down_) return make_error_code(error::operation_aborted);
     CO2_CONTRACT_CHECK(not state.registered);
-    epoll_event event{};
-    event.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET;
-    event.data.ptr = &state;
-    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &event) != 0)
-        return std::error_code{errno, std::system_category()};
     state.fd = fd;
     state.ops[0] = nullptr;
     state.ops[1] = nullptr;
     state.ready = 0U;
+    state.interest = 0U;
+    state.demux_index = descriptor_state::no_index;
+    // 边沿触发：一次登记全部兴趣；电平触发：从无兴趣开始，排队时再加。
+    auto const initial = demux_->edge_triggered() ? (read_ready_bit | write_ready_bit) : 0U;
+    auto const ec = demux_->add(state, initial);
+    if (ec) return ec;
+    state.interest = initial;
     state.registered = true;
     registered_.insert(&state);
     return {};
 }
 
-void epoll_reactor::deregister_descriptor(descriptor_state& state) noexcept {
-    reactor_op* cancelled[2] = {nullptr, nullptr};
-    {
-        std::lock_guard<std::mutex> lock{mutex_};
-        if (not state.registered) return;
-        epoll_event event{};
-        ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, state.fd, &event);
-        registered_.erase(&state);
-        state.registered = false;
-        for (auto direction = 0; direction != 2; ++direction) {
-            auto* const op = state.ops[direction];
-            if (op == nullptr) continue;
-            state.ops[direction] = nullptr;
-            op->state = reactor_op::state_type::idle;
-            op->ec = make_error_code(error::operation_aborted);
-            cancelled[direction] = op;
-        }
-        state.ready = 0U;
+void reactor_backend::detach_ops(descriptor_state& state, reactor_op* (&cancelled)[2]) noexcept {
+    // 锁内。
+    for (auto direction = 0; direction != 2; ++direction) {
+        auto* const op = state.ops[direction];
+        cancelled[direction] = op;
+        if (op == nullptr) continue;
+        state.ops[direction] = nullptr;
+        op->state = reactor_op::state_type::idle;
+        op->ec = make_error_code(error::operation_aborted);
     }
+}
+
+void reactor_backend::finish_cancelled(reactor_op* const (&cancelled)[2]) noexcept {
+    // 锁外。
     auto const executor = context_->get_executor();
     for (auto* const op : cancelled) {
         if (op == nullptr) continue;
@@ -118,28 +122,53 @@ void epoll_reactor::deregister_descriptor(descriptor_state& state) noexcept {
     }
 }
 
-bool epoll_reactor::start_op(descriptor_state& state, op_direction const direction,
-                             reactor_op& op) noexcept {
+void reactor_backend::deregister_descriptor(descriptor_state& state) noexcept {
+    reactor_op* cancelled[2] = {nullptr, nullptr};
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        if (not state.registered) return;
+        demux_->remove(state);
+        registered_.erase(&state);
+        state.registered = false;
+        detach_ops(state, cancelled);
+        state.ready = 0U;
+        state.interest = 0U;
+    }
+    finish_cancelled(cancelled);
+}
+
+void reactor_backend::refresh_interest(descriptor_state& state) noexcept {
+    // 锁内。边沿触发的后端不需要。
+    if (demux_->edge_triggered()) return;
+    auto const wanted = state.wanted();
+    if (wanted == state.interest) return;
+    state.interest = wanted;
+    demux_->update(state, wanted);
+}
+
+bool reactor_backend::start_op(descriptor_state& state, op_direction const direction,
+                               reactor_op& op) noexcept {
     auto const index = static_cast<unsigned>(direction);
-    auto const bit = direction == op_direction::read ? read_ready : write_ready;
+    auto const bit = direction == op_direction::read ? read_ready_bit : write_ready_bit;
     {
         std::lock_guard<std::mutex> lock{mutex_};
         CO2_CONTRACT_CHECK(state.registered);
         CO2_CONTRACT_CHECK(state.ops[index] == nullptr);
         if (state.ready & bit) {
-            // 上一次边沿已经到达且尚未被消费：先试一次。
+            // 上一次就绪已经到达且尚未被消费：先试一次。
             state.ready &= ~bit;
             if (op.perform()) return true;
         }
         op.state = reactor_op::state_type::queued;
         state.ops[index] = &op;
+        refresh_interest(state);
     }
     if (op.counts_as_work) context_->get_executor().on_work_started();
     return false;
 }
 
-bool epoll_reactor::cancel_op(descriptor_state& state, op_direction const direction,
-                              reactor_op& op) noexcept {
+bool reactor_backend::cancel_op(descriptor_state& state, op_direction const direction,
+                                reactor_op& op) noexcept {
     auto const index = static_cast<unsigned>(direction);
     {
         std::lock_guard<std::mutex> lock{mutex_};
@@ -147,37 +176,34 @@ bool epoll_reactor::cancel_op(descriptor_state& state, op_direction const direct
         state.ops[index] = nullptr;
         op.state = reactor_op::state_type::idle;
         op.ec = make_error_code(error::operation_aborted);
+        refresh_interest(state);
     }
     op.complete();
     if (op.counts_as_work) context_->get_executor().on_work_finished();
     return true;
 }
 
-void epoll_reactor::cancel_ops(descriptor_state& state) noexcept {
+void reactor_backend::cancel_ops(descriptor_state& state) noexcept {
     reactor_op* cancelled[2] = {nullptr, nullptr};
     {
         std::lock_guard<std::mutex> lock{mutex_};
-        for (auto direction = 0; direction != 2; ++direction) {
-            auto* const op = state.ops[direction];
-            if (op == nullptr) continue;
-            state.ops[direction] = nullptr;
-            op->state = reactor_op::state_type::idle;
-            op->ec = make_error_code(error::operation_aborted);
-            cancelled[direction] = op;
-        }
+        detach_ops(state, cancelled);
+        if (state.registered) refresh_interest(state);
     }
-    auto const executor = context_->get_executor();
-    for (auto* const op : cancelled) {
-        if (op == nullptr) continue;
-        op->complete();
-        if (op->counts_as_work) executor.on_work_finished();
-    }
+    finish_cancelled(cancelled);
 }
 
-void epoll_reactor::process_descriptor(descriptor_state& state, unsigned const ready,
-                                       std::vector<completed_op>& completed) noexcept {
+// ---- 事件 ----
+
+void reactor_backend::on_ready(descriptor_state& state, unsigned const ready_bits) noexcept {
+    events_.push_back(pending_event{&state, ready_bits});
+}
+
+void reactor_backend::process_event(descriptor_state& state, unsigned const ready,
+                                    std::vector<completed_op>& completed) noexcept {
     // 锁内。就绪的方向：有排队操作就执行，完成则摘下交给完成列表；没有操作就记下就绪位。
-    unsigned const bits[2] = {read_ready, write_ready};
+    unsigned const bits[2] = {read_ready_bit, write_ready_bit};
+    auto changed = false;
     for (auto direction = 0U; direction != 2U; ++direction) {
         if ((ready & bits[direction]) == 0U) continue;
         auto* const op = state.ops[direction];
@@ -185,16 +211,18 @@ void epoll_reactor::process_descriptor(descriptor_state& state, unsigned const r
             state.ready |= bits[direction];
             continue;
         }
-        if (not op->perform()) continue; // 仍是 EAGAIN：保持排队，等待下一个边沿
+        if (not op->perform()) continue; // 仍是 EAGAIN：保持排队
         state.ops[direction] = nullptr;
         op->state = reactor_op::state_type::idle;
         completed.push_back(completed_op{op, op->counts_as_work});
+        changed = true;
     }
+    if (changed) refresh_interest(state);
 }
 
 // ---- 定时器 ----
 
-void epoll_reactor::add_timer(timer_op& op) noexcept {
+void reactor_backend::add_timer(timer_op& op) noexcept {
     auto became_earliest = false;
     {
         std::lock_guard<std::mutex> lock{mutex_};
@@ -206,7 +234,7 @@ void epoll_reactor::add_timer(timer_op& op) noexcept {
     if (became_earliest) interrupt();
 }
 
-bool epoll_reactor::cancel_timer(timer_op& op) noexcept {
+bool reactor_backend::cancel_timer(timer_op& op) noexcept {
     {
         std::lock_guard<std::mutex> lock{mutex_};
         if (op.heap_index == timer_op::not_queued) return false;
@@ -218,7 +246,7 @@ bool epoll_reactor::cancel_timer(timer_op& op) noexcept {
     return true;
 }
 
-long epoll_reactor::timer_timeout_ms(long const limit) const noexcept {
+long reactor_backend::timer_timeout_ms(long const limit) const noexcept {
     // 锁内。
     if (timers_.empty()) return limit;
     auto const now = std::chrono::steady_clock::now();
@@ -226,13 +254,13 @@ long epoll_reactor::timer_timeout_ms(long const limit) const noexcept {
     if (earliest <= now) return 0;
     auto const remaining =
         std::chrono::duration_cast<std::chrono::milliseconds>(earliest - now).count() + 1;
-    auto const clamped = remaining > static_cast<long long>(1L << 30) ? (1L << 30)
-                                                                       : static_cast<long>(remaining);
+    auto const clamped =
+        remaining > static_cast<long long>(1L << 30) ? (1L << 30) : static_cast<long>(remaining);
     if (limit < 0) return clamped;
     return std::min(limit, clamped);
 }
 
-void epoll_reactor::pop_expired_timers(std::vector<timer_op*>& expired) noexcept {
+void reactor_backend::pop_expired_timers(std::vector<timer_op*>& expired) noexcept {
     // 锁内。
     if (timers_.empty()) return;
     auto const now = std::chrono::steady_clock::now();
@@ -244,19 +272,18 @@ void epoll_reactor::pop_expired_timers(std::vector<timer_op*>& expired) noexcept
     }
 }
 
-void epoll_reactor::heap_push(timer_op& op) noexcept {
+void reactor_backend::heap_push(timer_op& op) noexcept {
     op.heap_index = timers_.size();
     timers_.push_back(&op);
     heap_up(op.heap_index);
 }
 
-void epoll_reactor::heap_remove(std::size_t const index) noexcept {
+void reactor_backend::heap_remove(std::size_t const index) noexcept {
     auto* const removed = timers_[index];
     auto const last = timers_.size() - 1U;
     if (index != last) {
         heap_swap(index, last);
         timers_.pop_back();
-        // 被换上来的元素可能需要上浮或下沉。
         if (index > 0U && timers_[index]->expiry < timers_[(index - 1U) / 2U]->expiry)
             heap_up(index);
         else
@@ -267,7 +294,7 @@ void epoll_reactor::heap_remove(std::size_t const index) noexcept {
     removed->heap_index = timer_op::not_queued;
 }
 
-void epoll_reactor::heap_up(std::size_t index) noexcept {
+void reactor_backend::heap_up(std::size_t index) noexcept {
     while (index > 0U) {
         auto const parent = (index - 1U) / 2U;
         if (not(timers_[index]->expiry < timers_[parent]->expiry)) break;
@@ -276,7 +303,7 @@ void epoll_reactor::heap_up(std::size_t index) noexcept {
     }
 }
 
-void epoll_reactor::heap_down(std::size_t index) noexcept {
+void reactor_backend::heap_down(std::size_t index) noexcept {
     auto const count = timers_.size();
     for (;;) {
         auto const left = 2U * index + 1U;
@@ -290,7 +317,7 @@ void epoll_reactor::heap_down(std::size_t index) noexcept {
     }
 }
 
-void epoll_reactor::heap_swap(std::size_t const a, std::size_t const b) noexcept {
+void reactor_backend::heap_swap(std::size_t const a, std::size_t const b) noexcept {
     std::swap(timers_[a], timers_[b]);
     timers_[a]->heap_index = a;
     timers_[b]->heap_index = b;
@@ -298,40 +325,29 @@ void epoll_reactor::heap_swap(std::size_t const a, std::size_t const b) noexcept
 
 // ---- 事件循环 ----
 
-void epoll_reactor::interrupt() noexcept {
-    std::uint64_t const one = 1U;
-    // 非阻塞 eventfd：计数器满时 write 返回 EAGAIN，此时已有待处理的中断，无需重试。
-    static_cast<void>(::write(event_fd_, &one, sizeof(one)));
-}
+void reactor_backend::interrupt() noexcept { demux_->interrupt(); }
 
-void epoll_reactor::run(long const timeout_ms) {
-    epoll_event events[max_events];
+void reactor_backend::run(long const timeout_ms) {
     long timeout = 0;
     {
         std::lock_guard<std::mutex> lock{mutex_};
         timeout = timer_timeout_ms(timeout_ms);
     }
-    auto const count = ::epoll_wait(epoll_fd_, events, max_events,
-                                    timeout < 0 ? -1 : static_cast<int>(timeout));
-    if (count < 0 && errno != EINTR)
-        throw std::system_error{errno, std::system_category(), "epoll_wait"};
+    events_.clear();
+    auto const wait_error = demux_->wait(timeout, *this);
+    if (wait_error) throw std::system_error{wait_error, demux_->name()};
 
     std::vector<completed_op> completed;
     std::vector<timer_op*> expired;
     {
         std::lock_guard<std::mutex> lock{mutex_};
-        for (auto index = 0; index < count; ++index) {
-            auto* const state = static_cast<descriptor_state*>(events[index].data.ptr);
-            if (state == nullptr) {
-                std::uint64_t drained = 0;
-                while (::read(event_fd_, &drained, sizeof(drained)) > 0) {}
-                continue;
-            }
-            if (registered_.count(state) == 0U) continue; // 已注销：迟到的事件
-            process_descriptor(*state, ready_bits_of(events[index].events), completed);
+        for (auto const& event : events_) {
+            if (registered_.count(event.state) == 0U) continue; // 已注销：迟到的事件
+            process_event(*event.state, event.bits, completed);
         }
         pop_expired_timers(expired);
     }
+    events_.clear();
 
     auto const executor = context_->get_executor();
     for (auto const& entry : completed) {

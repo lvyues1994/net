@@ -28,15 +28,18 @@ endif()
 
 # ---- 库 ----
 #
-# 抽象层（IoAwaitable 协议、task、执行器、缓冲区、流、组合子）仅含头文件；平台层
-# （io_context 的 epoll 反应器、套接字、定时器、DNS、信号）编译进 libnet。
-add_library(net STATIC
+# 抽象层（IoAwaitable 协议、task、执行器、缓冲区、流、组合子）仅含头文件；平台层编译进
+# libnet，分三部分：
+#   - 具体层：io_context / 套接字 / 定时器 / DNS / 信号，只依赖 src/detail/backend.hpp 的抽象接口；
+#   - 就绪型后端族（src/detail/reactor）：共享的反应器 + epoll / poll / select 解复用器；
+#   - POSIX 公共部分（src/detail/posix）：系统调用封装。
+# 完成型后端（io_uring / IOCP）接入时各自成一族（src/detail/io_uring、src/detail/iocp）。
+set(net_concrete_sources
     src/error.cpp
     src/execution_context.cpp
     src/memory_resource.cpp
-    src/io_context.cpp
-    src/detail/epoll_reactor.cpp
     src/thread_pool.cpp
+    src/io_context.cpp
     src/ip.cpp
     src/socket_base.cpp
     src/tcp.cpp
@@ -44,6 +47,22 @@ add_library(net STATIC
     src/timer.cpp
     src/resolver.cpp
     src/signal_set.cpp)
+
+set(net_posix_sources
+    src/detail/posix/socket_ops.cpp)
+
+set(net_reactor_sources
+    src/detail/reactor/reactor_backend.cpp
+    src/detail/reactor/reactor_socket.cpp
+    src/detail/reactor/reactor_timer.cpp
+    src/detail/reactor/epoll_demultiplexer.cpp
+    src/detail/reactor/poll_demultiplexer.cpp
+    src/detail/reactor/select_demultiplexer.cpp)
+
+add_library(net STATIC
+    ${net_concrete_sources}
+    ${net_posix_sources}
+    ${net_reactor_sources})
 add_library(net::net ALIAS net)
 
 target_compile_features(net PUBLIC cxx_std_14)

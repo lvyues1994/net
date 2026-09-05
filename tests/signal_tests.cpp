@@ -36,7 +36,7 @@ net::io_result<int> wait_for(net::io_context& ctx, net::signal_set& signals) {
 }
 
 void raised_signal_completes_the_wait() {
-    net::io_context ctx;
+    test_context ctx;
     net::signal_set signals{ctx, SIGUSR1};
     net::run_async(ctx.get_executor())(raise_later(&ctx, SIGUSR1));
     auto const r = wait_for(ctx, signals);
@@ -45,7 +45,7 @@ void raised_signal_completes_the_wait() {
 }
 
 void early_signal_is_queued() {
-    net::io_context ctx;
+    test_context ctx;
     net::signal_set signals{ctx, SIGUSR2};
     CHECK_EQ(std::raise(SIGUSR2), 0);
     // 信号处理函数已把信号号写进管道；反应器读到后排队；wait 立即完成。
@@ -55,7 +55,7 @@ void early_signal_is_queued() {
 }
 
 void cancel_aborts_the_wait() {
-    net::io_context ctx;
+    test_context ctx;
     net::signal_set signals{ctx, SIGUSR1};
     net::io_result<int> result{};
     net::run_async(ctx.get_executor(), [&](net::io_result<int> v) { result = v; }, [](std::exception_ptr) { CHECK(false); })(wait_signal(&signals));
@@ -66,7 +66,7 @@ void cancel_aborts_the_wait() {
 }
 
 void stop_token_aborts_the_wait() {
-    net::io_context ctx;
+    test_context ctx;
     net::signal_set signals{ctx, SIGUSR1};
     net::stop_source source;
     net::io_result<int> result{};
@@ -79,7 +79,7 @@ void stop_token_aborts_the_wait() {
 }
 
 void every_registered_set_receives_the_signal() {
-    net::io_context ctx;
+    test_context ctx;
     net::signal_set a{ctx, SIGUSR1};
     net::signal_set b{ctx, SIGUSR1, SIGUSR2};
     net::io_result<int> ra{};
@@ -93,7 +93,7 @@ void every_registered_set_receives_the_signal() {
 }
 
 void removed_signal_is_not_delivered() {
-    net::io_context ctx;
+    test_context ctx;
     net::signal_set signals{ctx, SIGUSR1, SIGUSR2};
     CHECK(not signals.remove(SIGUSR2));
     // SIGUSR2 现在恢复默认处置——默认会终止进程，所以这里只验证它不再在集合里（用忽略处置）。

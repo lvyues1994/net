@@ -7,8 +7,9 @@
 
 #include "net/memory_resource.hpp"
 
-#include "detail/epoll_reactor.hpp"
-#include "detail/reactor.hpp"
+#include "detail/backend.hpp"
+#include "detail/reactor/demultiplexer.hpp"
+#include "detail/reactor/reactor_backend.hpp"
 
 namespace net {
 
@@ -45,8 +46,27 @@ bool thread_runs(io_context const* const context) noexcept {
 
 } // namespace
 
+namespace {
+
+std::unique_ptr<detail::demultiplexer> make_demultiplexer(backend_kind const kind) {
+    switch (kind) {
+    case backend_kind::epoll: return detail::make_epoll_demultiplexer();
+    case backend_kind::poll: return detail::make_poll_demultiplexer();
+    case backend_kind::select: return detail::make_select_demultiplexer();
+    }
+    return detail::make_epoll_demultiplexer();
+}
+
+// 就绪型后端族：一个共享的 reactor_backend + 按标签选择的解复用器。完成型后端（io_uring /
+// IOCP）接入时在这里多一个分支，返回它们自己的 io_backend 服务。
+detail::io_backend& make_backend(io_context& owner, backend_kind const kind) {
+    return owner.make_service<detail::reactor_backend>(make_demultiplexer(kind));
+}
+
+} // namespace
+
 struct io_context::impl {
-    explicit impl(io_context& owner) : reactor{owner.use_service<detail::epoll_reactor>()} {}
+    impl(io_context& owner, backend_kind const kind_) : kind{kind_}, backend{make_backend(owner, kind_)} {}
 
     void push(continuation& c) noexcept {
         c.next = nullptr;
@@ -93,12 +113,12 @@ struct io_context::impl {
         if (idle_threads > 0U)
             cv.notify_one();
         else if (reactor_busy)
-            reactor.interrupt();
+            backend.interrupt();
     }
 
     void wake_all_locked() noexcept {
         cv.notify_all();
-        if (reactor_busy) reactor.interrupt();
+        if (reactor_busy) backend.interrupt();
     }
 
     static long milliseconds_until(std::chrono::steady_clock::time_point const deadline) noexcept {
@@ -138,7 +158,7 @@ struct io_context::impl {
                     busy_guard guard{this, &lock};
                     auto timeout = block ? -1L : 0L;
                     if (block && deadline != nullptr) timeout = milliseconds_until(*deadline);
-                    reactor.run(timeout);
+                    backend.run(timeout);
                 }
                 if (head != nullptr) continue;
                 if (not block) return 0U;
@@ -161,7 +181,8 @@ struct io_context::impl {
         }
     }
 
-    detail::epoll_reactor& reactor;
+    backend_kind kind;
+    detail::io_backend& backend;
     std::mutex mutex;
     std::condition_variable cv;
     continuation* head = nullptr;
@@ -174,14 +195,20 @@ struct io_context::impl {
 
 // ---- io_context ----
 
-io_context::io_context() : impl_{new impl{*this}} {}
+io_context::io_context() : io_context(default_backend_t::kind, 1) {}
 
-io_context::io_context(int) : impl_{new impl{*this}} {}
+io_context::io_context(int const concurrency_hint) : io_context(default_backend_t::kind, concurrency_hint) {}
+
+io_context::io_context(backend_kind const backend, int) : impl_{new impl{*this, backend}} {}
 
 io_context::~io_context() {
     shutdown();
     destroy();
 }
+
+backend_kind io_context::backend() const noexcept { return impl_->kind; }
+
+char const* io_context::backend_name() const noexcept { return impl_->backend.name(); }
 
 std::size_t io_context::run() {
     thread_context_guard guard{this};
@@ -258,8 +285,8 @@ bool io_context::executor_type::running_in_this_thread() const noexcept {
 
 // ---- 私有入口 ----
 
-detail::reactor& detail::io_context_access::get_reactor(io_context& context) noexcept {
-    return context.impl_->reactor;
+detail::io_backend& detail::io_context_access::backend(io_context& context) noexcept {
+    return context.impl_->backend;
 }
 
 } // namespace net

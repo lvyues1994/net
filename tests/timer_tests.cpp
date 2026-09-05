@@ -35,7 +35,7 @@ auto wait_for(net::io_context* ctx, milliseconds d)
 CO2_END
 
 void timer_expires_after_the_duration() {
-    net::io_context ctx;
+    test_context ctx;
     auto const start = steady_clock::now();
     auto const ec = run_task(ctx, wait_for(&ctx, milliseconds{30}));
     CHECK(not ec);
@@ -43,7 +43,7 @@ void timer_expires_after_the_duration() {
 }
 
 void expired_timer_completes_immediately() {
-    net::io_context ctx;
+    test_context ctx;
     auto const start = steady_clock::now();
     auto const ec = run_task(ctx, wait_for(&ctx, milliseconds{0}));
     CHECK(not ec);
@@ -66,7 +66,7 @@ auto wait_on(net::steady_timer* timer) CO2_BEG((net::task<std::error_code>), (ti
 CO2_END
 
 void cancel_completes_the_wait_with_operation_aborted() {
-    net::io_context ctx;
+    test_context ctx;
     net::steady_timer victim{ctx, seconds{10}};
     std::error_code ec;
     net::run_async(ctx.get_executor(), [&](std::error_code e) { ec = e; }, [](std::exception_ptr) { CHECK(false); })(wait_on(&victim));
@@ -95,7 +95,7 @@ auto wait_twice(net::steady_timer* timer) CO2_BEG(net::task<int>, (timer), net::
 CO2_END
 
 void expires_after_cancels_a_pending_wait() {
-    net::io_context ctx;
+    test_context ctx;
     net::steady_timer victim{ctx, seconds{10}};
     auto result = 0;
     net::run_async(ctx.get_executor(), [&](int v) { result = v; }, [](std::exception_ptr) { CHECK(false); })(wait_twice(&victim));
@@ -107,7 +107,7 @@ void expires_after_cancels_a_pending_wait() {
 }
 
 void stop_token_cancels_the_wait() {
-    net::io_context ctx;
+    test_context ctx;
     net::stop_source source;
     std::error_code ec;
     net::run_async(ctx.get_executor(), source.get_token(), nullptr, [&](std::error_code e) { ec = e; },
@@ -121,7 +121,7 @@ void stop_token_cancels_the_wait() {
 }
 
 void already_stopped_token_completes_without_waiting() {
-    net::io_context ctx;
+    test_context ctx;
     net::stop_source source;
     source.request_stop();
     std::error_code ec;
@@ -140,7 +140,7 @@ auto record_order(net::io_context* ctx, milliseconds d, int id, std::vector<int>
 CO2_END
 
 void timers_fire_in_expiry_order() {
-    net::io_context ctx;
+    test_context ctx;
     std::vector<int> order;
     net::run_async(ctx.get_executor())(record_order(&ctx, milliseconds{30}, 3, &order));
     net::run_async(ctx.get_executor())(record_order(&ctx, milliseconds{10}, 1, &order));
@@ -160,7 +160,7 @@ auto all_timers(std::vector<net::task<std::error_code>> ts)
 CO2_END
 
 void many_timers_via_when_all() {
-    net::io_context ctx;
+    test_context ctx;
     std::vector<net::task<std::error_code>> tasks;
     for (auto i = 0; i != 50; ++i)
         tasks.push_back(wait_for(&ctx, milliseconds{i % 5}));

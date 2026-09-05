@@ -83,7 +83,7 @@ auto client_roundtrip(net::io_context* ctx, net::ip::tcp::endpoint ep, std::stri
 CO2_END
 
 void loopback_echo() {
-    net::io_context ctx;
+    test_context ctx;
     net::tcp_acceptor acceptor{ctx, net::ip::tcp::endpoint{net::ip::address_v4::loopback(), 0}};
     auto const ep = loopback_endpoint(acceptor);
     auto echoed = std::size_t{};
@@ -107,7 +107,7 @@ auto connect_refused(net::io_context* ctx, net::ip::tcp::endpoint ep)
 CO2_END
 
 void connect_to_a_closed_port_fails() {
-    net::io_context ctx;
+    test_context ctx;
     // 找一个空闲端口：绑定后立刻关闭。
     net::tcp_acceptor probe{ctx, net::ip::tcp::endpoint{net::ip::address_v4::loopback(), 0}};
     auto const ep = loopback_endpoint(probe);
@@ -143,7 +143,7 @@ auto connect_only(net::tcp_socket* sock, net::ip::tcp::endpoint ep) CO2_BEG(net:
 CO2_END
 
 struct connected_pair {
-    net::io_context ctx;
+    test_context ctx;
     net::tcp_acceptor acceptor{ctx, net::ip::tcp::endpoint{net::ip::address_v4::loopback(), 0}};
     net::tcp_socket client{ctx};
     net::tcp_socket server;
@@ -305,7 +305,7 @@ auto serve_n(net::tcp_acceptor* acceptor, int n, std::atomic<int>* sessions)
 CO2_END
 
 void many_clients_on_several_threads() {
-    net::io_context ctx;
+    test_context ctx;
     net::tcp_acceptor acceptor{ctx, net::ip::tcp::endpoint{net::ip::address_v4::loopback(), 0}};
     auto const ep = loopback_endpoint(acceptor);
     constexpr auto clients = 16;

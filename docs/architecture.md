@@ -17,8 +17,10 @@ net 用 C++14 与 co2 实现这套协议：语言里没有 `co_await`，但 co2 
 ┌──────────────────────────────────────────────────────────────────────┐
 │ 应用          examples/ echo_server echo_client http_get timers       │
 ├──────────────────────────────────────────────────────────────────────┤
-│ 平台（libnet） io_context   tcp / udp / timer / resolver / signal_set │
-│                src/detail/epoll_reactor  reactor_op  socket_impl     │
+│ 具体层（libnet） io_context  tcp / udp / timer / resolver / signal_set │
+│                 ↓ 抽象接缝 src/detail/backend.hpp                    │
+│ 后端            reactor_backend + demultiplexer{epoll, poll, select} │
+│                 （将来：io_uring_backend / iocp_backend）             │
 ├──────────────────────────────────────────────────────────────────────┤
 │ 组合子        when_all  when_any          detail/combinator          │
 │ 流            stream (read/write/read_until)  any_stream             │
@@ -35,8 +37,10 @@ net 用 C++14 与 co2 实现这套协议：语言里没有 `co_await`，但 co2 
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-依赖只向下。协议核心到组合子仅含头文件、与平台无关；平台层编译进 `libnet.a`，
-反应器接口（`src/detail/reactor.hpp`）只在 `src/` 内可见。
+依赖只向下。协议核心到组合子仅含头文件、与平台无关；平台层编译进 `libnet.a`：具体层
+只依赖 `src/detail/backend.hpp` 的抽象接口（`io_backend` / `socket_impl` / `timer_impl`），
+后端实现在 `src/detail/reactor/`（就绪型族）与 `src/detail/posix/`，全部只在 `src/` 内可见。
+后端的选择、与 Corosio 的对照、io_uring / IOCP 的接入方案见 `docs/backends.md`。
 
 ## 协议核心
 
@@ -118,44 +122,56 @@ set_continuation() / set_environment()`）。
   把派发帧 `post` 到内层执行器；派发帧取走整批续体逐个 `safe_resume`，期间到达的排入
   下一批，批结束后重新 `post`（公平性）。派发帧排队期间实现自我保活。
 
-## 反应器（Linux epoll）
+## 平台层：具体层 + 后端
 
-`src/detail/reactor.hpp` 是 I/O 对象与反应器之间的私有协议：
+`io_context(tag)` 在构造时选择后端（`net::epoll` 默认、`net::poll`、`net::select`）：
+`io_context.cpp` 的 `make_backend(kind)` 用 `make_service` 在上下文里注册一个
+`detail::io_backend` 服务。`io_context::impl` 自己拥有队列、工作计数与 run 循环，后端只
+负责"等一批事件、把完成的操作交给它们的执行器"，以及创建 `socket_impl` / `timer_impl`。
 
-- `descriptor_state`（每个描述符）：fd、两个方向各一个 `reactor_op*`、未消费的就绪位；
-- `reactor_op`：`perform()`（就绪时在反应器锁内执行非阻塞系统调用，返回是否完成）、
-  `complete()`（锁外恰好调用一次，把续体交给操作的执行器：`env->executor.post(cont)`）；
-- `timer_op`：到期时间 + 堆下标。
+`tcp_socket` / `udp_socket` / `tcp_acceptor` 是 `socket_base` 的薄包装：同步操作（bind /
+listen / setsockopt / getsockname…）直接对 `impl_->native_handle()` 做系统调用；异步操作是
+一个三步协议 `begin_*`（记参数）→ `ready`（推测）→ `suspend`（排队/提交）→ `finish_*`
+（取结果），awaiter 的三个方法一一转发。`steady_timer` / `signal_set` 同理。
 
-边沿触发一次注册（`EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET`）。事件到达而没有排队
-操作时记入就绪位，`start_op` 先消费它——避免 ET 下推测尝试与排队之间的丢失唤醒。
-定时器是二叉堆，`epoll_wait` 超时取最早到期。每个排队操作与定时器持有 io_context 的
-一份工作计数（信号泵这类常驻监听除外：`counts_as_work = false`）。
+### 就绪型后端族（`src/detail/reactor/`）
+
+`reactor_backend`（对 epoll / poll / select 相同）：
+
+- `descriptor_state`（每个描述符）：fd、两个方向各一个 `reactor_op*`、就绪位、兴趣位；
+- `reactor_op`：`perform()`（就绪时在锁内执行非阻塞系统调用，返回是否完成）、
+  `complete()`（锁外恰好一次：`env->executor.post(cont)`）；
+- 定时器二叉堆、信号泵（`counts_as_work = false`）、工作计数、注销后迟到事件的识别。
+
+等待机制注入为 `demultiplexer`（`add / update / remove / wait / interrupt`）：epoll 边沿
+触发一次登记、由反应器维护就绪位；poll / select 电平触发，反应器在每次排队/摘除后以
+`update` 调整兴趣（否则可读而无人读的描述符会让 `wait` 忙转），解复用器在锁内构建快照
+再阻塞、兴趣增加时写 eventfd 唤醒重建。
 
 ### 操作状态住在 I/O 对象里
 
-`tcp_socket::read_some(buffers)` 把缓冲区序列展平进 `socket_impl::read_op`，返回的
+`tcp_socket::read_some(buffers)` 把缓冲区序列展平交给 `socket_impl::begin_read`，返回的
 awaiter 只有一个指针（`socket_read_awaitable{impl}`）——总能内联进协程帧的 awaiter 槽，
 每次操作零分配，且 awaiter 的三个方法都定义在库内（ABI 稳定）。代价是每个套接字
 每个方向同一时刻只能有一个未完成操作（流的常规约束），以及**有未完成操作时不能销毁
-I/O 对象**（契约违规；移动是安全的，实现对象地址不变）。
+I/O 对象**（契约违规；移动是安全的，实现对象地址不变）。对完成型后端这一点更重要：
+内核持有指向缓冲区与操作的指针直到完成。
 
-`await_ready` 做推测性系统调用（数据已就绪则不挂起）；`await_suspend` 记下续体与
-环境、注册 stop_callback（回调 `cancel_op`）、`start_op`；排队后复查
-`stop_requested()` 关闭"注册回调与排队之间停止到达"的窗口。`await_resume` 销毁
-stop_callback、清 pending、交出 `{ec, bytes}`。
+`ready` 做推测性系统调用（数据已就绪则不挂起）；`suspend` 记下续体与环境、注册
+stop_callback（回调 `cancel_op`）、`start_op`；排队后复查 `stop_requested()` 关闭"注册
+回调与排队之间停止到达"的窗口。`finish_*` 销毁 stop_callback、清 pending、交出结果。
 
 ### 其它 I/O 对象
 
-- `steady_timer`：`timer_impl` 即 `timer_op`；`expires_*` / `cancel` 取消挂起的 wait。
+- `steady_timer`：`reactor_timer` 即 `timer_op`；`expires_*` / `cancel` 取消挂起的 wait。
 - `resolver`：每个 io_context 一个 `resolver_service`，惰性启动一条工作线程串行执行
   `getaddrinfo` / `getnameinfo`；取消不能中断进行中的调用，结果到达后以
-  `operation_aborted` 完成。
+  `operation_aborted` 完成。与后端无关。
 - `signal_set`：进程唯一的自管道 + 每个信号的注册表；每个 io_context 的
-  `signal_service` 把管道读端注册进自己的反应器，用一个永不完成的读操作（`perform`
-  读到 EAGAIN 返回 false 保持排队）分发给所有注册了该信号的 signal_set。
+  `signal_service` 经 `io_backend::register_signal_reader` 请求后端监视管道读端（就绪型
+  用一个永不完成的读操作），可读时排空并分发给所有注册了该信号的 signal_set。
 
-锁序：反应器锁 → 信号状态锁 → io_context 队列锁；strand 锁 → 内层执行器。
+锁序：反应器锁 → 解复用器锁；反应器锁 → 信号状态锁 → io_context 队列锁。
 
 ## 组合子
 

@@ -82,7 +82,7 @@ auto generic_tuple() CO2_BEG((net::task<std::tuple<int, std::string>>), (), std:
 CO2_END
 
 void when_all_concatenates_non_io_values() {
-    net::io_context ctx;
+    test_context ctx;
     auto const t = run_task(ctx, generic_tuple());
     CHECK_EQ(std::get<0>(t), 1);
     CHECK_EQ(std::get<1>(t), "two");
@@ -95,7 +95,7 @@ auto all_void() CO2_BEG(net::task<int>, ()) {
 CO2_END
 
 void when_all_of_void_tasks_is_void() {
-    net::io_context ctx;
+    test_context ctx;
     CHECK_EQ(run_task(ctx, all_void()), 1);
 }
 
@@ -107,7 +107,7 @@ auto io_pair(net::io_context* ctx) CO2_BEG((net::task<net::io_result<std::size_t
 CO2_END
 
 void when_all_lifts_error_code_out_of_io_results() {
-    net::io_context ctx;
+    test_context ctx;
     auto const r = run_task(ctx, io_pair(&ctx));
     CHECK(not r.ec);
     CHECK_EQ(std::get<0>(r.values), 3U);
@@ -121,7 +121,7 @@ auto io_mixed() CO2_BEG((net::task<net::io_result<std::size_t>>), (), net::io_re
 CO2_END
 
 void when_all_skips_empty_payloads() {
-    net::io_context ctx;
+    test_context ctx;
     auto const r = run_task(ctx, io_mixed());
     CHECK(not r.ec);
     CHECK_EQ(r.value, 9U);
@@ -137,7 +137,7 @@ auto io_failure(net::io_context* ctx) CO2_BEG((net::task<net::io_result<std::siz
 CO2_END
 
 void when_all_cancels_siblings_on_error() {
-    net::io_context ctx;
+    test_context ctx;
     auto const start = std::chrono::steady_clock::now();
     auto const r = run_task(ctx, io_failure(&ctx));
     CHECK(r.ec == net::error::eof);
@@ -158,7 +158,7 @@ auto exception_wins(net::io_context* ctx) CO2_BEG(net::task<int>, (ctx), std::tu
 CO2_END
 
 void when_all_rethrows_the_first_exception_after_all_complete() {
-    net::io_context ctx;
+    test_context ctx;
     auto thrown = false;
     net::run_async(ctx.get_executor(), [](int) { CHECK(false); },
                    [&](std::exception_ptr const e) {
@@ -186,7 +186,7 @@ auto ranged(net::io_context* ctx) CO2_BEG((net::task<net::io_result<std::vector<
 CO2_END
 
 void when_all_range_keeps_order() {
-    net::io_context ctx;
+    test_context ctx;
     auto const r = run_task(ctx, ranged(&ctx));
     CHECK(not r.ec);
     CHECK_EQ(r.value.size(), 3U);
@@ -204,7 +204,7 @@ auto ranged_void() CO2_BEG(net::task<int>, (), std::vector<net::task<>> tasks;) 
 CO2_END
 
 void when_all_range_of_void() {
-    net::io_context ctx;
+    test_context ctx;
     CHECK_EQ(run_task(ctx, ranged_void()), 2);
 }
 
@@ -217,7 +217,7 @@ auto race(net::io_context* ctx) CO2_BEG((net::task<net::when_any_result<int>>), 
 CO2_END
 
 void when_any_returns_the_first_and_cancels_the_rest() {
-    net::io_context ctx;
+    test_context ctx;
     auto const start = std::chrono::steady_clock::now();
     auto const r = run_task(ctx, race(&ctx));
     CHECK_EQ(r.index, 1U);
@@ -235,7 +235,7 @@ auto io_race(net::io_context* ctx) CO2_BEG((net::task<net::when_any_result<std::
 CO2_END
 
 void when_any_skips_failed_children() {
-    net::io_context ctx;
+    test_context ctx;
     auto const r = run_task(ctx, io_race(&ctx));
     CHECK(not r.ec);
     CHECK_EQ(r.index, 1U);
@@ -250,7 +250,7 @@ auto all_fail() CO2_BEG((net::task<net::when_any_result<std::size_t>>), (), net:
 CO2_END
 
 void when_any_reports_the_first_error_when_all_fail() {
-    net::io_context ctx;
+    test_context ctx;
     auto const r = run_task(ctx, all_fail());
     CHECK(r.ec == net::error::eof);
     CHECK_EQ(r.index, net::when_any_result<std::size_t>::none);
@@ -267,7 +267,7 @@ auto any_range(net::io_context* ctx) CO2_BEG((net::task<net::when_any_result<int
 CO2_END
 
 void when_any_range() {
-    net::io_context ctx;
+    test_context ctx;
     auto const r = run_task(ctx, any_range(&ctx));
     CHECK_EQ(r.index, 1U);
     CHECK_EQ(r.value, 2);
@@ -289,7 +289,7 @@ auto fire_after(net::io_context* ctx, net::stop_source* source)
 CO2_END
 
 void parent_stop_token_is_forwarded_to_children() {
-    net::io_context ctx;
+    test_context ctx;
     net::stop_source source;
     auto result = 0;
     net::run_async(ctx.get_executor(), source.get_token(), nullptr, [&](int v) { result = v; },

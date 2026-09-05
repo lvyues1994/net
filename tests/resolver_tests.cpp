@@ -32,7 +32,7 @@ net::io_result<results_type> run_resolve(net::io_context& ctx, net::ip::tcp::res
 }
 
 void numeric_host_and_service() {
-    net::io_context ctx;
+    test_context ctx;
     net::ip::tcp::resolver resolver{ctx};
     auto const r = run_resolve(ctx, resolver, "127.0.0.1", "8080",
                                net::ip::resolver_flags::numeric_host | net::ip::resolver_flags::numeric_service);
@@ -44,7 +44,7 @@ void numeric_host_and_service() {
 }
 
 void ipv6_numeric_host() {
-    net::io_context ctx;
+    test_context ctx;
     net::ip::tcp::resolver resolver{ctx};
     auto const r = run_resolve(ctx, resolver, "::1", "1", net::ip::resolver_flags::numeric_host | net::ip::resolver_flags::numeric_service);
     CHECK(not r.ec);
@@ -55,7 +55,7 @@ void ipv6_numeric_host() {
 }
 
 void localhost_resolves_to_loopback() {
-    net::io_context ctx;
+    test_context ctx;
     net::ip::tcp::resolver resolver{ctx};
     auto const r = run_resolve(ctx, resolver, "localhost", "80", net::ip::resolver_flags::numeric_service);
     CHECK(not r.ec);
@@ -67,7 +67,7 @@ void localhost_resolves_to_loopback() {
 }
 
 void invalid_numeric_host_fails() {
-    net::io_context ctx;
+    test_context ctx;
     net::ip::tcp::resolver resolver{ctx};
     auto const r = run_resolve(ctx, resolver, "not-an-address", "80",
                                net::ip::resolver_flags::numeric_host | net::ip::resolver_flags::numeric_service);
@@ -76,7 +76,7 @@ void invalid_numeric_host_fails() {
 }
 
 void passive_resolution_for_binding() {
-    net::io_context ctx;
+    test_context ctx;
     net::ip::tcp::resolver resolver{ctx};
     auto const r = run_resolve(ctx, resolver, "", "9000",
                                net::ip::resolver_flags::passive | net::ip::resolver_flags::numeric_service);
@@ -94,7 +94,7 @@ auto reverse(net::ip::tcp::resolver* resolver, net::ip::tcp::endpoint ep)
 CO2_END
 
 void reverse_resolution_of_loopback() {
-    net::io_context ctx;
+    test_context ctx;
     net::ip::tcp::resolver resolver{ctx};
     net::io_result<results_type> result;
     net::run_async(ctx.get_executor(), [&](net::io_result<results_type> v) { result = std::move(v); },
@@ -107,7 +107,7 @@ void reverse_resolution_of_loopback() {
 }
 
 void stop_token_cancels_a_resolution() {
-    net::io_context ctx;
+    test_context ctx;
     net::ip::tcp::resolver resolver{ctx};
     net::stop_source source;
     source.request_stop();

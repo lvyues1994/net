@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <mutex>
 #include <set>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -40,6 +41,36 @@ void run_returns_immediately_without_work() {
     CHECK_EQ(ctx.run(), 0U);
     CHECK_EQ(ctx.poll(), 0U);
     CHECK(not ctx.stopped());
+}
+
+auto tick(net::io_context* ctx) CO2_BEG(net::task<int>, (ctx), net::steady_timer timer{*ctx}; net::io_result<> r;) {
+    timer.expires_after(std::chrono::milliseconds{5});
+    CO2_AWAIT_SET(r, timer.wait());
+    CO2_RETURN(r.ec ? 0 : 1);
+}
+CO2_END
+
+// 每种后端都能被选中、报告自己的名字，并跑通一个定时器。
+void every_backend_can_be_selected() {
+    {
+        net::io_context ctx;
+        CHECK(ctx.backend() == net::backend_kind::epoll);
+        CHECK_EQ(std::string{ctx.backend_name()}, "epoll");
+    }
+    net::backend_kind const kinds[] = {net::backend_kind::epoll, net::backend_kind::poll, net::backend_kind::select};
+    for (auto const kind : kinds) {
+        net::io_context ctx{kind, 1};
+        CHECK(ctx.backend() == kind);
+        CHECK_EQ(std::string{ctx.backend_name()}, std::string{net::to_string(kind)});
+        auto ticks = 0;
+        net::run_async(ctx.get_executor(), [&](int v) { ticks = v; }, [](std::exception_ptr) { CHECK(false); })(tick(&ctx));
+        ctx.run();
+        CHECK_EQ(ticks, 1);
+    }
+    net::io_context by_tag_poll{net::poll};
+    CHECK(by_tag_poll.backend() == net::backend_kind::poll);
+    net::io_context by_tag_select{net::select, 2};
+    CHECK(by_tag_select.backend() == net::backend_kind::select);
 }
 
 void stop_and_restart() {
@@ -239,6 +270,7 @@ void poll_processes_ready_work_only() {
 
 int main() {
     run_returns_immediately_without_work();
+    every_backend_can_be_selected();
     stop_and_restart();
     io_context_runs_on_multiple_threads();
     strand_serializes_on_a_thread_pool();

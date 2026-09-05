@@ -18,7 +18,7 @@
 #include "net/execution_context.hpp"
 #include "net/io_context.hpp"
 
-#include "detail/reactor.hpp"
+#include "detail/backend.hpp"
 
 namespace net {
 namespace detail {
@@ -112,59 +112,29 @@ struct signal_set_impl {
     late_init<stop_callback<cancel_signal_wait>> stop_cb;
 };
 
-// 每个 io_context 一个：把管道读端注册进反应器，用一个常驻读操作分发信号。
+// 每个 io_context 一个：请求后端监视信号管道的读端。可读时后端排空它并对每个信号号
+// 调用 deliver（就绪型后端用一个常驻读操作；完成型后端可用 poll-add / 等待对象）。
 struct signal_service final : execution_context::service {
-    explicit signal_service(execution_context& context)
-        : context_{static_cast<io_context*>(&context)},
-          reactor_{&io_context_access::get_reactor(*context_)} {
+    explicit signal_service(execution_context& context) {
         auto& state = signal_state::instance();
         auto fd = -1;
         {
-            // 锁序：反应器锁 → 信号状态锁（泵在反应器锁内分发）。这里不能反过来持锁注册。
             std::lock_guard<std::mutex> lock{state.mutex};
             auto const ec = state.ensure_pipe();
             if (ec) throw std::system_error{ec, "signal_set pipe"};
             fd = state.pipe_read();
         }
-        pump_.fd_ = fd;
-        pump_.counts_as_work = false;
-        auto const registered = reactor_->register_descriptor(descriptor_, fd);
+        auto const registered = io_context_access::backend(static_cast<io_context&>(context))
+                                    .register_signal_reader(fd, &signal_service::deliver);
         if (registered) throw std::system_error{registered, "signal_set register"};
-        reactor_->start_op(descriptor_, op_direction::read, pump_);
     }
 
-    ~signal_service() override { deregister(); }
-
-    void shutdown() override { deregister(); }
+    void shutdown() override {}
 
   private:
-    struct pump_op final : reactor_op {
-        bool perform() noexcept override {
-            for (;;) {
-                int value = 0;
-                auto const n = ::read(fd_, &value, sizeof(value));
-                if (n == static_cast<ssize_t>(sizeof(value))) {
-                    signal_state::instance().deliver(value);
-                    continue;
-                }
-                if (n < 0 && errno == EINTR) continue;
-                return false; // EAGAIN 或异常：保持排队等待下一个边沿
-            }
-        }
-
-        void complete() noexcept override {}
-
-        int fd_ = -1;
-    };
-
-    void deregister() noexcept {
-        if (descriptor_.registered) reactor_->deregister_descriptor(descriptor_);
+    static void deliver(int const signal_number) noexcept {
+        signal_state::instance().deliver(signal_number);
     }
-
-    io_context* context_;
-    reactor* reactor_;
-    descriptor_state descriptor_;
-    pump_op pump_;
 };
 
 // ---- signal_state ----

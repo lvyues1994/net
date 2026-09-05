@@ -9,7 +9,7 @@
 #include "net/error.hpp"
 #include "net/io_context.hpp"
 
-#include "detail/socket_impl.hpp"
+#include "detail/backend.hpp"
 
 namespace net {
 
@@ -73,34 +73,27 @@ tcp_acceptor::endpoint_type tcp_acceptor::local_endpoint(std::error_code& ec) co
 
 tcp_accept_awaitable tcp_acceptor::accept() noexcept {
     CO2_CONTRACT_CHECK(impl() != nullptr);
-    auto& op = impl()->read_op;
-    CO2_CONTRACT_CHECK(not op.pending);
-    op.op_kind = detail::socket_op::kind::accept;
-    op.accepted_fd = -1;
+    impl()->begin_accept();
     return tcp_accept_awaitable{this};
 }
 
 bool tcp_accept_awaitable::await_ready() noexcept {
-    auto* const impl = acceptor->impl();
-    return impl->op_ready(impl->read_op);
+    return acceptor->impl()->ready(detail::op_direction::read);
 }
 
 coroutine_handle<> tcp_accept_awaitable::await_suspend(coroutine_handle<> const h,
                                                        io_env const* const env) noexcept {
-    auto* const impl = acceptor->impl();
-    return impl->op_suspend(impl->read_op, h, env);
+    return acceptor->impl()->suspend(detail::op_direction::read, h, env);
 }
 
 io_result<tcp_socket> tcp_accept_awaitable::await_resume() noexcept {
     auto* const impl = acceptor->impl();
-    auto& op = impl->read_op;
-    impl->op_finish(op);
-    auto result = io_result<tcp_socket>{op.ec, tcp_socket{}};
-    if (op.ec || op.accepted_fd < 0) return result;
-    auto const fd = op.accepted_fd;
-    op.accepted_fd = -1;
-    auto const protocol = op.address.ss_family == AF_INET6 ? ip::tcp::v6() : ip::tcp::v4();
-    auto peer = tcp_socket{*impl->context};
+    auto fd = -1;
+    auto family = 0;
+    auto result = io_result<tcp_socket>{impl->finish_accept(fd, family), tcp_socket{}};
+    if (result.ec || fd < 0) return result;
+    auto const protocol = family == AF_INET6 ? ip::tcp::v6() : ip::tcp::v4();
+    auto peer = tcp_socket{impl->context()};
     result.ec = peer.assign(protocol, fd);
     if (result.ec) {
         ::close(fd);
