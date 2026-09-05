@@ -1,0 +1,186 @@
+# 架构
+
+本文描述 net 的分层、每层与提案（P4003R3 / P4172R1 / P4100R1 / P4124R0）的对应关系、
+在 co2（C++14 无栈协程）上落地时的关键决策，以及生命周期契约。
+
+## 问题
+
+Network Endeavor 主张：C++20 协程本身就是网络 I/O 的执行模型，不需要在其上再叠一层
+sender 抽象。协议只回答三个问题——协程在哪个执行器上恢复、该不该停、帧在哪分配——
+以 `io_env` 打包、经双参数 `await_suspend(coroutine_handle<>, io_env const*)` 注入。
+net 用 C++14 与 co2 实现这套协议：语言里没有 `co_await`，但 co2 的 promise/awaiter 协议
+与标准同形，`await_transform` 这个注入点是存在的。
+
+## 分层
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│ 应用          examples/ echo_server echo_client http_get timers       │
+├──────────────────────────────────────────────────────────────────────┤
+│ 平台（libnet） io_context   tcp / udp / timer / resolver / signal_set │
+│                src/detail/epoll_reactor  reactor_op  socket_impl     │
+├──────────────────────────────────────────────────────────────────────┤
+│ 组合子        when_all  when_any          detail/combinator          │
+│ 流            stream (read/write/read_until)  any_stream             │
+│ 缓冲区        buffers  dynamic_buffer  span                          │
+├──────────────────────────────────────────────────────────────────────┤
+│ 执行器        thread_pool  strand  any_executor  executor_ref        │
+│ 启动          run_async  run              detail/completion_frame    │
+├──────────────────────────────────────────────────────────────────────┤
+│ 协议核心      io_env  continuation  task  io_awaitable_promise_base  │
+│               this_coro  io_result  immediate  execution_context     │
+│               memory_resource (帧分配器带外通道, safe_resume)        │
+├──────────────────────────────────────────────────────────────────────┤
+│ co2           coroutine_handle  CO2_* 宏  stop_token  contract       │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+依赖只向下。协议核心到组合子仅含头文件、与平台无关；平台层编译进 `libnet.a`，
+反应器接口（`src/detail/reactor.hpp`）只在 `src/` 内可见。
+
+## 协议核心
+
+### env_awaiter：把 IoAwaitable 装进 co2
+
+co2 的 `CO2_AWAIT(e)` 展开为标准的 `co_await` 序列：`promise.await_transform(e)` →
+`operator co_await` 查找 → `await_ready` → `await_suspend(coroutine_handle<Promise>)` →
+`await_resume`。`io_awaitable_promise_base<Derived>::await_transform(A&&)`：
+
+1. 截获 `this_coro::*` 标签，返回不挂起的 `immediate_value<T>`；
+2. 其余交给 `Derived::transform_awaitable`（扩展点），再用 co2 的 `getAwaiter` 完成
+   `operator_co_await` 查找，得到最终 awaiter；
+3. 把 awaiter **按值**移进 `env_awaiter<Inner>`（co2 D10：awaitable 表达式里的临时对象
+   活不过挂起点，awaiter 必须自己拥有一切），连同 promise 里的 `io_env const*`。
+
+`env_awaiter::await_suspend(coroutine_handle<Promise>)` 调用
+`inner.await_suspend(static_cast<coroutine_handle<>>(h), env)`；`await_resume` 先
+`set_cached_frame_allocator(env->frame_allocator)` 再转发。`Inner` 没有双参数
+`await_suspend` 时 `static_assert` 给出清晰的诊断。
+
+一个实现细节：基类模板里对 `Derived` 成员的访问必须是依赖名（`template <class A,
+class D = Derived>`），否则 GCC 在基类实例化时就检查它，而此时 `Derived` 不完整——
+co2 的 D9 宽松规则会把 SFINAE 失败当成"没有 await_transform"静默回落到原始 awaitable。
+
+### task<T>
+
+与 co2 `Task<T>` 同形（惰性、单消费者、只可移动、右值本身是 awaiter、左值经
+`operator_co_await() &` 借用），差别是协议要求的部分：`await_suspend(h, io_env const*)`
+让子 promise 继承整个环境；`initial_awaiter::await_resume` 把环境里的帧分配器写进线程
+局部槽位；promise 满足 IoRunnable（`handle() / release() / exception() / result() /
+set_continuation() / set_environment()`）。
+
+### 帧分配
+
+`io_awaitable_promise_base::operator new(size)` 读 `get_cached_frame_allocator()`
+（空则 `new_delete_resource()`），多分配一个 `memory_resource*` 存在帧尾；
+`operator delete(p, size)` 从帧尾取回。co2 检测到 promise 有 `operator new` 就用它
+（忽略 allocator 参数路径）。`safe_resume` 在恢复前后保存/恢复槽位——所有执行循环
+（`io_context::run`、`thread_pool` 工作线程、`strand` 派发帧）都经由它恢复协程。
+
+`execution_context` 自带一个 `recycling_memory_resource` 作为默认帧分配器：按
+（尺寸, 对齐）分类缓存最近释放的块；协程帧尺寸重复、生命周期嵌套，稳态下每次帧分配
+命中缓存。
+
+### completion_frame
+
+启动函数与组合子需要"task 完成时通知我"的续体，但没有协程可以 `co_await`。
+`detail::completion_frame` 是一个手写的标准布局帧（首成员是 co2 的 `FrameHeader`）：
+把它的 `handle()` 设为 task 的续体，task 的 `final_suspend` 对称转移到它，co2 的恢复
+循环调用它的 `step` → 我们的回调；回调返回下一个要恢复的句柄（通常是
+`executor.dispatch(parent)` 的结果）或空。这是 co2 自己的 `syncWait` / `spawn` /
+`whenAll` 使用的技术。
+
+## 启动
+
+- `run_async(ex[, token, mr][, on_value, on_error])(task)`：第一段构造 launcher，把帧分配器
+  （显式给出的，否则 `ex.context().get_frame_allocator()`）写进槽位并在析构时恢复；第二段
+  堆分配 `run_async_state`（执行器副本、`io_env`、task、处理器、completion_frame），
+  `on_work_started()`，`post` 启动句柄。完成回调：调用处理器（默认丢弃结果、重抛
+  异常）、`on_work_finished()`、释放状态。`io_env::executor` 指向状态里的执行器副本，
+  因此 `executor_ref` 的生存期由链的生存期保证。
+- `run(ex / token / mr)(task)`：awaiter 拥有子 task 与一个新 `io_env`；`await_suspend`
+  经新执行器 `dispatch` 启动子任务（已在该上下文则对称转移），子任务完成后边界帧经
+  **父**执行器 `dispatch` 恢复父协程。子任务运行期间持有新执行器的工作计数。
+
+## 执行器
+
+`is_executor<E>` 以 SFINAE 检查 P4003R3 §4.3 的七条要求。`executor_ref` 是两指针的
+非拥有视图（`detail::executor_vtable_for<E>`），`any_executor` 是拥有型的。
+
+- `io_context`：互斥锁保护的侵入式 `continuation` 队列 + 工作计数 + 反应器。`run()`
+  循环：有队列元素就 `safe_resume`；无工作则返回；否则一个线程进反应器
+  （`epoll_wait`），其它线程等条件变量。`post` 叫醒空闲线程或（唯一的线程在
+  `epoll_wait` 里时）写 eventfd 打断它。`dispatch` 在本线程正 `run()` 本上下文时直接
+  返回 `c.h`。线程与上下文的关系用线程局部的调用栈记录（允许嵌套 `run()`）。
+- `thread_pool`：固定线程数，同一份队列/工作计数模型；池自身持有一份初始工作直到
+  `join()`。
+- `strand<Ex>`：互斥锁 + 侵入式队列 + 一个派发帧（completion_frame）。首个到达的续体
+  把派发帧 `post` 到内层执行器；派发帧取走整批续体逐个 `safe_resume`，期间到达的排入
+  下一批，批结束后重新 `post`（公平性）。派发帧排队期间实现自我保活。
+
+## 反应器（Linux epoll）
+
+`src/detail/reactor.hpp` 是 I/O 对象与反应器之间的私有协议：
+
+- `descriptor_state`（每个描述符）：fd、两个方向各一个 `reactor_op*`、未消费的就绪位；
+- `reactor_op`：`perform()`（就绪时在反应器锁内执行非阻塞系统调用，返回是否完成）、
+  `complete()`（锁外恰好调用一次，把续体交给操作的执行器：`env->executor.post(cont)`）；
+- `timer_op`：到期时间 + 堆下标。
+
+边沿触发一次注册（`EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET`）。事件到达而没有排队
+操作时记入就绪位，`start_op` 先消费它——避免 ET 下推测尝试与排队之间的丢失唤醒。
+定时器是二叉堆，`epoll_wait` 超时取最早到期。每个排队操作与定时器持有 io_context 的
+一份工作计数（信号泵这类常驻监听除外：`counts_as_work = false`）。
+
+### 操作状态住在 I/O 对象里
+
+`tcp_socket::read_some(buffers)` 把缓冲区序列展平进 `socket_impl::read_op`，返回的
+awaiter 只有一个指针（`socket_read_awaitable{impl}`）——总能内联进协程帧的 awaiter 槽，
+每次操作零分配，且 awaiter 的三个方法都定义在库内（ABI 稳定）。代价是每个套接字
+每个方向同一时刻只能有一个未完成操作（流的常规约束），以及**有未完成操作时不能销毁
+I/O 对象**（契约违规；移动是安全的，实现对象地址不变）。
+
+`await_ready` 做推测性系统调用（数据已就绪则不挂起）；`await_suspend` 记下续体与
+环境、注册 stop_callback（回调 `cancel_op`）、`start_op`；排队后复查
+`stop_requested()` 关闭"注册回调与排队之间停止到达"的窗口。`await_resume` 销毁
+stop_callback、清 pending、交出 `{ec, bytes}`。
+
+### 其它 I/O 对象
+
+- `steady_timer`：`timer_impl` 即 `timer_op`；`expires_*` / `cancel` 取消挂起的 wait。
+- `resolver`：每个 io_context 一个 `resolver_service`，惰性启动一条工作线程串行执行
+  `getaddrinfo` / `getnameinfo`；取消不能中断进行中的调用，结果到达后以
+  `operation_aborted` 完成。
+- `signal_set`：进程唯一的自管道 + 每个信号的注册表；每个 io_context 的
+  `signal_service` 把管道读端注册进自己的反应器，用一个永不完成的读操作（`perform`
+  读到 EAGAIN 返回 false 保持排队）分发给所有注册了该信号的 signal_set。
+
+锁序：反应器锁 → 信号状态锁 → io_context 队列锁；strand 锁 → 内层执行器。
+
+## 组合子
+
+`when_all` / `when_any` 的每个子 awaitable 由一个 runner 协程（`task<void>`）
+`co_await`：runner 的 promise 把组合子的 `child_env`（父执行器、组合子自己的
+`stop_source` 的 token、父帧分配器）注入子 awaitable，并捕获异常。runner 的续体是嵌在
+组合子里的 `completion_frame`；子完成时记录结果、必要时请求兄弟停止，最后一个到达者
+经父执行器 `dispatch` 恢复父协程。计数初值 N + 1，启动方放下自己那一份时若归零则不
+挂起。
+
+结果类型（P4124R0 §2.3）：`io_result<T>` 载荷 T、`io_result<>` 与 void 不占位、
+`io_result<T, U..>` 载荷 `tuple<T, U..>`；有 io 子任务时结果是 `io_result<载荷...>`，
+否则 `std::tuple<载荷...>`（全空为 void）。`when_any` 同构载荷给出
+`when_any_result<P>`，异构给出 `when_any_result<std::tuple<P...>>`（只有赢家下标处有意义
+——C++14 没有 `std::variant`）。
+
+## 与提案的有意偏离
+
+全部来自 C++14 / co2 的限制：
+
+- `co_await e` → `CO2_AWAIT(e)` / `CO2_AWAIT_SET(v, e)`；结构化绑定 → `r.ec` / `r.value`
+  （io_result 提供 tuple 协议，C++17 可结构化绑定）；
+- concept → `is_*` 特征 + `static_assert`；
+- `std::pmr::memory_resource` → `net::memory_resource`（同形）；`std::span` →
+  `net::span`（子集）；`std::stop_token` → `co2::stop_token`（同形）；
+- `when_any` 异构结果用 tuple 而不是 variant；
+- 两段调用的求值顺序在 C++14 未规定：提供工厂形态作为确定性替代；
+- 操作状态住在 I/O 对象里而不是 awaiter 里（awaiter 需要放进 co2 固定容量的槽位）。
