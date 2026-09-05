@@ -57,8 +57,16 @@ void every_backend_can_be_selected() {
         CHECK(ctx.backend() == net::backend_kind::epoll);
         CHECK_EQ(std::string{ctx.backend_name()}, "epoll");
     }
-    net::backend_kind const kinds[] = {net::backend_kind::epoll, net::backend_kind::poll, net::backend_kind::select};
+    CHECK(net::backend_available(net::backend_kind::epoll));
+    CHECK(net::backend_available(net::backend_kind::poll));
+    CHECK(net::backend_available(net::backend_kind::select));
+    net::backend_kind const kinds[] = {net::backend_kind::epoll, net::backend_kind::poll, net::backend_kind::select,
+                                       net::backend_kind::io_uring};
     for (auto const kind : kinds) {
+        if (not net::backend_available(kind)) {
+            std::cout << "skipping unavailable backend " << net::to_string(kind) << '\n';
+            continue;
+        }
         net::io_context ctx{kind, 1};
         CHECK(ctx.backend() == kind);
         CHECK_EQ(std::string{ctx.backend_name()}, std::string{net::to_string(kind)});
@@ -71,6 +79,11 @@ void every_backend_can_be_selected() {
     CHECK(by_tag_poll.backend() == net::backend_kind::poll);
     net::io_context by_tag_select{net::select, 2};
     CHECK(by_tag_select.backend() == net::backend_kind::select);
+    if (net::backend_available(net::backend_kind::io_uring)) {
+        net::io_context by_tag_uring{net::io_uring};
+        CHECK(by_tag_uring.backend() == net::backend_kind::io_uring);
+        CHECK_EQ(std::string{by_tag_uring.backend_name()}, "io_uring");
+    }
 }
 
 void stop_and_restart() {

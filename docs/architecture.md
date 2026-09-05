@@ -20,7 +20,7 @@ net 用 C++14 与 co2 实现这套协议：语言里没有 `co_await`，但 co2 
 │ 具体层（libnet） io_context  tcp / udp / timer / resolver / signal_set │
 │                 ↓ 抽象接缝 src/detail/backend.hpp                    │
 │ 后端            reactor_backend + demultiplexer{epoll, poll, select} │
-│                 （将来：io_uring_backend / iocp_backend）             │
+│                 uring_backend（io_uring，完成型）                     │
 ├──────────────────────────────────────────────────────────────────────┤
 │ 组合子        when_all  when_any          detail/combinator          │
 │ 流            stream (read/write/read_until)  any_stream             │
@@ -124,7 +124,8 @@ set_continuation() / set_environment()`）。
 
 ## 平台层：具体层 + 后端
 
-`io_context(tag)` 在构造时选择后端（`net::epoll` 默认、`net::poll`、`net::select`）：
+`io_context(tag)` 在构造时选择后端（`net::epoll` 默认、`net::poll`、`net::select`、
+`net::io_uring`）：
 `io_context.cpp` 的 `make_backend(kind)` 用 `make_service` 在上下文里注册一个
 `detail::io_backend` 服务。`io_context::impl` 自己拥有队列、工作计数与 run 循环，后端只
 负责"等一批事件、把完成的操作交给它们的执行器"，以及创建 `socket_impl` / `timer_impl`。

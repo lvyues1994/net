@@ -6,8 +6,8 @@ set(net_test_sources
     stream_tests.cpp
     header_self_containment.cpp)
 
-# 平台测试：同一份源码为每个后端各编译一个变体（<name>、<name>_poll、<name>_select），
-# NET_TEST_BACKEND 决定 test_context 使用的后端（见 check.hpp）。
+# 平台测试：同一份源码为每个后端各编译一个变体（<name>、<name>_poll、<name>_select、
+# <name>_io_uring），NET_TEST_BACKEND 决定 test_context 使用的后端（见 check.hpp）。
 set(net_platform_test_sources
     combinator_tests.cpp
     timer_tests.cpp
@@ -45,7 +45,7 @@ endforeach()
 
 foreach(source IN LISTS net_platform_test_sources)
     get_filename_component(name "${source}" NAME_WE)
-    foreach(backend IN ITEMS epoll poll select)
+    foreach(backend IN ITEMS epoll poll select io_uring)
         if(backend STREQUAL "epoll")
             set(target ${name})
         else()

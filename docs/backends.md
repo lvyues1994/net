@@ -80,6 +80,12 @@ src/detail/reactor/            就绪型后端族
     epoll_demultiplexer.cpp        边沿触发
     poll_demultiplexer.cpp         电平触发，pollfd 数组 + 快照
     select_demultiplexer.cpp       电平触发，fd_set，FD_SETSIZE
+src/detail/io_uring/           完成型后端：io_uring
+    uring.hpp/.cpp                 裸系统调用的环封装（setup / enter / mmap SQ、CQ、SQE 数组），不依赖 liburing
+    uring_op.hpp                   操作基类：prepare(sqe) / on_complete(res) / complete()，状态位由环锁保护
+    uring_backend.hpp/.cpp         io_backend：提交 / 取消 / 延迟队列 / CQE 收割；eventfd 与信号管道的常驻 POLL_ADD
+    uring_socket.hpp/.cpp          socket_impl：RECVMSG / SENDMSG / ACCEPT / CONNECT（保留推测系统调用）
+    uring_timer.hpp/.cpp           timer_impl：绝对时间 TIMEOUT，取消用 TIMEOUT_REMOVE
 src/io_context.cpp             调度器（队列、工作计数、run 循环）+ make_backend(kind)
 src/socket_base.cpp tcp.cpp udp.cpp timer.cpp signal_set.cpp resolver.cpp   具体层
 ```
@@ -121,42 +127,54 @@ src/socket_base.cpp tcp.cpp udp.cpp timer.cpp signal_set.cpp resolver.cpp   具�
 锁内被任何线程调用。电平触发的实现自己再加一把注册表锁保护快照构建。锁序：反应器锁 →
 解复用器锁；反应器锁 → 信号状态锁 → io_context 队列锁。
 
-## 4. 接入 io_uring
+## 4. io_uring 后端（完成型）
 
 io_uring 是完成型：把"读 fd 到这些缓冲区"作为一个 SQE 提交，内核完成后给一个 CQE。它
-**不属于就绪型族**，所以不是再写一个 `demultiplexer`，而是另一个 `io_backend` 实现：
+**不属于就绪型族**，不是再写一个 `demultiplexer`，而是另一个 `io_backend` 实现
+（`src/detail/io_uring/`）。环是裸系统调用实现的（`io_uring_setup` / `io_uring_enter` +
+mmap 三块内存），只需要 `<linux/io_uring.h>`，不依赖 liburing。
 
-```
-src/detail/io_uring/
-    uring_backend.hpp/.cpp      io_backend：ring（liburing）、提交队列、CQE 分发、eventfd 唤醒
-    uring_op.hpp                op 基类：prep(sqe) / on_cqe(res, flags)；cont、env、pending、stop_cb
-    uring_socket.hpp/.cpp       socket_impl：IORING_OP_RECVMSG / SENDMSG / CONNECT / ACCEPT
-    uring_timer.hpp/.cpp        timer_impl：IORING_OP_TIMEOUT（或复用反应器的堆 + 最早到期作 wait 超时）
-```
+### 线程模型
 
-与就绪型实现相比，三步协议的语义变化：
+- **SQ 单生产者**：所有提交（`submit`、取消请求、常驻轮询的重新武装）都在 `uring_backend`
+  的环锁内取 SQE、填参数、发布尾指针并 `io_uring_enter(to_submit)`。环满时操作进入延迟
+  队列，由 `run()` 补提交。
+- **CQ 单消费者**：只有当前运行事件循环的线程调用 `run()`（`io_context` 以 `reactor_busy`
+  保证）。`run()` 先在环锁内补提交延迟队列，然后 `io_uring_enter(GETEVENTS, min=1,
+  EXT_ARG 超时)` 等待，收割全部 CQE。
+- **一条 C++ 内存模型上的 happens-before**：提交者在环锁内写完操作参数后 unlock；内核发布
+  CQE 这一跳对 C++ 不可见，所以 `run()` 在读操作对象之前先取一次环锁，再 `on_complete`。
+  否则 TSan 会（正确地）报告 `begin_read` 的写与 `on_complete` 的读之间没有同步边。
+- 完成的操作在锁外 `complete()`（`env->executor.post(cont)`）并归还工作计数；
+  `complete()` 之后不再触碰操作对象（续体恢复后套接字可能已被销毁）。
+
+### 三步协议的实现
 
 | 步骤 | 就绪型 | io_uring |
 | --- | --- | --- |
-| `begin_*` | 记缓冲区描述符 | 同；缓冲区必须钉住到 CQE 到达（op 状态住在 I/O 对象里已经保证） |
-| `ready()` | 推测系统调用，成功则不挂起 | 一般返回 false（可选：`IORING_RECVSEND_POLL_FIRST`；零长度传输仍立即完成） |
-| `suspend()` | `start_op` 排队，等就绪 | 取 SQE、`prep`、`io_uring_submit`（或批量在 `run` 里提交）；返回 noop |
-| 完成 | 反应器线程 `perform()` 后 `complete()` | `run()` 里 `io_uring_wait_cqe_timeout` 取 CQE → `op.on_cqe(res)` 记 ec/bytes → `complete()`（`env->executor.post`） |
-| 取消 | 锁内摘下，立即 `complete(operation_aborted)` | 提交 `IORING_OP_ASYNC_CANCEL`，**等原操作的 CQE**（`-ECANCELED`）再完成；期间 op 保持 pending |
-| `close()` | 注销 + 取消 + `::close` | 先取消并等待 in-flight CQE 排空（或 `IORING_ASYNC_CANCEL_FD`），再 close；简化做法：close 后仍把 CQE 路由给 op |
-| 中断 | eventfd 在 epoll 里 | eventfd 用 `IORING_OP_POLL_ADD` 多次注册，或 `IORING_OP_MSG_RING` |
-| 信号管道 | 常驻读操作 | `IORING_OP_POLL_ADD`（multishot）监视读端，可读时排空 |
-| 定时器 | 二叉堆 + wait 超时 | `IORING_OP_TIMEOUT` 每个定时器一个 SQE，取消用 `IORING_OP_TIMEOUT_REMOVE`；或沿用堆 |
+| `begin_*` | 记缓冲区描述符 | 同；`iovec[]` 与 `msghdr` 住在操作里，钉住到 CQE 到达 |
+| `ready()` | 推测系统调用，成功则不挂起 | **同样推测**（套接字仍是非阻塞的）：命中就不提交；connect 除外——`IORING_OP_CONNECT` 自己处理 EINPROGRESS |
+| `suspend()` | `start_op` 排队，等就绪 | 环锁内取 SQE、`prepare`、`user_data = &op`、提交；返回 noop |
+| 完成 | 反应器线程 `perform()` 后 `complete()` | `run()` 收 CQE → `on_complete(res)` 记 ec / bytes（`-ECANCELED` → `operation_aborted`，读到 0 → `eof`）→ `complete()` |
+| 取消 | 锁内摘下，立即 `complete(operation_aborted)` | 提交 `IORING_OP_ASYNC_CANCEL`（定时器：`TIMEOUT_REMOVE`），**等原操作的 CQE**；在延迟队列里则摘下立即完成；尚未提交则记 `cancel_requested`，`submit` 返回 false，`suspend` 直接以 aborted 恢复 |
+| `close()` | 注销 + 取消 + `::close` | 先对在飞操作请求取消再 `::close`——在飞请求持有文件引用，关闭描述符不会结束它们 |
+| 中断 | eventfd 在 epoll 里 | eventfd 上一个常驻 `POLL_ADD`，完成后重新武装；`interrupt()` 只是 `write(eventfd)`，不碰环、不加锁 |
+| 信号管道 | 常驻读操作 | 常驻 `POLL_ADD` 监视读端，可读时排空并 `deliver` |
+| 定时器 | 二叉堆 + wait 超时 | 每次 wait 一个 `IORING_OP_TIMEOUT`（`IORING_TIMEOUT_ABS`，CLOCK_MONOTONIC 与 steady_clock 同源）；`-ETIME` 成功，`-ECANCELED` 取消 |
 
-上层**不需要改动**：`tcp_socket` / `udp_socket` / `steady_timer` / `signal_set` / `resolver`
-只经 `detail/backend.hpp` 的抽象接口对接；`io_context.cpp` 的 `make_backend` 多一个
-`backend_kind::io_uring` 分支；`include/net/backend.hpp` 多一个 `io_uring_t` 标签
-（编译期 `NET_HAS_IO_URING` 控制）。`posix::*` 的同步部分（`create_socket`、
-`set_nonblocking_cloexec`、`connect_result`）直接复用。
+取消的可见差异：就绪型的 `steady_timer::cancel()` / `socket::cancel()` 同步完成操作；
+io_uring 的取消异步，`cancel()` 返回 1 只表示"已请求"，操作在 CQE 到达时以
+`operation_aborted` 完成。`has_pending()` 的语义因此是"CQE 尚未到达"——销毁契约照旧。
+一个微妙点：`cancel()` 在操作已完成、协程尚未恢复时到达会留下过期的 `cancel_requested`，
+`finish_*` 在销毁 stop_callback 之后把它清零。
 
-一条需要注意的契约：就绪型后端的 `cancel_op` 是同步的（摘下即完成），而 io_uring 的取消
-是异步的——`suspend()` 里 stop_token 回调触发 `ASYNC_CANCEL` 后，操作要等 CQE 才算完成。
-`socket_impl::has_pending()` 的语义因此是"CQE 尚未到达"，销毁契约照旧成立。
+### 上层没有改动
+
+`tcp_socket` / `udp_socket` / `steady_timer` / `signal_set` / `resolver` 一行未改；
+`io_context.cpp` 的 `make_backend` 多一个 `backend_kind::io_uring` 分支，`backend.hpp` 多一个
+`io_uring_t` 标签与运行时探测 `backend_available()`（内核 sysctl `io_uring_disabled` 或
+seccomp 可能禁用它）。`posix::*` 的同步部分（`create_socket`、`set_nonblocking_cloexec`）
+直接复用。全部平台测试为四种后端各编译一个变体，ASan / UBSan / LSan / TSan 全绿。
 
 ## 5. 接入 IOCP
 
@@ -170,7 +188,8 @@ src/detail/iocp/
     iocp_timer.hpp/.cpp         timer_impl：定时器线程 + PostQueuedCompletionStatus，或 CreateWaitableTimerEx（Corosio: win_timers_thread / win_timers_none）
 ```
 
-差异点：`native_handle_type` 是 `SOCKET`；`accept` 必须先 `WSASocket` 出接受套接字再
+差异点（与 io_uring 后端相同的部分——环锁 / 完成收割 / 异步取消 / `complete()` 后不触碰
+操作——可以直接照搬 `uring_backend` 的骨架）：`native_handle_type` 是 `SOCKET`；`accept` 必须先 `WSASocket` 出接受套接字再
 `AcceptEx`，完成后 `SO_UPDATE_ACCEPT_CONTEXT`；`connect` 需先 `bind`；取消用
 `CancelIoEx(handle, &overlapped)` 并等完成包（`ERROR_OPERATION_ABORTED`）；信号没有管道，
 `register_signal_reader` 改为 CRT `signal()` + `PostQueuedCompletionStatus`（Corosio:
@@ -186,4 +205,5 @@ src/detail/iocp/
 - **操作状态住在 I/O 对象里**（而不是 awaiter 或堆上）对完成型后端尤其重要：内核持有
   指向缓冲区与 op 的指针直到完成，op 的地址必须稳定、生命周期由销毁契约保证。
 - **抽象接口的粒度是"一次操作"**（`begin/ready/suspend/finish`），不是"一个系统调用"。
-  就绪型与完成型的差别全部封装在实现里，awaiter 与 `tcp_socket` 一行不改。
+  就绪型与完成型的差别全部封装在实现里，awaiter 与 `tcp_socket` 一行不改——io_uring
+  后端的接入验证了这一点。

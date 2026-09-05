@@ -8,6 +8,8 @@
 #include "net/memory_resource.hpp"
 
 #include "detail/backend.hpp"
+#include "detail/io_uring/uring.hpp"
+#include "detail/io_uring/uring_backend.hpp"
 #include "detail/reactor/demultiplexer.hpp"
 #include "detail/reactor/reactor_backend.hpp"
 
@@ -53,13 +55,15 @@ std::unique_ptr<detail::demultiplexer> make_demultiplexer(backend_kind const kin
     case backend_kind::epoll: return detail::make_epoll_demultiplexer();
     case backend_kind::poll: return detail::make_poll_demultiplexer();
     case backend_kind::select: return detail::make_select_demultiplexer();
+    case backend_kind::io_uring: break;
     }
     return detail::make_epoll_demultiplexer();
 }
 
-// 就绪型后端族：一个共享的 reactor_backend + 按标签选择的解复用器。完成型后端（io_uring /
-// IOCP）接入时在这里多一个分支，返回它们自己的 io_backend 服务。
+// 就绪型后端族：一个共享的 reactor_backend + 按标签选择的解复用器；完成型后端各自是一个
+// io_backend 服务。
 detail::io_backend& make_backend(io_context& owner, backend_kind const kind) {
+    if (kind == backend_kind::io_uring) return owner.make_service<detail::uring_backend>();
     return owner.make_service<detail::reactor_backend>(make_demultiplexer(kind));
 }
 
@@ -207,6 +211,16 @@ io_context::~io_context() {
 }
 
 backend_kind io_context::backend() const noexcept { return impl_->kind; }
+
+bool backend_available(backend_kind const kind) noexcept {
+    switch (kind) {
+    case backend_kind::epoll:
+    case backend_kind::poll:
+    case backend_kind::select: return true;
+    case backend_kind::io_uring: return detail::uring_available();
+    }
+    return false;
+}
 
 char const* io_context::backend_name() const noexcept { return impl_->backend.name(); }
 

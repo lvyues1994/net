@@ -1,0 +1,360 @@
+#include "detail/io_uring/uring_socket.hpp"
+
+#include <cerrno>
+#include <cstring>
+
+#include "co2/contract.hpp"
+
+#include "net/error.hpp"
+#include "net/io_context.hpp"
+
+#include "detail/io_uring/uring_backend.hpp"
+#include "detail/posix/socket_ops.hpp"
+
+namespace net {
+namespace detail {
+
+namespace {
+
+std::error_code error_from_result(int const res) noexcept {
+    if (res == -ECANCELED) return make_error_code(error::operation_aborted);
+    return std::error_code{-res, std::system_category()};
+}
+
+template <class Buffer, std::size_t N>
+std::size_t fill_vectors(iovec (&vectors)[N], buffer_array<Buffer, N> const& buffers) noexcept {
+    auto count = std::size_t{};
+    for (auto const& b : buffers) {
+        vectors[count].iov_base = const_cast<void*>(static_cast<void const*>(b.data()));
+        vectors[count].iov_len = b.size();
+        ++count;
+    }
+    return count;
+}
+
+} // namespace
+
+// ---- uring_socket_op ----
+
+void uring_socket_op::prepare(io_uring_sqe& sqe) noexcept {
+    sqe.fd = owner->native_handle();
+    switch (op_kind) {
+    case kind::read:
+    case kind::receive_from: {
+        auto const count = fill_vectors(vectors, read_buffers);
+        message = msghdr{};
+        message.msg_iov = vectors;
+        message.msg_iovlen = count;
+        if (op_kind == kind::receive_from) {
+            message.msg_name = address_out;
+            message.msg_namelen = address_length;
+        }
+        sqe.opcode = IORING_OP_RECVMSG;
+        sqe.addr = reinterpret_cast<std::uintptr_t>(&message);
+        sqe.len = 1U;
+        sqe.msg_flags = 0U;
+        return;
+    }
+    case kind::write:
+    case kind::send_to: {
+        auto const count = fill_vectors(vectors, write_buffers);
+        message = msghdr{};
+        message.msg_iov = vectors;
+        message.msg_iovlen = count;
+        if (op_kind == kind::send_to) {
+            message.msg_name = &address;
+            message.msg_namelen = address_length;
+        }
+        sqe.opcode = IORING_OP_SENDMSG;
+        sqe.addr = reinterpret_cast<std::uintptr_t>(&message);
+        sqe.len = 1U;
+        sqe.msg_flags = MSG_NOSIGNAL;
+        return;
+    }
+    case kind::connect:
+        sqe.opcode = IORING_OP_CONNECT;
+        sqe.addr = reinterpret_cast<std::uintptr_t>(&address);
+        sqe.off = address_length;
+        return;
+    case kind::accept:
+        address_length = static_cast<socklen_t>(sizeof(address));
+        sqe.opcode = IORING_OP_ACCEPT;
+        sqe.addr = reinterpret_cast<std::uintptr_t>(&address);
+        sqe.addr2 = reinterpret_cast<std::uintptr_t>(&address_length);
+        sqe.accept_flags = SOCK_NONBLOCK | SOCK_CLOEXEC;
+        return;
+    case kind::none:
+        sqe.opcode = IORING_OP_NOP;
+        return;
+    }
+}
+
+void uring_socket_op::on_complete(int const res, unsigned) noexcept {
+    if (res < 0) {
+        ec = error_from_result(res);
+        bytes_transferred = 0U;
+        accepted_fd = -1;
+        return;
+    }
+    switch (op_kind) {
+    case kind::read:
+        ec = res == 0 ? make_error_code(error::eof) : std::error_code{};
+        bytes_transferred = static_cast<std::size_t>(res);
+        return;
+    case kind::write:
+    case kind::receive_from:
+    case kind::send_to:
+        ec.clear();
+        bytes_transferred = static_cast<std::size_t>(res);
+        return;
+    case kind::connect:
+        ec.clear();
+        bytes_transferred = 0U;
+        return;
+    case kind::accept:
+        ec.clear();
+        accepted_fd = res;
+        accepted_family = address.ss_family;
+        return;
+    case kind::none:
+        ec = make_error_code(error::not_open);
+        return;
+    }
+}
+
+void uring_socket_op::complete() noexcept { env->executor.post(cont); }
+
+void cancel_uring_socket_op::operator()() const noexcept {
+    impl->backend().cancel(impl->op_for(direction));
+}
+
+// ---- uring_socket ----
+
+uring_socket::uring_socket(io_context& context, uring_backend& backend) noexcept
+    : context_{&context}, backend_{&backend}, read_op_{*this, op_direction::read},
+      write_op_{*this, op_direction::write} {}
+
+uring_socket::~uring_socket() {
+    CO2_CONTRACT_CHECK(not has_pending());
+    close();
+}
+
+std::error_code uring_socket::open(int const family, int const type, int const protocol) noexcept {
+    if (fd_ >= 0) return make_error_code(error::already_open);
+    auto const created = posix::create_socket(family, type, protocol);
+    if (created < 0) return posix::last_error();
+    auto const ec = assign(family, type, protocol, created);
+    if (ec) posix::close_socket(created);
+    return ec;
+}
+
+std::error_code uring_socket::assign(int, int, int, int const fd) noexcept {
+    if (fd_ >= 0) return make_error_code(error::already_open);
+    auto const ec = posix::set_nonblocking_cloexec(fd);
+    if (ec) return ec;
+    fd_ = fd;
+    return {};
+}
+
+void uring_socket::cancel_pending(uring_socket_op& op) noexcept {
+    if (op.pending) backend_->cancel(op);
+}
+
+std::error_code uring_socket::close() noexcept {
+    if (fd_ < 0) return {};
+    // 在飞的请求持有文件引用，关闭描述符不会结束它们：先请求取消，CQE 以 -ECANCELED 到达。
+    cancel_pending(read_op_);
+    cancel_pending(write_op_);
+    auto const closing = fd_;
+    fd_ = -1;
+    return posix::close_socket(closing);
+}
+
+void uring_socket::cancel() noexcept {
+    if (fd_ < 0) return;
+    cancel_pending(read_op_);
+    cancel_pending(write_op_);
+}
+
+int uring_socket::release() noexcept {
+    if (fd_ < 0) return -1;
+    cancel_pending(read_op_);
+    cancel_pending(write_op_);
+    auto const released = fd_;
+    fd_ = -1;
+    return released;
+}
+
+// ---- begin_* ----
+
+void uring_socket::begin_read(span<mutable_buffer const> const buffers) noexcept {
+    CO2_CONTRACT_CHECK(not read_op_.pending);
+    read_op_.op_kind = uring_socket_op::kind::read;
+    read_op_.read_buffers = mutable_buffer_array<>{buffers};
+}
+
+void uring_socket::begin_write(span<const_buffer const> const buffers) noexcept {
+    CO2_CONTRACT_CHECK(not write_op_.pending);
+    write_op_.op_kind = uring_socket_op::kind::write;
+    write_op_.write_buffers = const_buffer_array<>{buffers};
+}
+
+void uring_socket::begin_receive_from(span<mutable_buffer const> const buffers, sockaddr* const sender,
+                                      socklen_t const capacity) noexcept {
+    CO2_CONTRACT_CHECK(not read_op_.pending);
+    read_op_.op_kind = uring_socket_op::kind::receive_from;
+    read_op_.read_buffers = mutable_buffer_array<>{buffers};
+    read_op_.address_out = sender;
+    read_op_.address_length = capacity;
+}
+
+void uring_socket::begin_send_to(span<const_buffer const> const buffers, sockaddr const* const target,
+                                 socklen_t const length) noexcept {
+    CO2_CONTRACT_CHECK(not write_op_.pending);
+    write_op_.op_kind = uring_socket_op::kind::send_to;
+    write_op_.write_buffers = const_buffer_array<>{buffers};
+    std::memcpy(&write_op_.address, target, length);
+    write_op_.address_length = length;
+}
+
+void uring_socket::begin_connect(sockaddr const* const address, socklen_t const length, int const family,
+                                 int const type, int const protocol) noexcept {
+    CO2_CONTRACT_CHECK(not write_op_.pending);
+    auto& op = write_op_;
+    op.op_kind = uring_socket_op::kind::connect;
+    op.bytes_transferred = 0U;
+    op.immediate = false;
+    if (fd_ < 0) {
+        op.ec = open(family, type, protocol);
+        if (op.ec) {
+            op.immediate = true; // 同步失败
+            return;
+        }
+    }
+    // IORING_OP_CONNECT 自己处理非阻塞套接字的 EINPROGRESS：整个连接交给内核。
+    std::memcpy(&op.address, address, length);
+    op.address_length = length;
+}
+
+void uring_socket::begin_accept() noexcept {
+    CO2_CONTRACT_CHECK(not read_op_.pending);
+    read_op_.op_kind = uring_socket_op::kind::accept;
+    read_op_.accepted_fd = -1;
+}
+
+// ---- awaiter 三步 ----
+
+bool uring_socket::ready(op_direction const direction) noexcept {
+    auto& op = op_for(direction);
+    if (op.op_kind == uring_socket_op::kind::connect) return op.immediate;
+    if (fd_ < 0) {
+        op.ec = make_error_code(error::not_open);
+        op.bytes_transferred = 0U;
+        return true;
+    }
+    switch (op.op_kind) {
+    case uring_socket_op::kind::read: {
+        if (op.read_buffers.total_size() == 0U) break;
+        auto const outcome = posix::readv(fd_, op.read_buffers);
+        if (not outcome.done) return false;
+        op.ec = outcome.ec;
+        op.bytes_transferred = outcome.bytes;
+        return true;
+    }
+    case uring_socket_op::kind::receive_from: {
+        if (op.read_buffers.total_size() == 0U) break;
+        auto const outcome = posix::recvmsg(fd_, op.read_buffers, op.address_out, op.address_length);
+        if (not outcome.done) return false;
+        op.ec = outcome.ec;
+        op.bytes_transferred = outcome.bytes;
+        return true;
+    }
+    case uring_socket_op::kind::write: {
+        if (op.write_buffers.total_size() == 0U) break;
+        auto const outcome = posix::writev(fd_, op.write_buffers);
+        if (not outcome.done) return false;
+        op.ec = outcome.ec;
+        op.bytes_transferred = outcome.bytes;
+        return true;
+    }
+    case uring_socket_op::kind::send_to: {
+        if (op.write_buffers.total_size() == 0U) break;
+        auto const outcome = posix::sendmsg(fd_, op.write_buffers, reinterpret_cast<sockaddr const*>(&op.address),
+                                            op.address_length);
+        if (not outcome.done) return false;
+        op.ec = outcome.ec;
+        op.bytes_transferred = outcome.bytes;
+        return true;
+    }
+    case uring_socket_op::kind::accept: {
+        auto const outcome = posix::accept(fd_);
+        if (not outcome.done) return false;
+        op.ec = outcome.ec;
+        op.accepted_fd = outcome.fd;
+        op.accepted_family = outcome.family;
+        return true;
+    }
+    case uring_socket_op::kind::connect:
+    case uring_socket_op::kind::none: break;
+    }
+    // 零长度传输立即完成。
+    op.ec.clear();
+    op.bytes_transferred = 0U;
+    return true;
+}
+
+coroutine_handle<> uring_socket::suspend(op_direction const direction, coroutine_handle<> const h,
+                                         io_env const* const env) noexcept {
+    auto& op = op_for(direction);
+    op.cont.h = h;
+    op.env = env;
+    op.pending = true;
+    if (env->stop_token.stop_requested()) {
+        op.ec = make_error_code(error::operation_aborted);
+        op.bytes_transferred = 0U;
+        return h;
+    }
+    if (env->stop_token.stop_possible())
+        op.stop_cb.emplace(env->stop_token, cancel_uring_socket_op{this, direction});
+    if (not backend_->submit(op)) {
+        // 提交前已被取消：不会有 CQE。
+        op.ec = make_error_code(error::operation_aborted);
+        op.bytes_transferred = 0U;
+        return h;
+    }
+    // 关闭"注册回调与提交之间停止请求到达"的窗口（取消请求幂等）。
+    if (env->stop_token.stop_requested()) backend_->cancel(op);
+    return noop_coroutine();
+}
+
+void uring_socket::finish(uring_socket_op& op) noexcept {
+    op.stop_cb.reset(); // 之后不再有取消回调
+    op.cancel_requested = false;
+    op.pending = false;
+    op.env = nullptr;
+}
+
+io_result<std::size_t> uring_socket::finish_transfer(op_direction const direction) noexcept {
+    auto& op = op_for(direction);
+    finish(op);
+    return io_result<std::size_t>{op.ec, op.bytes_transferred};
+}
+
+io_result<> uring_socket::finish_connect() noexcept {
+    auto& op = write_op_;
+    finish(op);
+    op.immediate = false;
+    return io_result<>{op.ec};
+}
+
+std::error_code uring_socket::finish_accept(int& fd, int& family) noexcept {
+    auto& op = read_op_;
+    finish(op);
+    fd = op.accepted_fd;
+    family = op.accepted_family;
+    op.accepted_fd = -1;
+    return op.ec;
+}
+
+} // namespace detail
+} // namespace net

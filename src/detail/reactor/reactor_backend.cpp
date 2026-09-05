@@ -117,8 +117,9 @@ void reactor_backend::finish_cancelled(reactor_op* const (&cancelled)[2]) noexce
     auto const executor = context_->get_executor();
     for (auto* const op : cancelled) {
         if (op == nullptr) continue;
+        auto const counts = op->counts_as_work; // complete() 之后不再触碰 op
         op->complete();
-        if (op->counts_as_work) executor.on_work_finished();
+        if (counts) executor.on_work_finished();
     }
 }
 
@@ -178,8 +179,9 @@ bool reactor_backend::cancel_op(descriptor_state& state, op_direction const dire
         op.ec = make_error_code(error::operation_aborted);
         refresh_interest(state);
     }
+    auto const counts = op.counts_as_work; // complete() 之后不再触碰 op
     op.complete();
-    if (op.counts_as_work) context_->get_executor().on_work_finished();
+    if (counts) context_->get_executor().on_work_finished();
     return true;
 }
 

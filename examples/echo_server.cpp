@@ -1,6 +1,6 @@
 // 回显服务器：accept 循环 + 每个连接一条协程链；SIGINT / SIGTERM 优雅退出。
 //
-//   ./echo_server [port]        （默认 7777）
+//   ./echo_server [port] [backend]     （默认 7777、epoll；backend ∈ epoll | poll | select | io_uring）
 //
 // 业务逻辑 echo_session 只依赖 any_stream&：换成 TLS 或别的传输不需要改它。
 
@@ -65,14 +65,26 @@ CO2_END
 
 } // namespace
 
+net::backend_kind parse_backend(char const* const name) {
+    if (std::string{name} == "poll") return net::backend_kind::poll;
+    if (std::string{name} == "select") return net::backend_kind::select;
+    if (std::string{name} == "io_uring") return net::backend_kind::io_uring;
+    return net::backend_kind::epoll;
+}
+
 int main(int argc, char** argv) {
     auto const port = static_cast<net::ip::port_type>(argc > 1 ? std::atoi(argv[1]) : 7777);
+    auto const backend = argc > 2 ? parse_backend(argv[2]) : net::backend_kind::epoll;
+    if (not net::backend_available(backend)) {
+        std::fprintf(stderr, "backend %s is not available on this system\n", net::to_string(backend));
+        return 1;
+    }
     try {
-        net::io_context ctx;
+        net::io_context ctx{backend, 1};
         net::tcp_acceptor acceptor{ctx, net::ip::tcp::endpoint{net::ip::address_v4::any(), port}};
         net::signal_set signals{ctx, SIGINT, SIGTERM};
         net::stop_source stop;
-        std::printf("echo server listening on port %u\n", static_cast<unsigned>(port));
+        std::printf("echo server (%s) listening on port %u\n", ctx.backend_name(), static_cast<unsigned>(port));
 
         net::run_async(ctx.get_executor(), stop.get_token())(accept_loop(&ctx, &acceptor));
         net::run_async(ctx.get_executor())(wait_for_shutdown(&signals, &stop, &acceptor));
