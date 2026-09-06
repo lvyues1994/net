@@ -64,16 +64,19 @@ struct execution_context {
         return find_service(key_of<T>()) != nullptr;
     }
 
-    // 默认帧分配器：通过本上下文启动的每条协程链都用它。默认是上下文自带的回收式
-    // 分配器；传空指针恢复默认。
+    // 默认帧分配器：通过本上下文启动的每条协程链都用它。默认由构建选项
+    // NET_DEFAULT_FRAME_ALLOCATOR 决定（new_delete_resource，或上下文自带的回收式分配器）；
+    // 传空指针恢复默认。
     memory_resource* get_frame_allocator() const noexcept {
         return frame_allocator_.load(std::memory_order_acquire);
     }
 
     void set_frame_allocator(memory_resource* const resource) noexcept {
-        frame_allocator_.store(resource != nullptr ? resource : default_frame_allocator_.get(),
-                               std::memory_order_release);
+        frame_allocator_.store(resource != nullptr ? resource : built_in_frame_allocator(), std::memory_order_release);
     }
+
+    // 上下文自带的回收式分配器（无论默认是哪个都可用）。
+    recycling_memory_resource& recycling_frame_allocator() noexcept { return *default_frame_allocator_; }
 
   protected:
     // 逆注册顺序调用每个服务的 shutdown()。可重复调用。
@@ -82,6 +85,14 @@ struct execution_context {
     void destroy() noexcept;
 
   private:
+    memory_resource* built_in_frame_allocator() noexcept {
+#if defined(NET_DEFAULT_FRAME_ALLOCATOR_RECYCLING)
+        return default_frame_allocator_.get();
+#else
+        return new_delete_resource();
+#endif
+    }
+
     template <class T, class = void> struct key_type_of {
         using type = T;
     };

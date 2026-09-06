@@ -33,6 +33,11 @@
 #include "net/udp.hpp"
 #include "net/when_all.hpp"
 #include "net/when_any.hpp"
+#if defined(NET_HAS_TLS)
+#include "net/tls/context.hpp"
+#include "net/tls/error.hpp"
+#include "net/tls/stream.hpp"
+#endif
 
 #include "net/net.hpp"
 

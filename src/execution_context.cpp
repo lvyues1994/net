@@ -6,7 +6,13 @@ namespace net {
 
 execution_context::execution_context()
     : default_frame_allocator_{new recycling_memory_resource{}},
-      frame_allocator_{default_frame_allocator_.get()} {}
+#if defined(NET_DEFAULT_FRAME_ALLOCATOR_RECYCLING)
+      frame_allocator_{default_frame_allocator_.get()} {
+}
+#else
+      frame_allocator_{new_delete_resource()} {
+}
+#endif
 
 execution_context::~execution_context() {
     shutdown();

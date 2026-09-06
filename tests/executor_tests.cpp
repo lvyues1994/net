@@ -2,6 +2,9 @@
 // execution_context 服务与帧分配器。
 
 #include <atomic>
+#include <utility>
+#include <cstdint>
+#include <cstring>
 #include <chrono>
 #include <cstddef>
 #include <mutex>
@@ -236,6 +239,65 @@ void recycling_resource_reuses_blocks() {
     resource.deallocate(second, 256U);
     resource.release();
     CHECK_EQ(resource.cached_bytes(), 0U);
+
+    // 尺寸按 64 字节粒度归类：200 与 256 共用一个类；超过 8 KiB 或过对齐直接走上游。
+    auto* const small = resource.allocate(200U);
+    resource.deallocate(small, 200U);
+    CHECK_EQ(resource.cached_blocks(), 1U);
+    CHECK(resource.allocate(256U) == small);
+    resource.deallocate(small, 256U);
+    auto* const large = resource.allocate(64U * 1024U);
+    resource.deallocate(large, 64U * 1024U);
+    CHECK_EQ(resource.cached_blocks(), 1U);
+    auto* const aligned = resource.allocate(128U, 128U);
+    CHECK(reinterpret_cast<std::uintptr_t>(aligned) % 128U == 0U);
+    resource.deallocate(aligned, 128U, 128U);
+    CHECK_EQ(resource.cached_blocks(), 1U);
+
+    // 每类缓存上限：多出的块交还上游。
+    net::recycling_memory_resource::config small_cache;
+    small_cache.max_blocks_per_class = 2U;
+    net::recycling_memory_resource bounded{net::new_delete_resource(), small_cache};
+    void* blocks[4];
+    for (auto& b : blocks) b = bounded.allocate(64U);
+    for (auto* const b : blocks) bounded.deallocate(b, 64U);
+    CHECK_EQ(bounded.cached_blocks(), 2U);
+}
+
+// 无锁栈在多线程下的正确性：跨线程释放、并发分配 / 释放、块不重复分发。
+void recycling_resource_is_safe_across_threads() {
+    net::recycling_memory_resource resource;
+    constexpr auto thread_count = 4U;
+    constexpr auto rounds = 2000U;
+    std::atomic<int> failures{0};
+    std::vector<std::thread> threads;
+    for (auto t = 0U; t != thread_count; ++t) {
+        threads.emplace_back([&, t] {
+            std::vector<std::pair<void*, std::size_t>> held;
+            for (auto round = 0U; round != rounds; ++round) {
+                auto const size = 64U + 64U * ((round + t) % 4U);
+                auto* const block = static_cast<unsigned char*>(resource.allocate(size));
+                // 写满再检查：若同一块被分发给两个线程，这里会被对方覆盖。
+                std::memset(block, static_cast<int>(t + 1U), size);
+                held.emplace_back(block, size);
+                if (held.size() >= 8U) {
+                    for (auto const& entry : held) {
+                        auto const* const bytes = static_cast<unsigned char const*>(entry.first);
+                        for (auto i = std::size_t{}; i != entry.second; ++i)
+                            if (bytes[i] != static_cast<unsigned char>(t + 1U)) ++failures;
+                        resource.deallocate(entry.first, entry.second);
+                    }
+                    held.clear();
+                }
+            }
+            for (auto const& entry : held) resource.deallocate(entry.first, entry.second);
+        });
+    }
+    for (auto& thread : threads) thread.join();
+    CHECK_EQ(failures.load(), 0);
+    CHECK(resource.cached_blocks() <= 4U * 64U);
+    resource.release();
+    CHECK_EQ(resource.cached_blocks(), 0U);
 }
 
 void safe_resume_restores_the_cached_frame_allocator() {
@@ -291,6 +353,7 @@ int main() {
     any_executor_equality_and_target();
     services_are_singletons_with_ordered_shutdown();
     recycling_resource_reuses_blocks();
+    recycling_resource_is_safe_across_threads();
     safe_resume_restores_the_cached_frame_allocator();
     run_for_returns_on_timeout_with_pending_work();
     poll_processes_ready_work_only();

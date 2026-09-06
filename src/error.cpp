@@ -23,6 +23,7 @@ struct net_error_category final : std::error_category {
         case error::no_recovery: return "A non-recoverable error occurred during database lookup";
         case error::no_data: return "The query is valid but does not have associated address data";
         case error::invalid_address: return "Invalid address string";
+        case error::stream_truncated: return "Stream truncated before close_notify";
         }
         return "Unknown net error " + std::to_string(value);
     }

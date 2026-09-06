@@ -12,16 +12,25 @@ find_package(Threads REQUIRED)
 set(NET_CO2_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../coro/coro"
     CACHE PATH "co2 源码目录（find_package 失败时用 add_subdirectory 加入）")
 
+set(NET_CO2_GIT_REPOSITORY "https://github.com/lvyues1994/coro.git"
+    CACHE STRING "本地找不到 co2 时用 FetchContent 拉取的仓库")
+set(NET_CO2_GIT_TAG "main" CACHE STRING "拉取 co2 时的分支 / 标签")
+
 if(NOT TARGET co2::co2)
     find_package(co2 CONFIG QUIET)
     if(NOT TARGET co2::co2)
+        set(CO2_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+        set(CO2_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
         if(EXISTS "${NET_CO2_DIR}/CMakeLists.txt")
-            set(CO2_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-            set(CO2_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
             add_subdirectory("${NET_CO2_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/co2" EXCLUDE_FROM_ALL)
         else()
-            message(FATAL_ERROR
-                "co2 not found: install it or set NET_CO2_DIR to the co2 source tree")
+            message(STATUS "net: co2 not found at ${NET_CO2_DIR}, fetching ${NET_CO2_GIT_REPOSITORY}@${NET_CO2_GIT_TAG}")
+            include(FetchContent)
+            FetchContent_Declare(co2
+                GIT_REPOSITORY ${NET_CO2_GIT_REPOSITORY}
+                GIT_TAG ${NET_CO2_GIT_TAG}
+                GIT_SHALLOW TRUE)
+            FetchContent_MakeAvailable(co2)
         endif()
     endif()
 endif()
@@ -66,12 +75,72 @@ set(net_io_uring_sources
     src/detail/io_uring/uring_socket.cpp
     src/detail/io_uring/uring_timer.cpp)
 
+# ---- TLS 提供者 ----
+#
+# tls::context / tls::stream 的实现建立在 OpenSSL API 子集之上，OpenSSL 与 BoringSSL 共用同
+# 一份源码，构建期选择链接哪一个。BoringSSL 可以给现成的安装根目录，或用 FetchContent
+# 从源码构建（约 400 个目标，不需要 Go / Perl）。
+set(NET_TLS_PROVIDER "OpenSSL" CACHE STRING "TLS provider: OpenSSL | BoringSSL | OFF")
+set_property(CACHE NET_TLS_PROVIDER PROPERTY STRINGS OpenSSL BoringSSL OFF)
+set(NET_BORINGSSL_ROOT "" CACHE PATH "Prebuilt BoringSSL root containing include/ and lib/ (empty: FetchContent)")
+set(NET_BORINGSSL_GIT_TAG "0.20250701.0" CACHE STRING "BoringSSL tag fetched when NET_BORINGSSL_ROOT is empty")
+
+set(net_tls_sources)
+set(net_tls_libraries)
+set(net_has_tls OFF)
+if(NET_TLS_PROVIDER STREQUAL "OpenSSL")
+    find_package(OpenSSL REQUIRED)
+    set(net_tls_libraries OpenSSL::SSL OpenSSL::Crypto)
+    set(net_has_tls ON)
+elseif(NET_TLS_PROVIDER STREQUAL "BoringSSL")
+    if(NET_BORINGSSL_ROOT)
+        add_library(net_boringssl_crypto STATIC IMPORTED)
+        set_target_properties(net_boringssl_crypto PROPERTIES
+            IMPORTED_LOCATION "${NET_BORINGSSL_ROOT}/lib/libcrypto.a"
+            INTERFACE_INCLUDE_DIRECTORIES "${NET_BORINGSSL_ROOT}/include")
+        add_library(net_boringssl_ssl STATIC IMPORTED)
+        set_target_properties(net_boringssl_ssl PROPERTIES
+            IMPORTED_LOCATION "${NET_BORINGSSL_ROOT}/lib/libssl.a"
+            INTERFACE_INCLUDE_DIRECTORIES "${NET_BORINGSSL_ROOT}/include"
+            INTERFACE_LINK_LIBRARIES net_boringssl_crypto)
+        set(net_tls_libraries net_boringssl_ssl net_boringssl_crypto)
+    else()
+        include(FetchContent)
+        FetchContent_Declare(boringssl
+            GIT_REPOSITORY https://github.com/google/boringssl.git
+            GIT_TAG ${NET_BORINGSSL_GIT_TAG}
+            GIT_SHALLOW TRUE)
+        set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+        FetchContent_MakeAvailable(boringssl)
+        set(net_tls_libraries ssl crypto)
+    endif()
+    set(net_has_tls ON)
+elseif(NOT NET_TLS_PROVIDER STREQUAL "OFF")
+    message(FATAL_ERROR "NET_TLS_PROVIDER must be OpenSSL, BoringSSL or OFF (got '${NET_TLS_PROVIDER}')")
+endif()
+
+if(net_has_tls)
+    set(net_tls_sources
+        src/tls/error.cpp
+        src/tls/context.cpp
+        src/tls/openssl_stream.cpp)
+endif()
+
 add_library(net STATIC
     ${net_concrete_sources}
     ${net_posix_sources}
     ${net_reactor_sources}
-    ${net_io_uring_sources})
+    ${net_io_uring_sources}
+    ${net_tls_sources})
 add_library(net::net ALIAS net)
+
+if(net_has_tls)
+    target_link_libraries(net PUBLIC ${net_tls_libraries})
+    target_compile_definitions(net PUBLIC NET_HAS_TLS=1 "NET_TLS_PROVIDER_NAME=\"${NET_TLS_PROVIDER}\"")
+    message(STATUS "net: TLS provider ${NET_TLS_PROVIDER}")
+else()
+    message(STATUS "net: TLS disabled")
+endif()
 
 target_compile_features(net PUBLIC cxx_std_14)
 set_target_properties(net PROPERTIES CXX_EXTENSIONS OFF)
@@ -100,8 +169,19 @@ if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
     set(NET_BUILD_TESTS_DEFAULT ON)
     set(NET_BUILD_EXAMPLES_DEFAULT ON)
 endif()
+# 默认帧分配器。glibc 的 malloc 自带每线程免锁缓存（tcache），基准里比无锁的回收式分配器还
+# 快约 3 ns/帧；在 malloc 较慢的平台（MSVC、macOS）或需要有界内存池时选 recycling。
+set(NET_DEFAULT_FRAME_ALLOCATOR "new_delete" CACHE STRING "Default frame allocator: new_delete | recycling")
+set_property(CACHE NET_DEFAULT_FRAME_ALLOCATOR PROPERTY STRINGS new_delete recycling)
+if(NET_DEFAULT_FRAME_ALLOCATOR STREQUAL "recycling")
+    target_compile_definitions(net PUBLIC NET_DEFAULT_FRAME_ALLOCATOR_RECYCLING=1)
+elseif(NOT NET_DEFAULT_FRAME_ALLOCATOR STREQUAL "new_delete")
+    message(FATAL_ERROR "NET_DEFAULT_FRAME_ALLOCATOR must be new_delete or recycling")
+endif()
+
 option(NET_BUILD_TESTS "Build net tests" ${NET_BUILD_TESTS_DEFAULT})
 option(NET_BUILD_EXAMPLES "Build net examples" ${NET_BUILD_EXAMPLES_DEFAULT})
+option(NET_BUILD_BENCHMARKS "Build net performance benchmarks" OFF)
 
 if(NET_BUILD_TESTS)
     enable_testing()
@@ -110,6 +190,10 @@ endif()
 
 if(NET_BUILD_EXAMPLES)
     add_subdirectory(examples)
+endif()
+
+if(NET_BUILD_BENCHMARKS)
+    add_subdirectory(benchmarks)
 endif()
 
 install(TARGETS net EXPORT netTargets

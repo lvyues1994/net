@@ -21,6 +21,8 @@ reactor_backend::reactor_backend(execution_context& context, std::unique_ptr<dem
     : context_{static_cast<io_context*>(&context)}, demux_{std::move(demux)} {
     CO2_CONTRACT_CHECK(demux_ != nullptr);
     events_.reserve(128U);
+    completed_.reserve(128U);
+    expired_.reserve(32U);
 }
 
 reactor_backend::~reactor_backend() = default;
@@ -339,27 +341,29 @@ void reactor_backend::run(long const timeout_ms) {
     auto const wait_error = demux_->wait(timeout, *this);
     if (wait_error) throw std::system_error{wait_error, demux_->name()};
 
-    std::vector<completed_op> completed;
-    std::vector<timer_op*> expired;
+    completed_.clear();
+    expired_.clear();
     {
         std::lock_guard<std::mutex> lock{mutex_};
         for (auto const& event : events_) {
             if (registered_.count(event.state) == 0U) continue; // 已注销：迟到的事件
-            process_event(*event.state, event.bits, completed);
+            process_event(*event.state, event.bits, completed_);
         }
-        pop_expired_timers(expired);
+        pop_expired_timers(expired_);
     }
     events_.clear();
 
     auto const executor = context_->get_executor();
-    for (auto const& entry : completed) {
-        entry.op->complete();
+    for (auto const& entry : completed_) {
+        entry.op->complete(); // complete() 之后不再触碰 op
         if (entry.counts_as_work) executor.on_work_finished();
     }
-    for (auto* const op : expired) {
+    for (auto* const op : expired_) {
         op->complete();
         executor.on_work_finished();
     }
+    completed_.clear();
+    expired_.clear();
 }
 
 } // namespace detail

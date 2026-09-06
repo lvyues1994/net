@@ -3,6 +3,9 @@ set(net_example_sources
     echo_client.cpp
     http_get.cpp
     timers.cpp)
+if(net_has_tls)
+    list(APPEND net_example_sources https_get.cpp)
+endif()
 
 foreach(source IN LISTS net_example_sources)
     get_filename_component(name "${source}" NAME_WE)

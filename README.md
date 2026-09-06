@@ -4,7 +4,7 @@
 （P4003R3《A Minimal Coroutine Execution Model》、P4172R1、P4100R1、P4124R0）描述的
 **IoAwaitable 协议**及其上的 `task<T>`、启动函数、执行器、缓冲区、流概念、组合子，
 以及 Linux 平台层：`io_context`（epoll / poll / select / io_uring 四种后端）、TCP/UDP
-套接字、定时器、DNS、信号。
+套接字、定时器、DNS、信号，和 TLS 传输安全包装器（OpenSSL / BoringSSL 两个提供者）。
 
 无栈协程由姊妹库 [co2](../../coro/coro)（C++14 宏生成的状态机，协议与 C++20 协程
 规范同形）提供：提案里写 `co_await f()` 的地方，这里写 `CO2_AWAIT(f())`。
@@ -68,6 +68,7 @@ coroutine_handle<> await_suspend(coroutine_handle<> h, io_env const* env);
 | `thread_pool`, `strand`, `any_executor` | 同名 | `thread_pool.hpp`, `strand.hpp`, `any_executor.hpp` |
 | `io_context`, `steady_timer`, `signal_set`, `tcp_socket`, `tcp_acceptor`, `udp_socket`, `resolver`, `ip::*` | 同名（Networking TS 形态去掉 `async_` 与完成令牌） | `io_context.hpp`, `timer.hpp`, `signal_set.hpp`, `tcp.hpp`, `udp.hpp`, `resolver.hpp`, `ip.hpp` |
 | `corosio::epoll` / `select` / `io_uring` … 后端标签，`io_context(backend)` | `net::epoll` / `net::poll` / `net::select` / `net::io_uring`，`io_context{net::io_uring}`，`backend_available()` | `backend.hpp` |
+| `tls_context`, `tls_stream`, `openssl_stream`（Paper 14） | `net::tls::context`, `net::tls::stream`, `net::tls::openssl_stream`（同一份实现覆盖 OpenSSL 与 BoringSSL） | `tls/context.hpp`, `tls/stream.hpp`, `tls/error.hpp` |
 
 ## 用法要点
 
@@ -94,6 +95,12 @@ liburing，`net::backend_available(net::backend_kind::io_uring)` 运行时探测
 等 I/O 对象经抽象接口对接后端，代码与后端无关；设计、与 Corosio 的对照以及 IOCP 的接入
 方案见 `docs/backends.md`。
 
+**TLS**：`net::tls::openssl_stream tls{&sock, ctx}; tls.set_hostname("example.com");
+CO2_AWAIT_SET(h, tls.handshake(net::tls::role::client));` 之后它就是一个 `Stream`——可以放进
+`any_stream`，`read` / `write` / `read_until` 照常工作。引擎是 sans-I/O 的（内存 BIO），驱动
+协程在底层流上泵字节，所以 TLS 与后端无关。对端 close_notify → `error::eof`；传输提前结束 →
+`error::stream_truncated`。设计与提供者差异见 `docs/tls.md`。
+
 **缓冲区描述符不拥有内存**：`net::buffer(std::string{"x"})` 指向的临时对象在 co_await
 表达式求值后就销毁——要发送的数据必须活到操作完成（帧局部或参数）。
 
@@ -115,43 +122,101 @@ liburing，`net::backend_available(net::backend_kind::io_uring)` 运行时探测
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug     # 默认从 ../../coro/coro 加入 co2；或 -DNET_CO2_DIR=...
-cmake --build build
+cmake --build build                              # 本地没有 co2 时自动 FetchContent lvyues1994/coro
 ctest --test-dir build --output-on-failure
 ```
 
-抽象层仅含头文件；平台层编译进 `libnet.a`。作为子项目：
+| 选项 | 默认 | 说明 |
+| --- | --- | --- |
+| `NET_TLS_PROVIDER` | `OpenSSL` | `OpenSSL`（`find_package`）/ `BoringSSL` / `OFF` |
+| `NET_BORINGSSL_ROOT` | 空 | 现成的 BoringSSL 安装根（`include/`、`lib/`）；为空则 FetchContent 从源码构建（`NET_BORINGSSL_GIT_TAG`，无需 Go / Perl） |
+| `NET_DEFAULT_FRAME_ALLOCATOR` | `new_delete` | 上下文默认帧分配器：`new_delete` 或 `recycling`（见下文"性能"） |
+| `NET_BUILD_TESTS` / `NET_BUILD_EXAMPLES` / `NET_BUILD_BENCHMARKS` | ON / ON / OFF | 作为子项目时测试与示例默认关闭 |
+
+抽象层仅含头文件；平台层与 TLS 编译进 `libnet.a`。作为子项目：
 
 ```cmake
 add_subdirectory(path/to/net)
 target_link_libraries(my-target PRIVATE net::net)
 ```
 
-测试覆盖：task / 环境传播 / 帧分配器、执行器（多线程 `run()`、strand 串行化、服务、后端
-选择）、缓冲区、流与 `any_stream`（零分配断言）、组合子（错误传播、取消、异常）、定时器、
-TCP 回环（取消、EOF、超时、多线程）、UDP、DNS、信号，以及一个契约违规测试。平台测试为
-epoll / poll / select / io_uring 各编译一个变体（`<name>`、`<name>_poll`、`<name>_select`、
-`<name>_io_uring`），共 30 个；全部在 ASan+UBSan+LSan 与 TSan 下通过。
+测试覆盖：task / 环境传播 / 帧分配器（含多线程回收器）、执行器（多线程 `run()`、strand
+串行化、服务、后端选择）、缓冲区、流与 `any_stream`（零分配断言）、组合子（错误传播、取消、
+异常）、定时器、TCP 回环（取消、EOF、超时、多线程）、UDP、DNS、信号、TLS（握手 / 回显 /
+干净关闭、证书与主机名校验失败、验证回调、传输截断、ALPN、3 MiB 经 `any_stream` 传输、取消、
+版本不匹配、拥有式流与移动），以及一个契约违规测试。平台测试为 epoll / poll / select /
+io_uring 各编译一个变体（`<name>`、`<name>_poll`、`<name>_select`、`<name>_io_uring`），后端
+不可用时以退出码 77 跳过；共 34 个，全部在 ASan+UBSan+LSan 与 TSan 下、OpenSSL 与 BoringSSL
+两个提供者下通过。
+
+CI（`.github/workflows/ci.yml`）：GCC / Clang × Debug / Release × 两种默认帧分配器的构建与
+测试、ASan+UBSan 与 TSan 全量运行、BoringSSL 提供者作业（FetchContent 构建并缓存）、quick 模式
+基准（结果写入 step summary 并上传 artifact）。
 
 `examples/`：`echo_server`（accept 循环 + `any_stream` 会话 + SIGINT 优雅退出，
 `./echo_server 7777 io_uring` 选后端）、
 `echo_client`（DNS + connect + `when_any` 超时读）、`http_get`（`read_until` +
 动态缓冲）、`timers`（组合子 / 线程池 / stop_token）。
 
+## 性能
+
+`benchmarks/`（`-DNET_BUILD_BENCHMARKS=ON`，Release；`--quick` 供 CI）。无第三方依赖的小
+harness：多轮取中位数，全局 `operator new` 计数给出 allocs/op。i7-13700KF、GCC 13 -O3、
+Linux 7.0，单线程：
+
+| 核心路径（`bench_core`） | ns/op | allocs/op |
+| --- | --- | --- |
+| `read_some`：原生（具体类型） | 2.4 | 0 |
+| `read_some`：抽象（对 `Stream` 的模板） | 2.3 | 0 |
+| `read_some`：类型擦除（`any_stream&`） | 17.8 | 0 |
+| task 等待子 task（对称转移 + 一个子帧） | 15.2 | 1（默认 `new_delete`；`recycling` 为 0） |
+| `io_context` post 一跳 | 12.8 | 0 |
+| strand post 一跳 | 58.1 | 0 |
+| `thread_pool` post 一跳（池线程内） | 87.0 | 0 |
+| `run_async` + `run()` 往返 | 49.5 | 2 |
+| `when_all` 两个就绪 task | 137.0 | 6 |
+| 85 帧 task 树：`recycling_memory_resource` | 1594 | 0 |
+| 85 帧 task 树：`new_delete_resource` | 1433 | 85 |
+
+对照 P4088R1 §1.1 的表（原生 31.4 / 抽象 32.1 / 类型擦除 36.4 ns，均 0 分配）：类型擦除的
+`any_stream` 同样是零每操作分配，代价是一次 vtable 派发加就地构造 awaitable。
+
+帧分配器一行值得说明：P4003R3 §3.5 报告回收式分配器在 MSVC 上快 3.1 倍、Apple clang 上
+1.55 倍，但 glibc 的 malloc 自带每线程免锁缓存（tcache），这里比每尺寸类一个自旋锁的回收器
+还快约 2 ns/帧。因此 Linux 上默认帧分配器是 `new_delete_resource()`；`recycling_memory_resource`
+保留给 malloc 较慢的平台和需要有界内存池的场景（`-DNET_DEFAULT_FRAME_ALLOCATOR=recycling`，
+或按上下文 `ctx.set_frame_allocator(&ctx.recycling_frame_allocator())`）。
+
+| 后端回环（`bench_net`） | epoll | poll | select | io_uring |
+| --- | --- | --- | --- | --- |
+| TCP 回显往返 64 B（µs） | 4.85 | 4.88 | 4.99 | 4.95 |
+| TCP 回显往返 4 KiB（µs） | 5.30 | 5.34 | 5.42 | 5.42 |
+| TCP 吞吐，64 KiB 写（MiB/s） | 10006 | 9564 | 10171 | 9981 |
+| 定时器到期 + 恢复（µs） | 2.94 | 3.00 | 2.79 | 1.97 |
+
+一个连接的回环里四种后端的差别在噪声之内（瓶颈是 4 次系统调用 + 2 次唤醒）；io_uring 的
+定时器（`IORING_OP_TIMEOUT`）比就绪型后端的定时器堆 + 解复用器超时快约 1 µs。TLS 的数字
+（OpenSSL 与 BoringSSL 对照）见 `docs/tls.md`。
+
 ## 目录
 
 ```
 include/net/            公共头：协议核心、执行器、缓冲区、流、组合子（仅头文件）；平台层的具体层接口
+include/net/tls/        TLS：context / stream / error（公共头不含 OpenSSL 头）
 src/                    具体层：io_context 调度器、套接字/定时器/DNS/信号（只依赖 detail/backend.hpp）
 src/detail/backend.hpp  后端接缝：io_backend / socket_impl / timer_impl（抽象）
 src/detail/posix/       POSIX 系统调用封装
 src/detail/reactor/     就绪型后端族：reactor_backend + epoll / poll / select 解复用器
 src/detail/io_uring/    完成型后端：裸系统调用的 io_uring 环、提交/取消/收割、套接字与定时器实现
-docs/                   architecture.md（分层与决策）、backends.md（后端设计与 io_uring / IOCP 接入）
-tests/  examples/
+src/tls/                TLS 引擎（OpenSSL API 子集，OpenSSL / BoringSSL 共用）与驱动协程
+benchmarks/             bench_core / bench_net / bench_tls 与 harness
+docs/                   architecture.md（分层与决策）、backends.md（后端设计与 io_uring / IOCP 接入）、tls.md
+tests/  examples/  .github/workflows/ci.yml
 ```
 
 ## 尚未提供
 
-TLS、文件 I/O、Unix 域套接字、`system_context`、回调风格的流概念（`BufferSource` /
+文件 I/O、Unix 域套接字、`system_context`、回调风格的流概念（`BufferSource` /
 `BufferSink`）、与 `std::execution` 的桥（P4092/P4093）、IOCP / kqueue 后端（接缝已就位，
-方案见 `docs/backends.md`）。
+方案见 `docs/backends.md`）、wolfSSL 提供者与 TLS 的 PKCS#12 / CRL / SNI 服务端回调 / 会话
+复用（见 `docs/tls.md`）。

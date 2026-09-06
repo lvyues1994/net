@@ -21,6 +21,7 @@ enum class error : int {
     no_recovery,
     no_data,
     invalid_address,   // 地址字符串无法解析
+    stream_truncated,  // TLS：传输在 close_notify 之前结束（无法与截断攻击区分）
 };
 
 std::error_category const& net_category() noexcept;

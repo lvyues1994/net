@@ -97,7 +97,9 @@ struct reactor_backend final : execution_context::service, io_backend, event_sin
     std::mutex mutex_;
     std::unordered_set<descriptor_state*> registered_;
     std::vector<timer_op*> timers_;
-    std::vector<pending_event> events_; // 只有运行 wait 的线程触碰
+    std::vector<pending_event> events_;   // 只有运行 run 的线程触碰
+    std::vector<completed_op> completed_; // 同上（复用，避免每轮分配）
+    std::vector<timer_op*> expired_;      // 同上
     descriptor_state signal_state_;
     signal_pump signal_pump_;
     bool shut_down_ = false;

@@ -1,0 +1,235 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # co2（无栈协程库）作为兄弟目录检出；CMake 的 NET_CO2_DIR 指向它。
+  CO2_REPOSITORY: lvyues1994/coro
+  CO2_REF: main
+
+jobs:
+  build:
+    name: ${{ matrix.compiler }} ${{ matrix.build_type }} (${{ matrix.allocator }} frames)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: g++
+            build_type: Debug
+            allocator: new_delete
+          - compiler: g++
+            build_type: Release
+            allocator: new_delete
+          - compiler: g++
+            build_type: Debug
+            allocator: recycling
+          - compiler: clang++
+            build_type: Debug
+            allocator: new_delete
+            packages: clang
+          - compiler: clang++
+            build_type: Release
+            allocator: recycling
+            packages: clang
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out co2
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CO2_REPOSITORY }}
+          ref: ${{ env.CO2_REF }}
+          path: co2
+
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libssl-dev ${{ matrix.packages }}
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} \
+            -DNET_CO2_DIR=$GITHUB_WORKSPACE/co2 \
+            -DNET_TLS_PROVIDER=OpenSSL \
+            -DNET_DEFAULT_FRAME_ALLOCATOR=${{ matrix.allocator }}
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        # io_uring 变体在内核 / 沙箱不允许时以 77 退出，CTest 记为 skipped。
+        run: ctest --test-dir build --output-on-failure --timeout 120
+
+  sanitizers:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ASan + UBSan
+            flags: -fsanitize=address,undefined -fno-omit-frame-pointer
+            env: ASAN_OPTIONS=detect_leaks=1:strict_string_checks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
+            prefix: ""
+          - name: TSan
+            flags: -fsanitize=thread -fno-omit-frame-pointer
+            env: TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1
+            # 新内核的 ASLR 布局与 TSan 的影子内存冲突：关掉本进程的 ASLR。
+            prefix: setarch x86_64 -R
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out co2
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CO2_REPOSITORY }}
+          ref: ${{ env.CO2_REF }}
+          path: co2
+
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libssl-dev
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="${{ matrix.flags }}" \
+            -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.flags }}" \
+            -DNET_CO2_DIR=$GITHUB_WORKSPACE/co2 \
+            -DNET_TLS_PROVIDER=OpenSSL \
+            -DNET_BUILD_EXAMPLES=OFF
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: |
+          set +e # 逐个运行并自行判定退出码（77 = 跳过，契约违规测试预期 abort）
+          export ${{ matrix.env }}
+          cd build/tests
+          status=0
+          for test in $(ctest -N | sed -n 's/^ *Test *#[0-9]*: //p'); do
+            echo "::group::$test"
+            ${{ matrix.prefix }} ./$test
+            code=$?
+            echo "::endgroup::"
+            if [ $code -eq 77 ]; then
+              echo "skipped: $test"
+            elif [ $code -ne 0 ]; then
+              case "$test" in
+                *contract_violation*) echo "expected abort: $test" ;;
+                *) echo "::error::$test failed with exit code $code"; status=1 ;;
+              esac
+            fi
+          done
+          exit $status
+
+  boringssl:
+    name: BoringSSL provider
+    runs-on: ubuntu-latest
+    env:
+      BORINGSSL_TAG: 0.20250701.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out co2
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CO2_REPOSITORY }}
+          ref: ${{ env.CO2_REF }}
+          path: co2
+
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+
+      # BoringSSL 从源码构建（约 400 个目标，不需要 Go / Perl）；按标签缓存构建产物。
+      - name: Cache BoringSSL
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/_deps/boringssl-src
+            build/_deps/boringssl-build
+            build/_deps/boringssl-subbuild
+          key: boringssl-${{ env.BORINGSSL_TAG }}-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DNET_CO2_DIR=$GITHUB_WORKSPACE/co2 \
+            -DNET_TLS_PROVIDER=BoringSSL \
+            -DNET_BORINGSSL_GIT_TAG=$BORINGSSL_TAG \
+            -DNET_BUILD_EXAMPLES=OFF
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --timeout 120
+
+  benchmarks:
+    name: Benchmarks (quick)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out co2
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CO2_REPOSITORY }}
+          ref: ${{ env.CO2_REF }}
+          path: co2
+
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libssl-dev
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DNET_CO2_DIR=$GITHUB_WORKSPACE/co2 \
+            -DNET_TLS_PROVIDER=OpenSSL \
+            -DNET_BUILD_TESTS=OFF \
+            -DNET_BUILD_EXAMPLES=OFF \
+            -DNET_BUILD_BENCHMARKS=ON
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Run
+        run: |
+          cd build/benchmarks
+          {
+            ./bench_core --quick
+            ./bench_net --quick
+            ./bench_tls --quick
+          } | tee ../../benchmark-results.txt
+          {
+            echo '## Benchmarks (quick mode, shared CI runner: numbers are indicative only)'
+            echo '```'
+            cat ../../benchmark-results.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: benchmark-results.txt

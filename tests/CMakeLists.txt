@@ -15,6 +15,9 @@ set(net_platform_test_sources
     udp_tests.cpp
     resolver_tests.cpp
     signal_tests.cpp)
+if(net_has_tls)
+    list(APPEND net_platform_test_sources tls_tests.cpp)
+endif()
 
 function(net_configure_test_target target)
     target_link_libraries(${target} PRIVATE net::net)
@@ -35,6 +38,9 @@ function(net_configure_test_target target)
     endif()
 endfunction()
 
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag(-Wmismatched-new-delete NET_COMPILER_HAS_WMISMATCHED_NEW_DELETE)
+
 foreach(source IN LISTS net_test_sources)
     get_filename_component(name "${source}" NAME_WE)
     add_executable(${name} ${source})
@@ -42,6 +48,12 @@ foreach(source IN LISTS net_test_sources)
     add_test(NAME ${name} COMMAND ${name})
     set_tests_properties(${name} PROPERTIES TIMEOUT 120)
 endforeach()
+
+# stream_tests 用 malloc/free 替换了全局 operator new/delete 来计数分配；GCC -O3 会对此
+# 误报 -Wmismatched-new-delete（配对是正确的）。
+if(NET_COMPILER_HAS_WMISMATCHED_NEW_DELETE)
+    target_compile_options(stream_tests PRIVATE -Wno-mismatched-new-delete)
+endif()
 
 foreach(source IN LISTS net_platform_test_sources)
     get_filename_component(name "${source}" NAME_WE)
@@ -55,7 +67,7 @@ foreach(source IN LISTS net_platform_test_sources)
         net_configure_test_target(${target})
         target_compile_definitions(${target} PRIVATE "NET_TEST_BACKEND=::net::${backend}")
         add_test(NAME ${target} COMMAND ${target})
-        set_tests_properties(${target} PROPERTIES TIMEOUT 120)
+        set_tests_properties(${target} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
 endforeach()
 

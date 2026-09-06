@@ -17,6 +17,9 @@ net 用 C++14 与 co2 实现这套协议：语言里没有 `co_await`，但 co2 
 ┌──────────────────────────────────────────────────────────────────────┐
 │ 应用          examples/ echo_server echo_client http_get timers       │
 ├──────────────────────────────────────────────────────────────────────┤
+│ TLS（libnet）   tls::context  tls::stream  openssl_stream            │
+│                 sans-I/O 引擎（OpenSSL / BoringSSL）+ 驱动协程，只依赖 Stream │
+├──────────────────────────────────────────────────────────────────────┤
 │ 具体层（libnet） io_context  tcp / udp / timer / resolver / signal_set │
 │                 ↓ 抽象接缝 src/detail/backend.hpp                    │
 │ 后端            reactor_backend + demultiplexer{epoll, poll, select} │
@@ -39,8 +42,14 @@ net 用 C++14 与 co2 实现这套协议：语言里没有 `co_await`，但 co2 
 
 依赖只向下。协议核心到组合子仅含头文件、与平台无关；平台层编译进 `libnet.a`：具体层
 只依赖 `src/detail/backend.hpp` 的抽象接口（`io_backend` / `socket_impl` / `timer_impl`），
-后端实现在 `src/detail/reactor/`（就绪型族）与 `src/detail/posix/`，全部只在 `src/` 内可见。
-后端的选择、与 Corosio 的对照、io_uring / IOCP 的接入方案见 `docs/backends.md`。
+后端实现在 `src/detail/reactor/`（就绪型族）、`src/detail/io_uring/` 与 `src/detail/posix/`，
+全部只在 `src/` 内可见。后端的选择、与 Corosio 的对照、io_uring / IOCP 的接入方案见
+`docs/backends.md`。
+
+TLS 层位于具体层之上、应用之下，但它只依赖 `Stream` 概念（经 `any_stream` 类型擦除）而不
+依赖任何具体 I/O 对象或后端：引擎是 sans-I/O 的（`SSL` + 内存 BIO），驱动协程用底层流的
+`read_some` / `write_some` 泵字节。`tls::stream` 自身满足 `Stream`，所以业务逻辑对
+`any_stream&` 编译一次就同时覆盖明文 TCP、TLS 与测试替身。设计见 `docs/tls.md`。
 
 ## 协议核心
 
@@ -81,9 +90,14 @@ set_continuation() / set_environment()`）。
 （忽略 allocator 参数路径）。`safe_resume` 在恢复前后保存/恢复槽位——所有执行循环
 （`io_context::run`、`thread_pool` 工作线程、`strand` 派发帧）都经由它恢复协程。
 
-`execution_context` 自带一个 `recycling_memory_resource` 作为默认帧分配器：按
-（尺寸, 对齐）分类缓存最近释放的块；协程帧尺寸重复、生命周期嵌套，稳态下每次帧分配
-命中缓存。
+`execution_context` 自带一个 `recycling_memory_resource`：尺寸按 64 字节粒度归类
+（≤ 8 KiB），每类一条侵入式空闲链表加一个自旋锁（临界区三条指令），缓存最近释放的块；
+协程帧尺寸重复、生命周期嵌套，稳态下每次帧分配命中缓存。它是否作为**默认**帧分配器由
+构建选项 `NET_DEFAULT_FRAME_ALLOCATOR` 决定：基准（`benchmarks/bench_core`）显示 glibc 的
+tcache malloc 比任何带原子操作的回收器都快，所以 Linux 上默认是 `new_delete_resource()`；
+回收器留给 malloc 慢的平台和有界内存池的场景（`ctx.set_frame_allocator(&ctx.recycling_frame_allocator())`）。
+最初的实现是无锁 Treiber 栈；它读取"可能已被别的线程弹出并投入使用"的块的 `next`，实践中
+无害但按 C++ 内存模型是数据竞争（TSan 会报），故换成原子操作数相同的自旋锁。
 
 ### completion_frame
 

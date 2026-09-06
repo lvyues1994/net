@@ -1,8 +1,9 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
-#include <mutex>
-#include <vector>
+#include <cstdint>
+#include <memory>
 
 #include "net/coroutine.hpp"
 
@@ -60,12 +61,19 @@ memory_resource* new_delete_resource() noexcept;
 
 // 回收式帧分配器（P4172R1 §6.3.1）。协程帧的尺寸重复、生命周期嵌套、释放顺序与分配
 // 顺序镜像；按尺寸分类缓存最近释放的块，稳态下每次帧分配都命中缓存，不再进入通用
-// 分配器。缓存有上限，超出的块交还上游。线程安全。
+// 分配器。缓存有上限，超出的块交还上游。
+//
+// 实现：尺寸按 64 字节粒度取整成尺寸类（≤ 8 KiB，更大的直接走上游），每类一个侵入式空闲
+// 链表，由一个自旋锁保护——临界区只有三条指令，分配 / 释放各一次原子 RMW 加一次 release
+// 存储，与无锁 Treiber 栈的原子操作数相同，但没有它的"读取已被弹出块的 next"数据竞争。
+// release() 与析构要求没有并发使用。
 struct recycling_memory_resource final : memory_resource {
+    static constexpr std::size_t granule = 64U;
+    static constexpr std::size_t class_count = 128U; // 覆盖到 8 KiB
+    static constexpr std::size_t max_cached_size = granule * class_count;
+
     struct config {
-        std::size_t max_size_classes = 32;        // 最多缓存多少种（尺寸, 对齐）
-        std::size_t max_blocks_per_class = 64;    // 每种最多缓存多少块
-        std::size_t max_block_size = 256U * 1024U; // 超过的块不缓存
+        std::size_t max_blocks_per_class = 64; // 每个尺寸类最多缓存多少块
     };
 
     explicit recycling_memory_resource(memory_resource* upstream = new_delete_resource());
@@ -77,10 +85,10 @@ struct recycling_memory_resource final : memory_resource {
 
     memory_resource* upstream() const noexcept { return upstream_; }
 
-    // 把缓存的块全部交还上游。
+    // 把缓存的块全部交还上游（前置条件：没有并发的 allocate / deallocate）。
     void release() noexcept;
 
-    // 诊断：当前缓存的块数与字节数。
+    // 诊断：当前缓存的块数与字节数（近似）。
     std::size_t cached_blocks() const noexcept;
     std::size_t cached_bytes() const noexcept;
 
@@ -90,23 +98,25 @@ struct recycling_memory_resource final : memory_resource {
     };
 
     struct size_class {
-        std::size_t size;
-        std::size_t alignment;
-        free_block* head;
-        std::size_t count;
+        std::atomic<bool> locked{false};
+        free_block* head = nullptr;
+        std::size_t count = 0;
     };
 
     void* do_allocate(std::size_t bytes, std::size_t alignment) override;
-    void do_deallocate(void* pointer, std::size_t bytes,
-                       std::size_t alignment) noexcept override;
+    void do_deallocate(void* pointer, std::size_t bytes, std::size_t alignment) noexcept override;
     bool do_is_equal(memory_resource const& other) const noexcept override;
 
-    size_class* find_class(std::size_t bytes, std::size_t alignment) noexcept;
+    static std::size_t class_index(std::size_t bytes) noexcept { return (bytes + granule - 1U) / granule - 1U; }
+    static std::size_t class_size(std::size_t index) noexcept { return (index + 1U) * granule; }
+    void* pop(size_class& cls) noexcept;
+    bool push(size_class& cls, void* pointer) noexcept;
+    static void lock(size_class& cls) noexcept;
+    static void unlock(size_class& cls) noexcept;
 
     memory_resource* upstream_;
     config options_;
-    mutable std::mutex mutex_;
-    std::vector<size_class> classes_;
+    std::unique_ptr<size_class[]> classes_;
 };
 
 // ---- 带外帧分配器通道 ----
