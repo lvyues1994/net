@@ -170,16 +170,26 @@ bool reactor_backend::start_op(descriptor_state& state, op_direction const direc
         std::lock_guard<std::mutex> lock{mutex_};
         CO2_CONTRACT_CHECK(state.registered);
         CO2_CONTRACT_CHECK(state.ops[index] == nullptr);
+        if (op.cancel_requested) {
+            // 停止请求先到了：不排队，同步以 aborted 完成。
+            op.cancel_requested = false;
+            op.ec = make_error_code(error::operation_aborted);
+            op.bytes_transferred = 0U;
+            return true;
+        }
         if (state.ready & bit) {
             // 上一次就绪已经到达且尚未被消费：先试一次。
             state.ready &= ~bit;
             if (op.perform()) return true;
         }
+        // 工作计数在发布之前、锁内加：发布之后别的线程可能立刻完成它并 on_work_finished——
+        // 计数先减后加会把 outstanding_work 打到 0（run() 提前返回 / 契约违规），而且那时 op
+        // 可能已随套接字销毁。
+        if (op.counts_as_work) context_->get_executor().on_work_started();
         op.state = reactor_op::state_type::queued;
         state.ops[index] = &op;
         refresh_interest(state);
     }
-    if (op.counts_as_work) context_->get_executor().on_work_started();
     return false;
 }
 
@@ -188,7 +198,11 @@ bool reactor_backend::cancel_op(descriptor_state& state, op_direction const dire
     auto const index = static_cast<unsigned>(direction);
     {
         std::lock_guard<std::mutex> lock{mutex_};
-        if (state.ops[index] != &op) return false;
+        if (state.ops[index] != &op) {
+            // 尚未 start_op（或已完成、协程尚未恢复——finish 会清掉这个过期标记）。
+            op.cancel_requested = true;
+            return false;
+        }
         state.ops[index] = nullptr;
         op.state = reactor_op::state_type::idle;
         op.ec = make_error_code(error::operation_aborted);
@@ -239,11 +253,17 @@ void reactor_backend::process_event(descriptor_state& state, unsigned const read
 
 // ---- 定时器 ----
 
-void reactor_backend::add_timer(timer_op& op) noexcept {
+bool reactor_backend::add_timer(timer_op& op) noexcept {
     auto became_earliest = false;
     {
         std::lock_guard<std::mutex> lock{mutex_};
         CO2_CONTRACT_CHECK(op.heap_index == timer_op::not_queued);
+        if (op.cancel_requested) {
+            op.cancel_requested = false;
+            op.ec = make_error_code(error::operation_aborted);
+            return true;
+        }
+        context_->get_executor().on_work_started(); // 发布之前（见 start_op）
         heap_push(op);
         // 成为最早到期且有线程正阻塞在解复用器里：重新武装 timerfd，它会在新到期时刻叫醒那个
         // 线程（timerfd 在解复用器的集合里，跨线程 settime 立即生效）。没有线程在等时留给 run()
@@ -251,13 +271,18 @@ void reactor_backend::add_timer(timer_op& op) noexcept {
         became_earliest = waiting_ && timers_.front() == &op;
         if (became_earliest) arm_timer_fd_locked();
     }
-    context_->get_executor().on_work_started();
+    return false;
 }
 
-bool reactor_backend::cancel_timer(timer_op& op) noexcept {
+bool reactor_backend::cancel_timer(timer_op& op, bool const from_stop_token) noexcept {
     {
         std::lock_guard<std::mutex> lock{mutex_};
-        if (op.heap_index == timer_op::not_queued) return false;
+        if (op.heap_index == timer_op::not_queued) {
+            // 只有 stop_token 路径会在"装好回调、尚未 add_timer"的窗口里到达；用户的 cancel()
+            // 对没在等的定时器不能留下标记，否则下一次 wait() 会被误中止。
+            if (from_stop_token) op.cancel_requested = true;
+            return false;
+        }
         heap_remove(op.heap_index);
         op.ec = make_error_code(error::operation_aborted);
     }

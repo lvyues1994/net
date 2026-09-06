@@ -52,8 +52,8 @@ struct reactor_backend final : execution_context::service, io_backend, event_sin
     bool cancel_op(descriptor_state& state, op_direction direction, reactor_op& op) noexcept;
     void cancel_ops(descriptor_state& state) noexcept;
 
-    void add_timer(timer_op& op) noexcept;
-    bool cancel_timer(timer_op& op) noexcept;
+    bool add_timer(timer_op& op) noexcept; // 返回 true：已因停止请求同步以 aborted 完成
+    bool cancel_timer(timer_op& op, bool from_stop_token = false) noexcept;
 
   protected:
     void shutdown() override;

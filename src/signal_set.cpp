@@ -92,7 +92,10 @@ struct signal_set_impl {
 
     // 锁内。
     bool cancel_locked() noexcept {
-        if (not waiting) return false;
+        if (not waiting) {
+            cancel_requested = true; // 回调装好、尚未挂起：await_suspend 看到即中止
+            return false;
+        }
         waiting = false;
         ec = make_error_code(error::operation_aborted);
         env->executor.post(cont);
@@ -107,6 +110,7 @@ struct signal_set_impl {
     io_env const* env = nullptr;
     bool pending = false; // wait() 已发出且尚未 await_resume
     bool waiting = false; // 已挂起等待信号（锁内读写）
+    bool cancel_requested = false; // 停止请求在挂起之前到达（锁内读写）
     int delivered = 0;
     std::error_code ec;
     late_init<stop_callback<cancel_signal_wait>> stop_cb;
@@ -213,26 +217,32 @@ coroutine_handle<> signal_wait_awaitable::await_suspend(coroutine_handle<> const
         impl->ec = make_error_code(error::operation_aborted);
         return h;
     }
-    auto& state = detail::signal_state::instance();
-    {
-        std::lock_guard<std::mutex> lock{state.mutex};
-        // 在 await_ready 与这里之间可能已有信号到达。
-        if (not impl->queued.empty()) {
-            impl->delivered = impl->queued.front();
-            impl->queued.pop_front();
-            impl->ec.clear();
-            return h;
-        }
-        impl->waiting = true;
-        impl->context->get_executor().on_work_started();
-    }
+    // 回调装在发布（waiting = true）之前：发布之后别的线程可能立刻交付信号、恢复并结束协程，
+    // env 与 impl->stop_cb 都不能再碰。发布前到达的停止请求由 cancel_locked 记为 cancel_requested。
     if (env->stop_token.stop_possible())
         impl->stop_cb.emplace(env->stop_token, detail::cancel_signal_wait{impl});
+    auto& state = detail::signal_state::instance();
+    std::lock_guard<std::mutex> lock{state.mutex};
+    if (impl->cancel_requested) {
+        impl->cancel_requested = false;
+        impl->ec = make_error_code(error::operation_aborted);
+        return h;
+    }
+    // 在 await_ready 与这里之间可能已有信号到达。
+    if (not impl->queued.empty()) {
+        impl->delivered = impl->queued.front();
+        impl->queued.pop_front();
+        impl->ec.clear();
+        return h;
+    }
+    impl->waiting = true;
+    impl->context->get_executor().on_work_started();
     return noop_coroutine();
 }
 
 io_result<int> signal_wait_awaitable::await_resume() noexcept {
-    impl->stop_cb.reset();
+    impl->stop_cb.reset(); // 之后不再有取消回调
+    impl->cancel_requested = false; // 交付后、恢复前到达的取消留下的过期标记
     impl->pending = false;
     impl->env = nullptr;
     return io_result<int>{impl->ec, impl->delivered};

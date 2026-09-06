@@ -220,16 +220,18 @@ coroutine_handle<> reactor_socket::suspend(op_direction const direction, corouti
         op.bytes_transferred = 0U;
         return h;
     }
+    // 回调装在发布之前：之后到达的停止请求经 cancel_op 取消已登记的操作；之前到达的（包括
+    // emplace 时已停止、同步触发的）由 cancel_op 记为 cancel_requested，start_op 看到即同步中止。
+    // start_op 之后不能再碰 env 与 op——别的线程可能已经完成操作、恢复并结束协程。
     if (env->stop_token.stop_possible())
         op.stop_cb.emplace(env->stop_token, cancel_reactor_socket_op{this, direction});
-    if (backend_->start_op(state_, direction, op)) return h; // 就绪位命中：已完成
-    // 关闭"注册回调与排队之间停止请求到达"的窗口。
-    if (env->stop_token.stop_requested()) backend_->cancel_op(state_, direction, op);
+    if (backend_->start_op(state_, direction, op)) return h; // 就绪位命中或已被取消：已完成
     return noop_coroutine();
 }
 
 void reactor_socket::finish(reactor_socket_op& op) noexcept {
-    op.stop_cb.reset();
+    op.stop_cb.reset(); // 之后不再有取消回调
+    op.cancel_requested = false; // 完成后、恢复前到达的取消留下的过期标记
     op.pending = false;
     op.env = nullptr;
 }

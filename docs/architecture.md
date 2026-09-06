@@ -163,6 +163,17 @@ listen / setsockopt / getsockname…）直接对 `impl_->native_handle()` 做系
 `update` 调整兴趣（否则可读而无人读的描述符会让 `wait` 忙转），解复用器在锁内构建快照
 再阻塞、兴趣增加时写 eventfd 唤醒重建。
 
+### suspend() 的发布规则
+
+多线程 `io_context` 下，`await_suspend` 一旦把操作发布出去（登记到反应器、写进 SQ 环、置
+`waiting`），另一个线程可能立刻完成它、恢复协程、跑到结束并销毁帧——帧里有套接字（连同
+操作对象）和 `run_async` 的状态（连同 `io_env`）。所以三条规则（`src/detail/backend.hpp`）：
+发布之后不碰 `env` / `op` / `this`；`on_work_started` 在发布之前、同一把锁内（否则完成方的
+`on_work_finished` 可能先到，把 `outstanding_work` 打到 0，`run()` 提前返回）；`stop_callback`
+在发布之前装好，"装好之后、发布之前"到达的停止请求由取消路径记为 `cancel_requested`，发布时
+看到即同步中止——早期实现在发布之后再读一次 `env->stop_token.stop_requested()` 来关这个窗口，
+在 2 核的 CI 机器上被 ASan 抓到 use-after-free。
+
 ### 操作状态住在 I/O 对象里
 
 `tcp_socket::read_some(buffers)` 把缓冲区序列展平交给 `socket_impl::begin_read`，返回的

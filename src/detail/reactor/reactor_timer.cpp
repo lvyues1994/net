@@ -10,7 +10,7 @@
 namespace net {
 namespace detail {
 
-void cancel_reactor_timer::operator()() const noexcept { impl->backend().cancel_timer(*impl); }
+void cancel_reactor_timer::operator()() const noexcept { impl->backend().cancel_timer(*impl, true); }
 
 reactor_timer::reactor_timer(io_context& context, reactor_backend& backend) noexcept
     : context_{&context}, backend_{&backend} {
@@ -43,14 +43,15 @@ coroutine_handle<> reactor_timer::suspend(coroutine_handle<> const h, io_env con
         ec = make_error_code(error::operation_aborted);
         return h;
     }
+    // 回调装在发布之前（见 reactor_socket::suspend）；add_timer 之后不再碰 env。
     if (env->stop_token.stop_possible()) stop_cb_.emplace(env->stop_token, cancel_reactor_timer{this});
-    backend_->add_timer(*this);
-    if (env->stop_token.stop_requested()) backend_->cancel_timer(*this);
+    if (backend_->add_timer(*this)) return h; // 停止请求先到：已同步中止
     return noop_coroutine();
 }
 
 io_result<> reactor_timer::finish() noexcept {
     stop_cb_.reset();
+    cancel_requested = false;
     pending_ = false;
     env_ = nullptr;
     return io_result<>{ec};

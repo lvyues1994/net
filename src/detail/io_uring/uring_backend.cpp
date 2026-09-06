@@ -190,11 +190,13 @@ bool uring_backend::submit(uring_op& op) noexcept {
             op.cancel_requested = false;
             return false;
         }
+        // 工作计数在发布之前、锁内加：run() 完成它时先取环锁，因此 on_work_finished 必然在这
+        // 之后；锁外加会与"提交后立刻完成"竞争，把 outstanding_work 打到 0。
+        if (op.counts_as_work) context_->get_executor().on_work_started();
         if (not try_submit_locked(op)) push_deferred_locked(op);
         ring_.flush(); // 只发布尾指针；进内核推迟到 run()
         wake = waiting_;
     }
-    if (op.counts_as_work) context_->get_executor().on_work_started();
     // 另一个线程正阻塞在 enter 里：叫醒它，让它把这条 SQE 提交进内核。单线程时永远不会走到。
     if (wake) interrupt();
     return true;
@@ -202,9 +204,9 @@ bool uring_backend::submit(uring_op& op) noexcept {
 
 void uring_backend::submit_locked(uring_op& op) noexcept {
     if (shut_down_) return;
+    if (op.counts_as_work) context_->get_executor().on_work_started(); // 发布之前
     if (not try_submit_locked(op)) push_deferred_locked(op);
     ring_.flush();
-    if (op.counts_as_work) context_->get_executor().on_work_started();
 }
 
 void uring_backend::retire(std::unique_ptr<uring_op> op) noexcept {

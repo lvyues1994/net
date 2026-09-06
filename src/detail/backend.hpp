@@ -26,6 +26,15 @@
 //   - timer_impl：一个定时器的实现。
 // 操作完成时实现把续体交给 io_env 里的执行器（env->executor.post(cont)）并归还工作计数；
 // 这一条对所有后端相同，与 P4003R3 §5 "there is always an owner" 一致。
+//
+// suspend() 的发布规则（每个后端都必须遵守，多线程 io_context 下违反即 use-after-free）：
+//   1. 发布操作（登记到反应器 / 写进 SQ 环 / 置 waiting）之后不能再碰 env、op、this——
+//      别的线程可能已经完成它、恢复协程、跑到结束并销毁帧（连同套接字与 run_async 状态）；
+//   2. 工作计数 on_work_started 在发布之前、与发布同一把锁内：发布后立刻完成会先
+//      on_work_finished，把 outstanding_work 打到 0；
+//   3. stop_callback 在发布之前装好；"装好之后、发布之前"到达的停止请求由取消路径记为
+//      cancel_requested，发布时看到即同步以 operation_aborted 完成——不能在发布之后再读
+//      env->stop_token 来关这个窗口。
 
 namespace net {
 

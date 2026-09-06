@@ -50,12 +50,11 @@ coroutine_handle<> uring_timer::suspend(coroutine_handle<> const h, io_env const
         return h;
     }
     if (env->stop_token.stop_possible()) stop_cb_.emplace(env->stop_token, cancel_uring_timer{this});
-    if (not backend_->submit(*this)) {
+    if (not backend_->submit(*this)) { // 提交前已被取消
         ec_ = make_error_code(error::operation_aborted);
         return h;
     }
-    if (env->stop_token.stop_requested()) backend_->cancel(*this);
-    return noop_coroutine();
+    return noop_coroutine(); // submit 之后不再碰 env / this
 }
 
 io_result<> uring_timer::finish() noexcept {

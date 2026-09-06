@@ -1,7 +1,11 @@
 #pragma once
 
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
+#include <thread>
+
+#include "co2/contract.hpp"
 
 #include "net/backend.hpp"
 #include "net/io_context.hpp"
@@ -37,6 +41,21 @@ inline void fail(char const* const expression, char const* const file, int const
     std::cerr << file << ':' << line << ": check failed: " << expression << '\n';
     std::exit(EXIT_FAILURE);
 }
+
+// 契约违规默认直接 std::terminate()，只会打印"terminate called without an active exception"。
+// 测试进程装一个会说出条件与位置的处理器；NET_TEST_CONTRACT_DELAY_MS 让它在终止前等一会
+//（sanitizer 在别的线程上打印报告时不被打断）。
+struct contract_reporter {
+    contract_reporter() {
+        co2::setContractViolationHandler([](co2::ContractViolation const& violation) {
+            std::cerr << "contract violation: " << violation.condition << " at " << violation.file << ':'
+                      << violation.line << '\n';
+            if (auto const* const delay = std::getenv("NET_TEST_CONTRACT_DELAY_MS"))
+                std::this_thread::sleep_for(std::chrono::milliseconds{std::atoi(delay)});
+        });
+    }
+};
+static contract_reporter const contract_reporter_instance{};
 
 } // namespace net_test
 

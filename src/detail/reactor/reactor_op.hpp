@@ -36,6 +36,10 @@ struct reactor_op {
     std::error_code ec;
     std::size_t bytes_transferred = 0;
     state_type state = state_type::idle;
+    // 停止请求在"装好 stop_callback 之后、start_op 之前"到达：cancel_op 找不到已登记的操作，
+    // 记在这里，start_op 看到就以 operation_aborted 同步完成。发布操作之后不能再碰 env / op
+    //（别的线程可能已经完成它、恢复协程、销毁帧），所以这个窗口只能这样关。
+    bool cancel_requested = false;
     // 为假的操作（信号泵这类常驻监听）排队时不计入 io_context 的未完成工作。
     bool counts_as_work = true;
 };
@@ -68,6 +72,7 @@ struct timer_op {
     std::chrono::steady_clock::time_point expiry{};
     std::size_t heap_index = not_queued;
     std::error_code ec;
+    bool cancel_requested = false; // 同 reactor_op::cancel_requested
 };
 
 } // namespace detail

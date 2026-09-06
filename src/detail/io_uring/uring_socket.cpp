@@ -522,18 +522,18 @@ coroutine_handle<> uring_socket::suspend(op_direction const direction, coroutine
             op.accepted_fd = -1;
             return h;
         }
+        context_->get_executor().on_work_started(); // 发布之前（锁内，交付方也在锁内）
         acceptor_->waiting = true;
-        context_->get_executor().on_work_started();
         return noop_coroutine();
     }
+    // submit 之后不能再碰 env 与 op：别的线程可能已经完成操作、恢复并结束协程。提交前到达的
+    // 停止请求由 cancel 记为 cancel_requested，submit 返回 false。
     if (not backend_->submit(op)) {
         // 提交前已被取消：不会有 CQE。
         op.ec = make_error_code(error::operation_aborted);
         op.bytes_transferred = 0U;
         return h;
     }
-    // 关闭"注册回调与提交之间停止请求到达"的窗口（取消请求幂等）。
-    if (env->stop_token.stop_requested()) backend_->cancel(op);
     return noop_coroutine();
 }
 
