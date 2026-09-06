@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+
 #include <sys/socket.h>
 #include <sys/uio.h>
 
@@ -26,6 +28,41 @@ struct cancel_uring_socket_op {
     uring_socket* impl;
     op_direction direction;
     void operator()() const noexcept;
+};
+
+// 自适应投机（照 Corosio 的 speculative_state）：每个操作先试一次非阻塞系统调用；EAGAIN 后关掉
+// 该方向的投机，直到一次异步完成证明就绪再重开；读方向连续 4 次 EAGAIN 后永久关闭——"总是
+// 先等"的套接字（服务端的读、acceptor）不再为白跑的 read 付系统调用，直接走完成型路径，由
+// 内核把数据拷进我们的缓冲区。字段只是提示，relaxed 原子：读到旧值最多浪费或省掉一次投机。
+struct speculation_state {
+    static constexpr int max_read_failures = 4;
+
+    bool may_read() const noexcept {
+        return try_read.load(std::memory_order_relaxed) && not perma_off_read.load(std::memory_order_relaxed);
+    }
+    bool may_write() const noexcept { return try_write.load(std::memory_order_relaxed); }
+
+    void on_read_exhausted() noexcept {
+        try_read.store(false, std::memory_order_relaxed);
+        auto streak = read_eagain_streak.load(std::memory_order_relaxed);
+        if (streak < max_read_failures) {
+            read_eagain_streak.store(++streak, std::memory_order_relaxed);
+            if (streak >= max_read_failures) perma_off_read.store(true, std::memory_order_relaxed);
+        }
+    }
+    void on_read_success() noexcept {
+        if (read_eagain_streak.load(std::memory_order_relaxed) != 0) read_eagain_streak.store(0, std::memory_order_relaxed);
+    }
+    void on_write_exhausted() noexcept { try_write.store(false, std::memory_order_relaxed); }
+    void on_async_read_ready() noexcept {
+        if (not perma_off_read.load(std::memory_order_relaxed)) try_read.store(true, std::memory_order_relaxed);
+    }
+    void on_async_write_ready() noexcept { try_write.store(true, std::memory_order_relaxed); }
+
+    std::atomic<bool> try_read{true};
+    std::atomic<bool> try_write{true};
+    std::atomic<int> read_eagain_streak{0};
+    std::atomic<bool> perma_off_read{false};
 };
 
 struct uring_socket_op final : uring_op {
@@ -95,6 +132,7 @@ struct uring_socket final : socket_impl {
     uring_socket_op& op_for(op_direction const direction) noexcept {
         return direction == op_direction::read ? read_op_ : write_op_;
     }
+    speculation_state& speculation() noexcept { return speculation_; }
 
   private:
     void cancel_pending(uring_socket_op& op) noexcept;
@@ -103,6 +141,7 @@ struct uring_socket final : socket_impl {
     io_context* context_;
     uring_backend* backend_;
     int fd_ = -1;
+    speculation_state speculation_;
     uring_socket_op read_op_;
     uring_socket_op write_op_;
 };

@@ -3,6 +3,7 @@
 #include <system_error>
 
 #include <sys/epoll.h>
+#include <sys/syscall.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
 
@@ -70,10 +71,23 @@ struct epoll_demultiplexer final : demultiplexer {
         ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, state.fd, &event);
     }
 
-    std::error_code wait(long const timeout_ms, event_sink& sink) noexcept override {
+    std::error_code wait(long long const timeout_ns, event_sink& sink) noexcept override {
         epoll_event events[max_events];
-        auto const count =
-            ::epoll_wait(epoll_fd_, events, max_events, timeout_ms < 0 ? -1 : static_cast<int>(timeout_ms));
+        timespec ts{};
+        auto const* const timeout = timespec_of(timeout_ns, ts);
+        auto count = -1;
+#if defined(__NR_epoll_pwait2)
+        // 5.11+：纳秒精度。老内核 ENOSYS 后退回毫秒的 epoll_wait（向上取整）。
+        if (have_pwait2_) {
+            count = static_cast<int>(::syscall(__NR_epoll_pwait2, epoll_fd_, events, max_events, timeout, nullptr, 0));
+            if (count < 0 && errno == ENOSYS) have_pwait2_ = false;
+        }
+        if (not have_pwait2_)
+#endif
+        {
+            auto const ms = timeout_ns < 0 ? -1 : static_cast<int>((timeout_ns + 999999LL) / 1000000LL);
+            count = ::epoll_wait(epoll_fd_, events, max_events, ms);
+        }
         if (count < 0) {
             if (errno == EINTR) return {};
             return std::error_code{errno, std::system_category()};
@@ -97,6 +111,7 @@ struct epoll_demultiplexer final : demultiplexer {
 
   private:
     int epoll_fd_ = -1;
+    bool have_pwait2_ = true;
     int event_fd_ = -1;
 };
 

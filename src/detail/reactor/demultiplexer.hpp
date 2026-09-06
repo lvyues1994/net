@@ -1,5 +1,7 @@
 #pragma once
 
+#include <ctime>
+
 #include <memory>
 #include <system_error>
 
@@ -23,6 +25,14 @@ struct event_sink {
     virtual void on_ready(descriptor_state& state, unsigned ready_bits) noexcept = 0;
 };
 
+// 把纳秒超时转成 timespec（timeout_ns < 0 时返回空指针 = 无限等待）。
+inline timespec* timespec_of(long long const timeout_ns, timespec& storage) noexcept {
+    if (timeout_ns < 0) return nullptr;
+    storage.tv_sec = static_cast<time_t>(timeout_ns / 1000000000LL);
+    storage.tv_nsec = static_cast<long>(timeout_ns % 1000000000LL);
+    return &storage;
+}
+
 struct demultiplexer {
     demultiplexer() = default;
     demultiplexer(demultiplexer const&) = delete;
@@ -39,8 +49,9 @@ struct demultiplexer {
     virtual void update(descriptor_state& state, unsigned interest) noexcept = 0;
     virtual void remove(descriptor_state& state) noexcept = 0;
 
-    // 阻塞至多 timeout_ms（< 0 无限）等待事件，就绪的描述符逐个交给 sink。
-    virtual std::error_code wait(long timeout_ms, event_sink& sink) noexcept = 0;
+    // 阻塞至多 timeout_ns（< 0 无限）等待事件，就绪的描述符逐个交给 sink。纳秒精度：定时器堆
+    // 的最早到期不能被向上取整到毫秒（epoll_pwait2 / ppoll / pselect）。
+    virtual std::error_code wait(long long timeout_ns, event_sink& sink) noexcept = 0;
     virtual void interrupt() noexcept = 0;
 };
 

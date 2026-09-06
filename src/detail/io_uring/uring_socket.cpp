@@ -90,6 +90,13 @@ void uring_socket_op::prepare(io_uring_sqe& sqe) noexcept {
 }
 
 void uring_socket_op::on_complete(int const res, unsigned) noexcept {
+    // 一次成功的异步完成证明该方向就绪：下一个操作可以再投机。
+    if (res >= 0) {
+        if (direction == op_direction::read)
+            owner->speculation().on_async_read_ready();
+        else
+            owner->speculation().on_async_write_ready();
+    }
     if (res < 0) {
         ec = error_from_result(res);
         bytes_transferred = 0U;
@@ -252,43 +259,67 @@ bool uring_socket::ready(op_direction const direction) noexcept {
         op.bytes_transferred = 0U;
         return true;
     }
+    auto& spec = speculation_;
     switch (op.op_kind) {
     case uring_socket_op::kind::read: {
         if (op.read_buffers.total_size() == 0U) break;
+        if (not spec.may_read()) return false;
         auto const outcome = posix::readv(fd_, op.read_buffers);
-        if (not outcome.done) return false;
+        if (not outcome.done) {
+            spec.on_read_exhausted();
+            return false;
+        }
+        spec.on_read_success();
         op.ec = outcome.ec;
         op.bytes_transferred = outcome.bytes;
         return true;
     }
     case uring_socket_op::kind::receive_from: {
         if (op.read_buffers.total_size() == 0U) break;
+        if (not spec.may_read()) return false;
         auto const outcome = posix::recvmsg(fd_, op.read_buffers, op.address_out, op.address_length);
-        if (not outcome.done) return false;
+        if (not outcome.done) {
+            spec.on_read_exhausted();
+            return false;
+        }
+        spec.on_read_success();
         op.ec = outcome.ec;
         op.bytes_transferred = outcome.bytes;
         return true;
     }
     case uring_socket_op::kind::write: {
         if (op.write_buffers.total_size() == 0U) break;
+        if (not spec.may_write()) return false;
         auto const outcome = posix::writev(fd_, op.write_buffers);
-        if (not outcome.done) return false;
+        if (not outcome.done) {
+            spec.on_write_exhausted();
+            return false;
+        }
         op.ec = outcome.ec;
         op.bytes_transferred = outcome.bytes;
         return true;
     }
     case uring_socket_op::kind::send_to: {
         if (op.write_buffers.total_size() == 0U) break;
+        if (not spec.may_write()) return false;
         auto const outcome = posix::sendmsg(fd_, op.write_buffers, reinterpret_cast<sockaddr const*>(&op.address),
                                             op.address_length);
-        if (not outcome.done) return false;
+        if (not outcome.done) {
+            spec.on_write_exhausted();
+            return false;
+        }
         op.ec = outcome.ec;
         op.bytes_transferred = outcome.bytes;
         return true;
     }
     case uring_socket_op::kind::accept: {
+        if (not spec.may_read()) return false;
         auto const outcome = posix::accept(fd_);
-        if (not outcome.done) return false;
+        if (not outcome.done) {
+            spec.on_read_exhausted();
+            return false;
+        }
+        spec.on_read_success();
         op.ec = outcome.ec;
         op.accepted_fd = outcome.fd;
         op.accepted_family = outcome.family;

@@ -63,7 +63,7 @@ struct select_demultiplexer final : demultiplexer {
         state.demux_index = descriptor_state::no_index;
     }
 
-    std::error_code wait(long const timeout_ms, event_sink& sink) noexcept override {
+    std::error_code wait(long long const timeout_ns, event_sink& sink) noexcept override {
         fd_set read_set;
         fd_set write_set;
         fd_set error_set;
@@ -84,13 +84,8 @@ struct select_demultiplexer final : demultiplexer {
             }
             waiting_.store(true, std::memory_order_release);
         }
-        timeval tv{};
-        if (timeout_ms >= 0) {
-            tv.tv_sec = static_cast<decltype(tv.tv_sec)>(timeout_ms / 1000);
-            tv.tv_usec = static_cast<decltype(tv.tv_usec)>((timeout_ms % 1000) * 1000);
-        }
-        auto const count =
-            ::select(max_fd + 1, &read_set, &write_set, &error_set, timeout_ms >= 0 ? &tv : nullptr);
+        timespec ts{};
+        auto const count = ::pselect(max_fd + 1, &read_set, &write_set, &error_set, timespec_of(timeout_ns, ts), nullptr);
         waiting_.store(false, std::memory_order_release);
         if (count < 0) {
             if (errno == EINTR) return {};

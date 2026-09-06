@@ -324,6 +324,53 @@ void many_clients_on_several_threads() {
     CHECK_EQ(replies.load(), clients);
 }
 
+// single_thread_hint：调用方承诺单线程，io_uring 以 SINGLE_ISSUER | DEFER_TASKRUN 运行。
+// 覆盖：批量提交（多个客户端在一轮里各发一个 SQE）、取消（定时器 TIMEOUT_REMOVE）、投机路径
+// 之外的完成路径（服务端的读总是先等），以及第二次 run() 仍在同一线程。
+auto cancel_soon(net::steady_timer* timer) CO2_BEG(net::task<>, (timer), net::steady_timer delay{timer->context()};
+                                                    net::io_result<> r;) {
+    delay.expires_after(std::chrono::milliseconds{5});
+    CO2_AWAIT_SET(r, delay.wait());
+    timer->cancel();
+}
+CO2_END
+
+auto wait_then_cancel(net::io_context* ctx, std::error_code* out)
+    CO2_BEG(net::task<>, (ctx, out), net::steady_timer timer{*ctx}; net::io_result<> r;) {
+    timer.expires_after(std::chrono::hours{1});
+    net::run_async(ctx->get_executor())(cancel_soon(&timer));
+    CO2_AWAIT_SET(r, timer.wait());
+    *out = r.ec;
+}
+CO2_END
+
+void single_thread_hint_promise() {
+    test_context ctx{net::single_thread_hint};
+    net::tcp_acceptor acceptor{ctx, net::ip::tcp::endpoint{net::ip::address_v4::loopback(), 0}};
+    auto const ep = loopback_endpoint(acceptor);
+    constexpr auto clients = 8;
+    std::atomic<int> sessions{0};
+    std::atomic<int> replies{0};
+    std::error_code timer_ec;
+    net::run_async(ctx.get_executor())(serve_n(&acceptor, clients, &sessions));
+    for (auto i = 0; i != clients; ++i)
+        net::run_async(ctx.get_executor(), [&](std::string s) { if (s.size() == 100U) replies.fetch_add(1); },
+                       [](std::exception_ptr) { CHECK(false); })(client_roundtrip(&ctx, ep, std::string(100, static_cast<char>('a' + i))));
+    net::run_async(ctx.get_executor())(wait_then_cancel(&ctx, &timer_ec));
+    ctx.run();
+    CHECK_EQ(sessions.load(), clients);
+    CHECK_EQ(replies.load(), clients);
+    CHECK(timer_ec == net::error::operation_aborted);
+    // 同一线程再跑一轮。
+    ctx.restart();
+    replies = 0;
+    net::run_async(ctx.get_executor())(serve_n(&acceptor, 1, &sessions));
+    net::run_async(ctx.get_executor(), [&](std::string s) { if (s.size() == 100U) replies.fetch_add(1); },
+                   [](std::exception_ptr) { CHECK(false); })(client_roundtrip(&ctx, ep, std::string(100, 'z')));
+    ctx.run();
+    CHECK_EQ(replies.load(), 1);
+}
+
 void endpoints_and_options() {
     connected_pair pair;
     std::error_code ec;
@@ -352,6 +399,7 @@ int main() {
     when_any_read_or_timeout();
     tcp_socket_behind_any_stream();
     many_clients_on_several_threads();
+    single_thread_hint_promise();
     endpoints_and_options();
     std::cout << "tcp tests passed\n";
     return 0;

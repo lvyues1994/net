@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstdint>
 
+#include <sys/timerfd.h>
 #include <unistd.h>
 
 #include "co2/contract.hpp"
@@ -23,9 +25,19 @@ reactor_backend::reactor_backend(execution_context& context, std::unique_ptr<dem
     events_.reserve(128U);
     completed_.reserve(128U);
     expired_.reserve(32U);
+    timer_fd_ = ::timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (timer_fd_ < 0) throw std::system_error{errno, std::system_category(), "timerfd_create"};
+    timer_state_.fd = timer_fd_;
+    timer_state_.registered = true;
+    if (auto const ec = demux_->add(timer_state_, read_ready_bit)) {
+        ::close(timer_fd_);
+        throw std::system_error{ec, "register timerfd"};
+    }
 }
 
-reactor_backend::~reactor_backend() = default;
+reactor_backend::~reactor_backend() {
+    if (timer_fd_ >= 0) ::close(timer_fd_);
+}
 
 void reactor_backend::shutdown() {
     // 未完成的操作被放弃：不再调用 complete()（等待它们的协程不会恢复）。
@@ -41,6 +53,7 @@ void reactor_backend::shutdown() {
     for (auto* const timer : timers_)
         timer->heap_index = timer_op::not_queued;
     timers_.clear();
+    demux_->remove(timer_state_);
 }
 
 // ---- 工厂 ----
@@ -232,10 +245,13 @@ void reactor_backend::add_timer(timer_op& op) noexcept {
         std::lock_guard<std::mutex> lock{mutex_};
         CO2_CONTRACT_CHECK(op.heap_index == timer_op::not_queued);
         heap_push(op);
-        became_earliest = timers_.front() == &op;
+        // 成为最早到期且有线程正阻塞在解复用器里：重新武装 timerfd，它会在新到期时刻叫醒那个
+        // 线程（timerfd 在解复用器的集合里，跨线程 settime 立即生效）。没有线程在等时留给 run()
+        // 进入等待前统一武装，省一次系统调用。
+        became_earliest = waiting_ && timers_.front() == &op;
+        if (became_earliest) arm_timer_fd_locked();
     }
     context_->get_executor().on_work_started();
-    if (became_earliest) interrupt();
 }
 
 bool reactor_backend::cancel_timer(timer_op& op) noexcept {
@@ -250,18 +266,34 @@ bool reactor_backend::cancel_timer(timer_op& op) noexcept {
     return true;
 }
 
-long reactor_backend::timer_timeout_ms(long const limit) const noexcept {
+long long reactor_backend::wait_timeout_ns(long const limit_ms) const noexcept {
+    // 锁内。定时器到期由 timerfd 负责；这里只有 io_context 给的上限（run_for 的截止），以及
+    //"已有定时器到期"时的 0（不必进内核等待）。
+    if (not timers_.empty() && timers_.front()->expiry <= std::chrono::steady_clock::now()) return 0;
+    return limit_ms < 0 ? -1LL : static_cast<long long>(limit_ms) * 1000000LL;
+}
+
+void reactor_backend::arm_timer_fd_locked() noexcept {
     // 锁内。
-    if (timers_.empty()) return limit;
-    auto const now = std::chrono::steady_clock::now();
-    auto const earliest = timers_.front()->expiry;
-    if (earliest <= now) return 0;
-    auto const remaining =
-        std::chrono::duration_cast<std::chrono::milliseconds>(earliest - now).count() + 1;
-    auto const clamped =
-        remaining > static_cast<long long>(1L << 30) ? (1L << 30) : static_cast<long>(remaining);
-    if (limit < 0) return clamped;
-    return std::min(limit, clamped);
+    if (timers_.empty()) {
+        if (armed_) {
+            itimerspec const disarm{};
+            ::timerfd_settime(timer_fd_, 0, &disarm, nullptr);
+            armed_ = false;
+        }
+        return;
+    }
+    auto const expiry = timers_.front()->expiry;
+    if (armed_ && expiry == armed_expiry_) return;
+    // steady_clock 在 Linux/libstdc++ 上就是 CLOCK_MONOTONIC：直接用绝对时间。
+    auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(expiry.time_since_epoch()).count();
+    if (ns <= 0) ns = 1; // it_value 全零表示解除武装；过去的时刻立刻到期
+    itimerspec spec{};
+    spec.it_value.tv_sec = static_cast<time_t>(ns / 1000000000LL);
+    spec.it_value.tv_nsec = static_cast<long>(ns % 1000000000LL);
+    ::timerfd_settime(timer_fd_, TFD_TIMER_ABSTIME, &spec, nullptr);
+    armed_ = true;
+    armed_expiry_ = expiry;
 }
 
 void reactor_backend::pop_expired_timers(std::vector<timer_op*>& expired) noexcept {
@@ -332,13 +364,19 @@ void reactor_backend::heap_swap(std::size_t const a, std::size_t const b) noexce
 void reactor_backend::interrupt() noexcept { demux_->interrupt(); }
 
 void reactor_backend::run(long const timeout_ms) {
-    long timeout = 0;
+    auto timeout = 0LL;
     {
         std::lock_guard<std::mutex> lock{mutex_};
-        timeout = timer_timeout_ms(timeout_ms);
+        arm_timer_fd_locked();
+        timeout = wait_timeout_ns(timeout_ms);
+        waiting_ = timeout != 0; // 与武装在同一把锁内：之后加入的更早定时器会重新武装 timerfd
     }
     events_.clear();
     auto const wait_error = demux_->wait(timeout, *this);
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        waiting_ = false;
+    }
     if (wait_error) throw std::system_error{wait_error, demux_->name()};
 
     completed_.clear();
@@ -346,6 +384,12 @@ void reactor_backend::run(long const timeout_ms) {
     {
         std::lock_guard<std::mutex> lock{mutex_};
         for (auto const& event : events_) {
+            if (event.state == &timer_state_) {
+                std::uint64_t expirations = 0;
+                static_cast<void>(::read(timer_fd_, &expirations, sizeof(expirations)));
+                armed_ = false; // 已触发：下一轮按堆顶重新武装
+                continue;
+            }
             if (registered_.count(event.state) == 0U) continue; // 已注销：迟到的事件
             process_event(*event.state, event.bits, completed_);
         }

@@ -137,11 +137,15 @@ mmap 三块内存），只需要 `<linux/io_uring.h>`，不依赖 liburing。
 ### 线程模型
 
 - **SQ 单生产者**：所有提交（`submit`、取消请求、常驻轮询的重新武装）都在 `uring_backend`
-  的环锁内取 SQE、填参数、发布尾指针并 `io_uring_enter(to_submit)`。环满时操作进入延迟
+  的环锁内取 SQE、填参数、发布尾指针——**只是用户态内存写，不进内核**。环满时操作进入延迟
   队列，由 `run()` 补提交。
 - **CQ 单消费者**：只有当前运行事件循环的线程调用 `run()`（`io_context` 以 `reactor_busy`
-  保证）。`run()` 先在环锁内补提交延迟队列，然后 `io_uring_enter(GETEVENTS, min=1,
-  EXT_ARG 超时)` 等待，收割全部 CQE。
+  保证）。`run()` 在环锁内补提交延迟队列、发布尾指针、置 `waiting_`，然后**一次**
+  `io_uring_enter(to_submit, min_complete=1, GETEVENTS[, EXT_ARG 超时])` 把提交与等待合并，
+  收割全部 CQE。已有 CQE 且无待提交时连这一次也省掉。
+- **跨线程提交者**：另一个线程在 `run()` 阻塞期间 `submit` / `cancel` 时看到 `waiting_`，写
+  eventfd 叫醒它去冲提交。单线程 io_context 里永远不会发生（提交者就是运行线程，回到
+  `run()` 时自然冲掉）。
 - **一条 C++ 内存模型上的 happens-before**：提交者在环锁内写完操作参数后 unlock；内核发布
   CQE 这一跳对 C++ 不可见，所以 `run()` 在读操作对象之前先取一次环锁，再 `on_complete`。
   否则 TSan 会（正确地）报告 `begin_read` 的写与 `on_complete` 的读之间没有同步边。
@@ -153,14 +157,14 @@ mmap 三块内存），只需要 `<linux/io_uring.h>`，不依赖 liburing。
 | 步骤 | 就绪型 | io_uring |
 | --- | --- | --- |
 | `begin_*` | 记缓冲区描述符 | 同；`iovec[]` 与 `msghdr` 住在操作里，钉住到 CQE 到达 |
-| `ready()` | 推测系统调用，成功则不挂起 | **同样推测**（套接字仍是非阻塞的）：命中就不提交；connect 除外——`IORING_OP_CONNECT` 自己处理 EINPROGRESS |
-| `suspend()` | `start_op` 排队，等就绪 | 环锁内取 SQE、`prepare`、`user_data = &op`、提交；返回 noop |
+| `ready()` | 推测系统调用，成功则不挂起 | **自适应推测**（`speculation_state`，照 Corosio）：先试一次非阻塞系统调用；EAGAIN 后关掉该方向的推测直到一次异步完成证明就绪；读方向连续 4 次 EAGAIN 永久关闭——服务端的读、acceptor 这类"总是先等"的套接字不再白跑 `read`，直接走完成型路径。connect 除外——`IORING_OP_CONNECT` 自己处理 EINPROGRESS |
+| `suspend()` | `start_op` 排队，等就绪 | 环锁内取 SQE、`prepare`、`user_data = &op`、发布尾指针；返回 noop。进内核推迟到 `run()` |
 | 完成 | 反应器线程 `perform()` 后 `complete()` | `run()` 收 CQE → `on_complete(res)` 记 ec / bytes（`-ECANCELED` → `operation_aborted`，读到 0 → `eof`）→ `complete()` |
 | 取消 | 锁内摘下，立即 `complete(operation_aborted)` | 提交 `IORING_OP_ASYNC_CANCEL`（定时器：`TIMEOUT_REMOVE`），**等原操作的 CQE**；在延迟队列里则摘下立即完成；尚未提交则记 `cancel_requested`，`submit` 返回 false，`suspend` 直接以 aborted 恢复 |
 | `close()` | 注销 + 取消 + `::close` | 先对在飞操作请求取消再 `::close`——在飞请求持有文件引用，关闭描述符不会结束它们 |
-| 中断 | eventfd 在 epoll 里 | eventfd 上一个常驻 `POLL_ADD`，完成后重新武装；`interrupt()` 只是 `write(eventfd)`，不碰环、不加锁 |
-| 信号管道 | 常驻读操作 | 常驻 `POLL_ADD` 监视读端，可读时排空并 `deliver` |
-| 定时器 | 二叉堆 + wait 超时 | 每次 wait 一个 `IORING_OP_TIMEOUT`（`IORING_TIMEOUT_ABS`，CLOCK_MONOTONIC 与 steady_clock 同源）；`-ETIME` 成功，`-ECANCELED` 取消 |
+| 中断 | eventfd 在解复用器集合里 | eventfd 上一个常驻**多发** `POLL_ADD`（`IORING_POLL_ADD_MULTI`）：CQE 带 `F_MORE` 表示仍在武装，只在终止或内核不支持（`-EINVAL` → 退回一次性）时重新武装；`interrupt()` 只是 `write(eventfd)`，不碰环、不加锁 |
+| 信号管道 | 常驻读操作 | 常驻多发 `POLL_ADD` 监视读端，可读时排空并 `deliver` |
+| 定时器 | 二叉堆；最早到期经 timerfd（`TFD_TIMER_ABSTIME`）送进解复用器 | 每次 wait 一个 `IORING_OP_TIMEOUT`（`IORING_TIMEOUT_ABS`，CLOCK_MONOTONIC 与 steady_clock 同源）；`-ETIME` 成功，`-ECANCELED` 取消 |
 
 取消的可见差异：就绪型的 `steady_timer::cancel()` / `socket::cancel()` 同步完成操作；
 io_uring 的取消异步，`cancel()` 返回 1 只表示"已请求"，操作在 CQE 到达时以
@@ -175,6 +179,43 @@ io_uring 的取消异步，`cancel()` 返回 1 只表示"已请求"，操作在 
 `io_uring_t` 标签与运行时探测 `backend_available()`（内核 sysctl `io_uring_disabled` 或
 seccomp 可能禁用它）。`posix::*` 的同步部分（`create_socket`、`set_nonblocking_cloexec`）
 直接复用。全部平台测试为四种后端各编译一个变体，ASan / UBSan / LSan / TSan 全绿。
+
+### 与 Corosio io_uring 调度器的对齐
+
+最初的实现每个操作 `suspend` 时立刻 `io_uring_enter(to_submit)`，`run()` 再 `io_uring_enter(GETEVENTS)`
+等待，且每个操作都无条件推测——单连接回环里阻塞路径是 `read`(EAGAIN) + 两次 enter，比 epoll 的
+`read`(EAGAIN) + `epoll_wait` 多一次，吞吐自然不占优。对照 Corosio
+`native/detail/io_uring/io_uring_scheduler.hpp` 之后按它的做法改了四点：
+
+| | Corosio | net（现在） |
+| --- | --- | --- |
+| 提交时机 | `io_uring_submit_op` 只写 SQE；首个提交者 CAS 后向调度器队列 post 一个 `submit_sqes_op`，它用一次 `io_uring_submit_and_get_events` 冲整批 | `submit` 只写 SQE；`run()` 用一次 `enter(to_submit, 1, GETEVENTS)` 合并提交与等待；跨线程提交者经 eventfd 叫醒等待者 |
+| 推测 | `speculative_state`：EAGAIN 关、异步就绪开、读连续 4 次永久关 | 同（`uring_socket.hpp` 的 `speculation_state`） |
+| 环标志 | 单线程模式 `SINGLE_ISSUER \| DEFER_TASKRUN`，多线程不设 | `io_context{net::io_uring, net::single_thread_hint}` 时同样两个标志 + `R_DISABLED`，第一个 `run()` 的线程 `IORING_REGISTER_ENABLE_RINGS` 成为提交者；老内核 EINVAL 退回普通模式 |
+| 唤醒 | eventfd 多发 poll | 同 |
+| accept | 多发 accept + parked fd 队列 | 仍是每次 `accept()` 一个 SQE（未做） |
+| 内联完成预算 | 推测成功直接对称转移，有 `try_consume_inline_budget` 上限 | 推测成功 `await_ready` 为真直接继续，无预算 |
+
+`single_thread_hint` 是**承诺**而不是提示（对应 Asio 的 `BOOST_ASIO_CONCURRENCY_HINT_UNSAFE`）：
+`io_context` 文档说 `concurrency_hint` 只是提示、`run()` 可以从任意多线程调用，所以不能把
+硬约束挂在 `concurrency_hint == 1` 上——测试里默认构造的 `io_context` 就在 4 个线程上 `run()`。
+违反承诺时内核以 `EEXIST` 拒绝第二个线程的 `io_uring_enter`，后端抛出。
+
+顺带发现并修掉两处影响**所有**后端的浪费，都是用 `strace -c` 看基准时暴露的：
+
+1. `io_context::post` 在 `reactor_busy` 时向 eventfd 写一字节打断反应器——但后端在 `run()`
+   里完成操作时 post 续体的正是运行线程自己，它不在等待。每次完成白付 1 写 + 2 读 + 1 个多余
+   的就绪事件 / CQE。现在记下进入 `backend.run()` 的线程 id，自己 post 不打断。
+2. 就绪型后端把定时器最早到期向上取整到毫秒作为 `epoll_wait` 超时；1 µs 的定时器本该睡满
+   1 ms，只是被上面的自打断掩盖了（`epoll_wait` 立即返回，1 µs 早已过去）。去掉自打断后暴露；
+   换成纳秒超时（`epoll_pwait2` / `ppoll` / `pselect`）又撞上线程的 timer slack（默认 50 µs，
+   poll/select/epoll 的超时都受它影响，定时器变成 56 µs）。最终照 Asio 的做法：一个 timerfd
+   （hrtimer，不受 slack 影响）武装到堆顶到期、注册进解复用器；只在堆顶变化时 `timerfd_settime`。
+   定时器从 2.9 µs 降到 1.5 µs。
+
+效果（`bench_net`，同一台机器）：往返 epoll 4.85 → 4.18 µs，io_uring 4.95 → 4.03 µs；定时器
+epoll 2.94 → 1.53 µs，io_uring 1.97 → 1.38 µs；quick 基准全程系统调用 epoll 357k → 133k，
+io_uring 378k → 92k。
 
 ## 5. 接入 IOCP
 

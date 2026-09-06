@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <unordered_set>
@@ -82,7 +83,8 @@ struct reactor_backend final : execution_context::service, io_backend, event_sin
     void process_event(descriptor_state& state, unsigned ready, std::vector<completed_op>& completed) noexcept;
     void refresh_interest(descriptor_state& state) noexcept;
     void detach_ops(descriptor_state& state, reactor_op* (&cancelled)[2]) noexcept;
-    long timer_timeout_ms(long limit) const noexcept;
+    long long wait_timeout_ns(long limit_ms) const noexcept;
+    void arm_timer_fd_locked() noexcept;
     void pop_expired_timers(std::vector<timer_op*>& expired) noexcept;
     void heap_push(timer_op& op) noexcept;
     void heap_remove(std::size_t index) noexcept;
@@ -103,6 +105,15 @@ struct reactor_backend final : execution_context::service, io_backend, event_sin
     descriptor_state signal_state_;
     signal_pump signal_pump_;
     bool shut_down_ = false;
+    bool waiting_ = false; // 有线程阻塞在 demux_->wait 里（锁内读写）
+
+    // 定时器堆最早到期用 timerfd 送进解复用器：timerfd 是 hrtimer、不受线程 timer slack
+    //（默认 50 µs）影响，而 epoll_pwait2 / ppoll / pselect 的超时会被 slack 拉长。只在最早到期
+    // 变化时 timerfd_settime。
+    int timer_fd_ = -1;
+    descriptor_state timer_state_;
+    std::chrono::steady_clock::time_point armed_expiry_{};
+    bool armed_ = false;
 };
 
 } // namespace detail

@@ -33,6 +33,13 @@ struct io_backend;
 struct io_context_access;
 } // namespace detail
 
+// concurrency_hint 的特殊值（对应 Asio 的 BOOST_ASIO_CONCURRENCY_HINT_UNSAFE）：调用方**承诺**只有
+// 一个线程会调用 run() / run_one() / poll() 系列函数，而且始终是同一个线程。后端据此启用单线程
+// 优化——io_uring 以 IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN 创建（内核省掉 SQ
+// 锁、完成批量交付），第一个调用 run() 的线程成为唯一提交者。违反承诺时 io_uring_enter 以
+// EEXIST 失败并抛出。就绪型后端忽略它。
+constexpr int single_thread_hint = 0;
+
 struct io_context : execution_context {
     struct executor_type {
         executor_type() noexcept = default;
@@ -65,9 +72,11 @@ struct io_context : execution_context {
 
     // 默认后端。
     io_context();
-    // concurrency_hint：预期同时 run() 的线程数（提示，不是限制）。
+    // concurrency_hint：预期同时 run() 的线程数（提示，不是限制）；net::single_thread_hint 是
+    // 例外——它是承诺，见其说明。
     explicit io_context(int concurrency_hint);
-    // 指定后端：io_context{net::poll} / io_context{net::select, 4}。
+    // 指定后端：io_context{net::poll} / io_context{net::select, 4} /
+    // io_context{net::io_uring, net::single_thread_hint}。
     template <class Backend, class = decltype(Backend::kind)>
     explicit io_context(Backend, int const concurrency_hint = 1)
         : io_context(Backend::kind, concurrency_hint) {}

@@ -2,6 +2,7 @@
 
 #include <condition_variable>
 #include <mutex>
+#include <thread>
 
 #include "co2/contract.hpp"
 
@@ -62,15 +63,19 @@ std::unique_ptr<detail::demultiplexer> make_demultiplexer(backend_kind const kin
 
 // 就绪型后端族：一个共享的 reactor_backend + 按标签选择的解复用器；完成型后端各自是一个
 // io_backend 服务。
-detail::io_backend& make_backend(io_context& owner, backend_kind const kind) {
-    if (kind == backend_kind::io_uring) return owner.make_service<detail::uring_backend>();
+detail::io_backend& make_backend(io_context& owner, backend_kind const kind, int const concurrency_hint) {
+    // single_thread_hint 是调用方的承诺：io_uring 以单提交者模式创建（SINGLE_ISSUER |
+    // DEFER_TASKRUN）。其它提示值（包括 1）只是提示，用普通模式。
+    if (kind == backend_kind::io_uring)
+        return owner.make_service<detail::uring_backend>(concurrency_hint == single_thread_hint);
     return owner.make_service<detail::reactor_backend>(make_demultiplexer(kind));
 }
 
 } // namespace
 
 struct io_context::impl {
-    impl(io_context& owner, backend_kind const kind_) : kind{kind_}, backend{make_backend(owner, kind_)} {}
+    impl(io_context& owner, backend_kind const kind_, int const concurrency_hint)
+        : kind{kind_}, backend{make_backend(owner, kind_, concurrency_hint)} {}
 
     void push(continuation& c) noexcept {
         c.next = nullptr;
@@ -112,17 +117,19 @@ struct io_context::impl {
     }
 
     // 锁内：叫醒一个能处理新队列元素的线程。有空闲线程就叫它；否则唯一在跑的线程可能
-    // 阻塞在 epoll_wait 里，打断它。
+    // 阻塞在 epoll_wait / io_uring_enter 里，打断它——除非提交者就是那个线程自己（后端在
+    // run() 里完成操作时 post 续体的情形）：它不在等待，回到循环就会看到队列，打断只是浪费
+    // 一次 eventfd 写、两次读和一个多余的完成事件。
     void wake_one_locked() noexcept {
         if (idle_threads > 0U)
             cv.notify_one();
-        else if (reactor_busy)
+        else if (reactor_busy && reactor_thread != std::this_thread::get_id())
             backend.interrupt();
     }
 
     void wake_all_locked() noexcept {
         cv.notify_all();
-        if (reactor_busy) backend.interrupt();
+        if (reactor_busy && reactor_thread != std::this_thread::get_id()) backend.interrupt();
     }
 
     static long milliseconds_until(std::chrono::steady_clock::time_point const deadline) noexcept {
@@ -157,6 +164,7 @@ struct io_context::impl {
                     }
                 };
                 reactor_busy = true;
+                reactor_thread = std::this_thread::get_id();
                 lock.unlock();
                 {
                     busy_guard guard{this, &lock};
@@ -194,6 +202,7 @@ struct io_context::impl {
     long outstanding_work = 0;
     unsigned idle_threads = 0U;
     bool reactor_busy = false;
+    std::thread::id reactor_thread; // reactor_busy 为真时：正在 backend.run() 里的线程
     bool stopped = false;
 };
 
@@ -203,7 +212,8 @@ io_context::io_context() : io_context(default_backend_t::kind, 1) {}
 
 io_context::io_context(int const concurrency_hint) : io_context(default_backend_t::kind, concurrency_hint) {}
 
-io_context::io_context(backend_kind const backend, int) : impl_{new impl{*this, backend}} {}
+io_context::io_context(backend_kind const backend, int const concurrency_hint)
+    : impl_{new impl{*this, backend, concurrency_hint}} {}
 
 io_context::~io_context() {
     shutdown();

@@ -91,9 +91,11 @@ coroutine_handle<> await_suspend(coroutine_handle<> h, io_env const* env);
 
 **后端**：`net::io_context ctx{net::io_uring};` 选择事件机制（默认 epoll；poll / select
 是电平触发的就绪型，select 受 `FD_SETSIZE` 限制；io_uring 是完成型，裸系统调用实现、不依赖
-liburing，`net::backend_available(net::backend_kind::io_uring)` 运行时探测）。套接字、定时器
-等 I/O 对象经抽象接口对接后端，代码与后端无关；设计、与 Corosio 的对照以及 IOCP 的接入
-方案见 `docs/backends.md`。
+liburing，`net::backend_available(net::backend_kind::io_uring)` 运行时探测）。
+`net::io_context ctx{net::io_uring, net::single_thread_hint}` 是一个承诺——只有一个线程、且
+始终是同一个线程调用 `run()`——io_uring 据此以 `SINGLE_ISSUER | DEFER_TASKRUN` 创建；普通的
+`concurrency_hint`（包括 1）只是提示。套接字、定时器等 I/O 对象经抽象接口对接后端，代码与
+后端无关；设计、与 Corosio 的对照以及 IOCP 的接入方案见 `docs/backends.md`。
 
 **TLS**：`net::tls::openssl_stream tls{&sock, ctx}; tls.set_hostname("example.com");
 CO2_AWAIT_SET(h, tls.handshake(net::tls::role::client));` 之后它就是一个 `Stream`——可以放进
@@ -189,20 +191,21 @@ Linux 7.0，单线程：
 
 | 后端回环（`bench_net`） | epoll | poll | select | io_uring |
 | --- | --- | --- | --- | --- |
-| TCP 回显往返 64 B（µs） | 4.85 | 4.88 | 4.99 | 4.95 |
-| TCP 回显往返 4 KiB（µs） | 5.30 | 5.34 | 5.42 | 5.42 |
-| TCP 吞吐，64 KiB 写（MiB/s，5 次运行的范围） | 9736–9984 | 9731–10520 | 9885–10709 | 9798–10399 |
-| 定时器到期 + 恢复（µs） | 2.94 | 3.00 | 2.79 | 1.97 |
+| TCP 回显往返 64 B（µs） | 4.18 | 4.54 | 5.28 | 4.03 |
+| TCP 回显往返 4 KiB（µs） | 4.60 | 5.01 | 5.71 | 4.49 |
+| TCP 吞吐，64 KiB 写（MiB/s，3 次运行） | 9874–10442 | ≈10000 | ≈9800 | 10192–10847 |
+| 定时器到期 + 恢复（µs） | 1.53 | 1.56 | 1.90 | 1.38 |
 
-一个连接的回环里四种后端的差别在噪声之内：吞吐行单次运行的波动就有 ±5%，瓶颈是内核回环
-路径里的两次内存拷贝，事件机制只占很小一部分。io_uring 在这条基准里**不会**比 epoll 快，
-这是结构性的（`strace -c` 可验证，`bench_net --backend io_uring`）：实现先做一次投机的非阻塞
-系统调用，命中时两者都是 1 次系统调用；未命中时 epoll 是 `read`(EAGAIN) + `epoll_wait` 两次，
-io_uring 是 `read`(EAGAIN) + `io_uring_enter`(提交) + `io_uring_enter`(等待) 三次。io_uring 的
-收益来自单连接 ping-pong 之外的东西——多连接下一次 `io_uring_enter` 批量提交、多发
-（multishot）接收、注册缓冲区、零拷贝发送——这些本实现尚未使用。io_uring 的定时器
-（`IORING_OP_TIMEOUT`）比就绪型后端的定时器堆 + 解复用器超时快约 1 µs。TLS 的数字（OpenSSL 与
-BoringSSL 对照）见 `docs/tls.md`。
+吞吐行的差别在噪声内（单次运行波动 ±5%，瓶颈是内核回环路径的两次拷贝）；往返与定时器行
+io_uring 领先，是把它按 Corosio（参考实现）的做法对齐之后的结果，`strace -c` 可验证
+（`bench_net --backend io_uring`）：同一 quick 基准全程 epoll 133k 次系统调用，io_uring 92k。
+对齐的四点见 `docs/backends.md`——提交推迟到 `run()` 与等待合并成一次 `io_uring_enter`、
+自适应投机（连续 EAGAIN 后不再白跑 `read`，直接走完成型路径）、`net::single_thread_hint` 下
+的 `SINGLE_ISSUER | DEFER_TASKRUN`、多发 POLL_ADD 唤醒。顺带修了两处影响所有后端的浪费：
+`io_context` 在 `run()` 线程自己 post 续体时会向自己写 eventfd（每次完成多 1 写 2 读），
+以及就绪型后端的定时器把到期向上取整到毫秒、又被这次自打断掩盖——现在最早到期经
+timerfd（hrtimer，不受 50 µs timer slack 影响）送进解复用器。io_uring 尚未使用的：多发
+accept / recv、注册缓冲区、零拷贝发送。TLS 的数字（OpenSSL 与 BoringSSL 对照）见 `docs/tls.md`。
 
 ## 目录
 

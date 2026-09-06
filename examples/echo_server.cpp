@@ -80,7 +80,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     try {
-        net::io_context ctx{backend, 1};
+        net::io_context ctx{backend, net::single_thread_hint};
         net::tcp_acceptor acceptor{ctx, net::ip::tcp::endpoint{net::ip::address_v4::any(), port}};
         net::signal_set signals{ctx, SIGINT, SIGTERM};
         net::stop_source stop;

@@ -46,7 +46,7 @@ struct connected_pair {
     net::tcp_socket client{ctx};
     net::tcp_socket server;
 
-    explicit connected_pair(net::backend_kind const kind) : ctx{kind, 1} {
+    explicit connected_pair(net::backend_kind const kind) : ctx{kind, net::single_thread_hint} {
         net::run_async(ctx.get_executor())(accept_into(&acceptor, &server));
         net::run_async(ctx.get_executor())(connect_to(&client, loopback_endpoint(acceptor)));
         ctx.run();
@@ -131,7 +131,7 @@ void bench_backend(bench::options const& o, net::backend_kind const kind, std::v
                                          net::run_async(pair.ctx.get_executor())(ping_n(&pair.client, size, n));
                                          pair.ctx.run();
                                      },
-                                     "ns per round trip (4 syscalls + 2 wakeups)"));
+                                     "ns per round trip, both peers on one thread"));
     }
 
     {
@@ -151,7 +151,7 @@ void bench_backend(bench::options const& o, net::backend_kind const kind, std::v
     }
 
     {
-        net::io_context ctx{kind, 1};
+        net::io_context ctx{kind, net::single_thread_hint};
         results.push_back(bench::run(o, name + ": timer expire + resume", o.scale(200000U), [&](std::size_t n) {
             net::run_async(ctx.get_executor())(timers_n(&ctx, n));
             ctx.run();

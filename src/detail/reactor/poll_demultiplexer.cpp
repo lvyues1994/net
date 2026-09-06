@@ -89,14 +89,15 @@ struct poll_demultiplexer final : demultiplexer {
             by_fd_[static_cast<std::size_t>(state.fd)] = nullptr;
     }
 
-    std::error_code wait(long const timeout_ms, event_sink& sink) noexcept override {
+    std::error_code wait(long long const timeout_ns, event_sink& sink) noexcept override {
         {
             std::lock_guard<std::mutex> lock{mutex_};
             snapshot_ = fds_;
             waiting_.store(true, std::memory_order_release);
         }
-        auto const count = ::poll(snapshot_.data(), static_cast<nfds_t>(snapshot_.size()),
-                                  timeout_ms < 0 ? -1 : static_cast<int>(timeout_ms));
+        timespec ts{};
+        auto const count = ::ppoll(snapshot_.data(), static_cast<nfds_t>(snapshot_.size()), timespec_of(timeout_ns, ts),
+                                   nullptr);
         waiting_.store(false, std::memory_order_release);
         if (count < 0) {
             if (errno == EINTR) return {};

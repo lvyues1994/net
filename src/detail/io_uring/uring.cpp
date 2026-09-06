@@ -22,6 +22,23 @@ int sys_io_uring_enter(int const fd, unsigned const to_submit, unsigned const mi
     return static_cast<int>(::syscall(__NR_io_uring_enter, fd, to_submit, min_complete, flags, arg, arg_size));
 }
 
+int sys_io_uring_register(int const fd, unsigned const opcode, void const* const arg, unsigned const nr_args) noexcept {
+    return static_cast<int>(::syscall(__NR_io_uring_register, fd, opcode, arg, nr_args));
+}
+
+#ifndef IORING_SETUP_SINGLE_ISSUER
+#define IORING_SETUP_SINGLE_ISSUER (1U << 12)
+#endif
+#ifndef IORING_SETUP_DEFER_TASKRUN
+#define IORING_SETUP_DEFER_TASKRUN (1U << 13)
+#endif
+#ifndef IORING_SETUP_R_DISABLED
+#define IORING_SETUP_R_DISABLED (1U << 6)
+#endif
+#ifndef IORING_REGISTER_ENABLE_RINGS
+#define IORING_REGISTER_ENABLE_RINGS 12
+#endif
+
 unsigned* ring_field(void* const base, unsigned const offset) noexcept {
     return reinterpret_cast<unsigned*>(static_cast<unsigned char*>(base) + offset);
 }
@@ -31,11 +48,29 @@ void store_release(unsigned* const p, unsigned const v) noexcept { __atomic_stor
 
 } // namespace
 
-uring::uring(unsigned const entries) {
+uring::uring(unsigned const entries, bool const single_issuer) {
+    if (single_issuer) {
+        // 6.1+ 才有 DEFER_TASKRUN；老内核返回 EINVAL，退回普通模式。
+        io_uring_params params{};
+        params.flags = IORING_SETUP_CLAMP | IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN |
+                       IORING_SETUP_R_DISABLED;
+        fd_ = sys_io_uring_setup(entries, &params);
+        if (fd_ >= 0) {
+            defer_taskrun_ = true;
+            enabled_ = false;
+            setup_mapped(params);
+            return;
+        }
+        if (errno != EINVAL) throw std::system_error{errno, std::system_category(), "io_uring_setup"};
+    }
     io_uring_params params{};
     params.flags = IORING_SETUP_CLAMP;
     fd_ = sys_io_uring_setup(entries, &params);
     if (fd_ < 0) throw std::system_error{errno, std::system_category(), "io_uring_setup"};
+    setup_mapped(params);
+}
+
+void uring::setup_mapped(io_uring_params const& params) {
     features_ = params.features;
     sq_entries_ = params.sq_entries;
     cq_entries_ = params.cq_entries;
@@ -90,6 +125,13 @@ uring::uring(unsigned const entries) {
 
 uring::~uring() { unmap(); }
 
+int uring::enable() noexcept {
+    if (enabled_) return 0;
+    if (sys_io_uring_register(fd_, IORING_REGISTER_ENABLE_RINGS, nullptr, 0U) < 0) return -errno;
+    enabled_ = true;
+    return 0;
+}
+
 void uring::unmap() noexcept {
     if (sqes_ != nullptr) ::munmap(sqes_, sqes_size_);
     if (cq_ring_ != nullptr && cq_ring_ != sq_ring_) ::munmap(cq_ring_, cq_ring_size_);
@@ -120,36 +162,29 @@ unsigned uring::flush() noexcept {
     return sq_local_tail_ - load_acquire(sq_head_);
 }
 
-int uring::submit(unsigned const to_submit) noexcept {
-    if (to_submit == 0U) return 0;
+int uring::enter(unsigned const to_submit, unsigned const min_complete, __kernel_timespec const* const timeout) noexcept {
     for (;;) {
-        auto const submitted = sys_io_uring_enter(fd_, to_submit, 0U, 0U, nullptr, 0U);
-        if (submitted >= 0) return submitted;
-        if (errno == EINTR) continue;
+        int result = 0;
+        if (timeout != nullptr && min_complete != 0U) {
+            io_uring_getevents_arg arg{};
+            arg.ts = reinterpret_cast<std::uint64_t>(timeout);
+            result = sys_io_uring_enter(fd_, to_submit, min_complete, IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG, &arg,
+                                        sizeof(arg));
+        } else {
+            result = sys_io_uring_enter(fd_, to_submit, min_complete, IORING_ENTER_GETEVENTS, nullptr, 0U);
+        }
+        if (result >= 0) return 0;
+        if (errno == EINTR) {
+            if (to_submit == 0U) return 0;
+            continue; // 提交被打断：重试，内核只接受尚未消费的条目
+        }
+        if (errno == ETIME) return 0;
+        if (errno == EAGAIN || errno == EBUSY) return 0; // CQ 满 / 需要先消费
         return -errno;
     }
 }
 
 // ---- CQ ----
-
-int uring::wait(__kernel_timespec const* const timeout, bool const block) noexcept {
-    if (not block) return 0; // 提交已由 submit 完成；只读已到达的 CQE
-    if (ready() != 0U) return 0;
-    for (;;) {
-        int result = 0;
-        if (timeout != nullptr) {
-            io_uring_getevents_arg arg{};
-            arg.ts = reinterpret_cast<std::uint64_t>(timeout);
-            result = sys_io_uring_enter(fd_, 0U, 1U, IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG, &arg, sizeof(arg));
-        } else {
-            result = sys_io_uring_enter(fd_, 0U, 1U, IORING_ENTER_GETEVENTS, nullptr, 0U);
-        }
-        if (result >= 0) return 0;
-        if (errno == EINTR || errno == ETIME) return 0;
-        if (errno == EAGAIN || errno == EBUSY) return 0; // CQ 满 / 需要先消费
-        return -errno;
-    }
-}
 
 bool uring::peek(io_uring_cqe const*& cqe) noexcept {
     auto const head = *cq_head_;
