@@ -160,7 +160,8 @@ mmap 三块内存），只需要 `<linux/io_uring.h>`，不依赖 liburing。
 | `ready()` | 推测系统调用，成功则不挂起 | **自适应推测**（`speculation_state`，照 Corosio）：先试一次非阻塞系统调用；EAGAIN 后关掉该方向的推测直到一次异步完成证明就绪；读方向连续 4 次 EAGAIN 永久关闭——服务端的读、acceptor 这类"总是先等"的套接字不再白跑 `read`，直接走完成型路径。connect 除外——`IORING_OP_CONNECT` 自己处理 EINPROGRESS |
 | `suspend()` | `start_op` 排队，等就绪 | 环锁内取 SQE、`prepare`、`user_data = &op`、发布尾指针；返回 noop。进内核推迟到 `run()` |
 | 完成 | 反应器线程 `perform()` 后 `complete()` | `run()` 收 CQE → `on_complete(res)` 记 ec / bytes（`-ECANCELED` → `operation_aborted`，读到 0 → `eof`）→ `complete()` |
-| 取消 | 锁内摘下，立即 `complete(operation_aborted)` | 提交 `IORING_OP_ASYNC_CANCEL`（定时器：`TIMEOUT_REMOVE`），**等原操作的 CQE**；在延迟队列里则摘下立即完成；尚未提交则记 `cancel_requested`，`submit` 返回 false，`suspend` 直接以 aborted 恢复 |
+| 取消 | 锁内摘下，立即 `complete(operation_aborted)` | 提交 `IORING_OP_ASYNC_CANCEL`（定时器：`TIMEOUT_REMOVE`），**等原操作的 CQE**；在延迟队列里则摘下立即完成；尚未提交则记 `cancel_requested`，`submit` 返回 false，`suspend` 直接以 aborted 恢复；多发模式下停着的 accept waiter 不在环里，由套接字自己以 aborted 完成 |
+| accept | 就绪 → `accept4` | **多发 accept**（`IORING_ACCEPT_MULTISHOT`，5.19+）：`listen()` / assign 已监听的 fd 时武装一个 SQE，不计入用户工作；每个带 `F_MORE` 的 CQE 送来一个 fd——有停着的 `accept()` 就交给它，否则进 parked 队列；`accept()` 先看 parked 队列、再投机 `accept4`（自适应关闭）、最后作为 waiter 停着**不提交 SQE**。终止 CQE 后重新武装；`-EINVAL` 退回每次 accept 一个 SQE。不取对端地址（多发下所有完成共用一块暂存会互相覆盖），由 `remote_endpoint()` 事后取。关闭 / 释放监听描述符时 `ASYNC_CANCEL` 并把操作**退役**给后端持有到终止 CQE（内核仍引用 user_data），排队的连接被关闭 |
 | `close()` | 注销 + 取消 + `::close` | 先对在飞操作请求取消再 `::close`——在飞请求持有文件引用，关闭描述符不会结束它们 |
 | 中断 | eventfd 在解复用器集合里 | eventfd 上一个常驻**多发** `POLL_ADD`（`IORING_POLL_ADD_MULTI`）：CQE 带 `F_MORE` 表示仍在武装，只在终止或内核不支持（`-EINVAL` → 退回一次性）时重新武装；`interrupt()` 只是 `write(eventfd)`，不碰环、不加锁 |
 | 信号管道 | 常驻读操作 | 常驻多发 `POLL_ADD` 监视读端，可读时排空并 `deliver` |
@@ -193,7 +194,7 @@ seccomp 可能禁用它）。`posix::*` 的同步部分（`create_socket`、`set
 | 推测 | `speculative_state`：EAGAIN 关、异步就绪开、读连续 4 次永久关 | 同（`uring_socket.hpp` 的 `speculation_state`） |
 | 环标志 | 单线程模式 `SINGLE_ISSUER \| DEFER_TASKRUN`，多线程不设 | `io_context{net::io_uring, net::single_thread_hint}` 时同样两个标志 + `R_DISABLED`，第一个 `run()` 的线程 `IORING_REGISTER_ENABLE_RINGS` 成为提交者；老内核 EINVAL 退回普通模式 |
 | 唤醒 | eventfd 多发 poll | 同 |
-| accept | 多发 accept + parked fd 队列 | 仍是每次 `accept()` 一个 SQE（未做） |
+| accept | 多发 accept + parked fd 队列；`retire_op` 把旧武装交给调度器等终止 CQE | 同：`uring_multishot_accept_op` + `acceptor_state`（parked FIFO / waiter / broken），`uring_backend::retire` 持有退役操作到终止 CQE 后删除 |
 | 内联完成预算 | 推测成功直接对称转移，有 `try_consume_inline_budget` 上限 | 推测成功 `await_ready` 为真直接继续，无预算 |
 
 `single_thread_hint` 是**承诺**而不是提示（对应 Asio 的 `BOOST_ASIO_CONCURRENCY_HINT_UNSAFE`）：
@@ -215,7 +216,19 @@ seccomp 可能禁用它）。`posix::*` 的同步部分（`create_socket`、`set
 
 效果（`bench_net`，同一台机器）：往返 epoll 4.85 → 4.18 µs，io_uring 4.95 → 4.03 µs；定时器
 epoll 2.94 → 1.53 µs，io_uring 1.97 → 1.38 µs；quick 基准全程系统调用 epoll 357k → 133k，
-io_uring 378k → 92k。
+io_uring 378k → 92k。多发 accept：`tcp_tests_io_uring` 的 42 次成功 accept 全部经 CQE 交付，
+`accept4` 只剩投机的 13 次 EAGAIN；每接受一个连接 1 次分配（新套接字的 impl），epoll 是 3 次。
+回环 connect + accept 两边都在 53 µs 左右——瓶颈是 TCP 握手与套接字创建 / 关闭，多发省的是
+每个 accept 的一次提交，不是这条路径的大头。
+
+多发 accept 的两个生存期细节值得记下：
+- **退役而不是删除**：关闭监听描述符不会结束在飞的多发请求（它持有文件引用），必须
+  `ASYNC_CANCEL`，而终止 CQE 异步到达——此时操作对象若已随套接字销毁，内核还会用它的
+  `user_data` 投递。所以 `close()` / `release()` 把操作的 `owner` 清空（环锁内，事件循环线程也在
+  锁内读它）后交给 `uring_backend::retire`，后端持有到终止 CQE 才删；退役后送来的 fd 直接关闭。
+- **多发操作的完成在环锁内处理**：`on_complete` / `rearm()` 读 `owner`，退役也改 `owner`，两者
+  都在环锁内；普通操作的完成仍在锁外。锁序是环锁 → acceptor 锁 → io_context 锁，`accept()`
+  一侧只拿 acceptor 锁，退回一次性提交时用 `submit_locked`（已持环锁）。
 
 ## 5. 接入 IOCP
 

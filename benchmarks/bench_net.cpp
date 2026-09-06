@@ -106,6 +106,28 @@ auto receive_total(net::tcp_socket* sock, std::size_t total)
 }
 CO2_END
 
+// 服务端接受 n 个连接（每个接受后立即丢弃）。
+auto accept_n(net::tcp_acceptor* acceptor, std::size_t n)
+    CO2_BEG(net::task<>, (acceptor, n), std::size_t i{}; net::io_result<net::tcp_socket> accepted;) {
+    for (i = 0; i != n; ++i) {
+        CO2_AWAIT_SET(accepted, acceptor->accept());
+        if (accepted.ec) break;
+    }
+}
+CO2_END
+
+// 客户端依次建立 n 个连接（每个连上即关）。
+auto connect_n(net::io_context* ctx, net::ip::tcp::endpoint ep, std::size_t n)
+    CO2_BEG(net::task<>, (ctx, ep, n), std::size_t i{}; net::tcp_socket sock{*ctx}; net::io_result<> c;) {
+    for (i = 0; i != n; ++i) {
+        sock.close();
+        sock.open(net::ip::tcp::v4());
+        CO2_AWAIT_SET(c, sock.connect(ep));
+        if (c.ec) break;
+    }
+}
+CO2_END
+
 // n 个已到期的定时器依次等待。
 auto timers_n(net::io_context* ctx, std::size_t n) CO2_BEG(net::task<>, (ctx, n), net::steady_timer timer{*ctx}; std::size_t i{};
                                                              net::io_result<> r;) {
@@ -148,6 +170,19 @@ void bench_backend(bench::options const& o, net::backend_kind const kind, std::v
         r.ns_per_op = r.ns_per_op / static_cast<double>(total / chunk); // ns per 64 KiB chunk
         r.iterations = total / chunk;
         results.push_back(std::move(r));
+    }
+
+    {
+        net::io_context ctx{kind, net::single_thread_hint};
+        net::tcp_acceptor acceptor{ctx, net::ip::tcp::endpoint{net::ip::address_v4::loopback(), 0}};
+        auto const ep = loopback_endpoint(acceptor);
+        results.push_back(bench::run(o, name + ": tcp connect + accept", o.scale(20000U),
+                                     [&](std::size_t n) {
+                                         net::run_async(ctx.get_executor())(accept_n(&acceptor, n));
+                                         net::run_async(ctx.get_executor())(connect_n(&ctx, ep, n));
+                                         ctx.run();
+                                     },
+                                     "ns per connection, both peers on one thread"));
     }
 
     {

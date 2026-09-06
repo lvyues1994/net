@@ -68,6 +68,7 @@ struct reactor_socket final : socket_impl {
     void cancel() noexcept override;
     int release() noexcept override;
     int native_handle() const noexcept override { return fd_; }
+    std::error_code listen(int backlog) noexcept override;
 
     void begin_read(span<mutable_buffer const> buffers) noexcept override;
     void begin_write(span<const_buffer const> buffers) noexcept override;

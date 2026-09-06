@@ -128,8 +128,7 @@ std::error_code socket_base::bind_raw(sockaddr const* const address, socklen_t c
 
 std::error_code socket_base::listen_raw(int const backlog) noexcept {
     if (not is_open()) return make_error_code(error::not_open);
-    if (::listen(impl_->native_handle(), backlog) != 0) return last_error();
-    return {};
+    return impl_->listen(backlog);
 }
 
 std::error_code socket_base::shutdown_raw(int const how) noexcept {

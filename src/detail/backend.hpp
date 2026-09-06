@@ -46,6 +46,8 @@ struct socket_impl {
     // ---- 同步 ----
     virtual std::error_code open(int family, int type, int protocol) noexcept = 0;
     virtual std::error_code assign(int family, int type, int protocol, int fd) noexcept = 0;
+    // ::listen；完成型后端借此武装多发 accept。
+    virtual std::error_code listen(int backlog) noexcept = 0;
     // 取消两个方向的操作（以 operation_aborted 完成）并关闭描述符。
     virtual std::error_code close() noexcept = 0;
     virtual void cancel() noexcept = 0;

@@ -144,7 +144,8 @@ target_link_libraries(my-target PRIVATE net::net)
 
 测试覆盖：task / 环境传播 / 帧分配器（含多线程回收器）、执行器（多线程 `run()`、strand
 串行化、服务、后端选择）、缓冲区、流与 `any_stream`（零分配断言）、组合子（错误传播、取消、
-异常）、定时器、TCP 回环（取消、EOF、超时、多线程）、UDP、DNS、信号、TLS（握手 / 回显 /
+异常）、定时器、TCP 回环（取消、EOF、超时、多线程、接受器：连接先到后取 / 取消 / 关闭丢弃排队连接 / assign
+已监听的描述符）、UDP、DNS、信号、TLS（握手 / 回显 /
 干净关闭、证书与主机名校验失败、验证回调、传输截断、ALPN、3 MiB 经 `any_stream` 传输、取消、
 版本不匹配、拥有式流与移动），以及一个契约违规测试。平台测试为 epoll / poll / select /
 io_uring 各编译一个变体（`<name>`、`<name>_poll`、`<name>_select`、`<name>_io_uring`），后端
@@ -199,13 +200,14 @@ Linux 7.0，单线程：
 吞吐行的差别在噪声内（单次运行波动 ±5%，瓶颈是内核回环路径的两次拷贝）；往返与定时器行
 io_uring 领先，是把它按 Corosio（参考实现）的做法对齐之后的结果，`strace -c` 可验证
 （`bench_net --backend io_uring`）：同一 quick 基准全程 epoll 133k 次系统调用，io_uring 92k。
-对齐的四点见 `docs/backends.md`——提交推迟到 `run()` 与等待合并成一次 `io_uring_enter`、
+对齐的五点见 `docs/backends.md`——提交推迟到 `run()` 与等待合并成一次 `io_uring_enter`、
 自适应投机（连续 EAGAIN 后不再白跑 `read`，直接走完成型路径）、`net::single_thread_hint` 下
-的 `SINGLE_ISSUER | DEFER_TASKRUN`、多发 POLL_ADD 唤醒。顺带修了两处影响所有后端的浪费：
+的 `SINGLE_ISSUER | DEFER_TASKRUN`、多发 POLL_ADD 唤醒、多发 accept（`listen()` 武装一个
+`IORING_ACCEPT_MULTISHOT` SQE，连接先于 `accept()` 到达时停在 parked 队列里）。顺带修了两处影响所有后端的浪费：
 `io_context` 在 `run()` 线程自己 post 续体时会向自己写 eventfd（每次完成多 1 写 2 读），
 以及就绪型后端的定时器把到期向上取整到毫秒、又被这次自打断掩盖——现在最早到期经
 timerfd（hrtimer，不受 50 µs timer slack 影响）送进解复用器。io_uring 尚未使用的：多发
-accept / recv、注册缓冲区、零拷贝发送。TLS 的数字（OpenSSL 与 BoringSSL 对照）见 `docs/tls.md`。
+recv、注册缓冲区、零拷贝发送。TLS 的数字（OpenSSL 与 BoringSSL 对照）见 `docs/tls.md`。
 
 ## 目录
 

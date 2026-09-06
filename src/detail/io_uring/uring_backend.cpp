@@ -50,6 +50,7 @@ void uring_backend::poller::prepare(io_uring_sqe& sqe) noexcept {
 }
 
 void uring_backend::poller::on_complete(int const res, unsigned) noexcept {
+    if (res == -EINVAL && multishot) multishot = false; // 内核不支持多发：退回一次性
     if (res >= 0 && on_readable != nullptr) on_readable(*this);
 }
 
@@ -98,11 +99,12 @@ uring_backend::~uring_backend() {
 }
 
 void uring_backend::shutdown() {
-    // 未完成的操作被放弃：环随后销毁，CQE 不再被读取。
+    // 未完成的操作被放弃：环随后销毁，CQE 不再被读取。退役的操作此时可以安全删除。
     std::lock_guard<std::mutex> lock{mutex_};
     shut_down_ = true;
     deferred_head_ = nullptr;
     deferred_tail_ = nullptr;
+    retired_.clear();
 }
 
 // ---- 工厂 ----
@@ -198,6 +200,22 @@ bool uring_backend::submit(uring_op& op) noexcept {
     return true;
 }
 
+void uring_backend::submit_locked(uring_op& op) noexcept {
+    if (shut_down_) return;
+    if (not try_submit_locked(op)) push_deferred_locked(op);
+    ring_.flush();
+    if (op.counts_as_work) context_->get_executor().on_work_started();
+}
+
+void uring_backend::retire(std::unique_ptr<uring_op> op) noexcept {
+    std::lock_guard<std::mutex> lock{mutex_};
+    op->retired = true;
+    if (op->in_flight) submit_cancel_locked(*op);
+    if (op->deferred) remove_deferred_locked(*op);
+    if (not shut_down_) retired_.push_back(std::move(op));
+    // shut_down_：环不再读 CQE，直接删。
+}
+
 void uring_backend::submit_cancel_locked(uring_op& op) noexcept {
     auto* const sqe = ring_.get_sqe();
     if (sqe == nullptr) return; // 环满：放弃这次取消（操作会自然完成）
@@ -289,44 +307,48 @@ void uring_backend::run(long const timeout_ms) {
     }
 
     // 先取一次环锁再读操作：提交者在环锁内写完操作参数后 unlock，这里的 lock 与之建立
-    // happens-before（内核发布 CQE 那一跳对 C++ 内存模型不可见）。
+    // happens-before（内核发布 CQE 那一跳对 C++ 内存模型不可见）。常驻 / 多发操作的 on_complete
+    // 与 rearm() 直接在锁内进行：它们的拥有者可能正在另一个线程上退役它们（retire 也在锁内）。
     {
         std::lock_guard<std::mutex> lock{mutex_};
         for (auto const& entry : reaped_) {
-            if (entry.op->persistent && (entry.flags & IORING_CQE_F_MORE) != 0U) continue; // 多发仍在武装
-            entry.op->in_flight = false;
-            if (not entry.op->persistent) --inflight_;
-        }
-    }
-    for (auto const& entry : reaped_) {
-        auto* const op = entry.op;
-        if (op->persistent) {
-            auto& self = static_cast<poller&>(*op);
-            if (entry.res == -EINVAL && self.multishot) self.multishot = false; // 内核不支持多发：退回一次性
+            auto* const op = entry.op;
+            auto const more = (entry.flags & IORING_CQE_F_MORE) != 0U;
+            if (not op->persistent) {
+                op->in_flight = false;
+                --inflight_;
+                completed_.push_back(entry);
+                continue;
+            }
             op->on_complete(entry.res, entry.flags);
-            if ((entry.flags & IORING_CQE_F_MORE) == 0U) rearm_.push_back(op);
-            continue;
+            if (more) continue; // 仍在武装
+            op->in_flight = false;
+            if (op->retired) continue; // 下面统一删除
+            if (not shut_down_ && op->rearm()) rearm_.push_back(op);
         }
-        op->on_complete(entry.res, entry.flags);
-        completed_.push_back(op);
-    }
-
-    {
-        std::lock_guard<std::mutex> lock{mutex_};
         for (auto* const op : rearm_)
-            if (not shut_down_ && not try_submit_locked(*op)) push_deferred_locked(*op);
+            if (not try_submit_locked(*op)) push_deferred_locked(*op);
+        rearm_.clear();
         drain_deferred_locked();
         ring_.flush(); // 下一次 run() 一并提交
+        // 退役操作：终止 CQE 已到（不在飞、不在延迟队列）就删除。
+        for (auto it = retired_.begin(); it != retired_.end();) {
+            if (not (*it)->in_flight && not (*it)->deferred)
+                it = retired_.erase(it);
+            else
+                ++it;
+        }
     }
-
+    // 普通操作：锁外记录结果并交出续体。
+    for (auto const& entry : completed_)
+        entry.op->on_complete(entry.res, entry.flags);
     auto const executor = context_->get_executor();
-    for (auto* const op : completed_) {
-        auto const counts = op->counts_as_work; // complete() 之后不再触碰 op
-        op->complete();
+    for (auto const& entry : completed_) {
+        auto const counts = entry.op->counts_as_work; // complete() 之后不再触碰 op
+        entry.op->complete();
         if (counts) executor.on_work_finished();
     }
     completed_.clear();
-    rearm_.clear();
 }
 
 } // namespace detail

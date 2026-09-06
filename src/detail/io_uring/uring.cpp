@@ -4,8 +4,11 @@
 #include <cerrno>
 #include <cstring>
 
+#include <cstdio>
+
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/utsname.h>
 #include <unistd.h>
 
 namespace net {
@@ -196,6 +199,18 @@ bool uring::peek(io_uring_cqe const*& cqe) noexcept {
 void uring::advance() noexcept { store_release(cq_head_, *cq_head_ + 1U); }
 
 unsigned uring::ready() const noexcept { return load_acquire(cq_tail_) - *cq_head_; }
+
+bool multishot_accept_supported() noexcept {
+    static bool const supported = [] {
+        utsname info{};
+        if (::uname(&info) != 0) return false;
+        auto major = 0;
+        auto minor = 0;
+        if (std::sscanf(info.release, "%d.%d", &major, &minor) != 2) return false;
+        return major > 5 || (major == 5 && minor >= 19);
+    }();
+    return supported;
+}
 
 bool uring_available() noexcept {
     io_uring_params params{};

@@ -4,9 +4,15 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include "net/any_stream.hpp"
 #include "net/error.hpp"
@@ -371,6 +377,134 @@ void single_thread_hint_promise() {
     CHECK_EQ(replies.load(), 1);
 }
 
+// ---- 接受器语义（io_uring 下走多发 accept：parked 队列 / waiter / 退役；其它后端语义相同） ----
+
+auto accept_n_into(net::tcp_acceptor* acceptor, int n, std::vector<net::tcp_socket>* out)
+    CO2_BEG(net::task<>, (acceptor, n, out), int i{}; net::io_result<net::tcp_socket> accepted;) {
+    for (i = 0; i != n; ++i) {
+        CO2_AWAIT_SET(accepted, acceptor->accept());
+        CHECK(not accepted.ec);
+        out->push_back(std::move(accepted.value));
+    }
+}
+CO2_END
+
+// 连接先于 accept() 到达：内核 / 多发 CQE 先把它们排好，之后的 accept() 逐个取走。
+void connections_arriving_before_accept_are_queued() {
+    test_context ctx;
+    net::tcp_acceptor acceptor{ctx, net::ip::tcp::endpoint{net::ip::address_v4::loopback(), 0}};
+    auto const ep = loopback_endpoint(acceptor);
+    constexpr auto count = 6;
+    std::vector<net::tcp_socket> clients;
+    for (auto i = 0; i != count; ++i) clients.emplace_back(ctx);
+    for (auto& c : clients) net::run_async(ctx.get_executor())(connect_only(&c, ep));
+    ctx.run(); // 全部连上，还没有人 accept
+    ctx.restart();
+    std::vector<net::tcp_socket> accepted;
+    net::run_async(ctx.get_executor())(accept_n_into(&acceptor, count, &accepted));
+    ctx.run();
+    CHECK_EQ(accepted.size(), static_cast<std::size_t>(count));
+    // 接受到的套接字的对端就是客户端们的本地端点（地址不经 accept 传递，由 remote_endpoint 取）。
+    std::set<unsigned short> client_ports;
+    std::set<unsigned short> peer_ports;
+    std::error_code ec;
+    for (auto& c : clients) client_ports.insert(c.local_endpoint(ec).port());
+    for (auto& a : accepted) {
+        auto const peer = a.remote_endpoint(ec);
+        CHECK(not ec);
+        CHECK(peer.address() == net::ip::address_v4::loopback());
+        peer_ports.insert(peer.port());
+    }
+    CHECK(client_ports == peer_ports);
+}
+
+auto accept_with_token(net::tcp_acceptor* acceptor, std::error_code* out)
+    CO2_BEG(net::task<>, (acceptor, out), net::io_result<net::tcp_socket> accepted;) {
+    CO2_AWAIT_SET(accepted, acceptor->accept());
+    *out = accepted.ec;
+}
+CO2_END
+
+// 停着的 accept 被 stop_token 取消；之后到达的连接照常被下一个 accept() 取走。
+void pending_accept_is_cancelled_by_stop_token_then_acceptor_keeps_working() {
+    test_context ctx;
+    net::tcp_acceptor acceptor{ctx, net::ip::tcp::endpoint{net::ip::address_v4::loopback(), 0}};
+    auto const ep = loopback_endpoint(acceptor);
+    net::stop_source source;
+    std::error_code first;
+    net::run_async(ctx.get_executor(), source.get_token(), nullptr, [] {}, [](std::exception_ptr) { CHECK(false); })(
+        accept_with_token(&acceptor, &first));
+    ctx.poll();
+    source.request_stop();
+    ctx.run();
+    CHECK(first == net::error::operation_aborted);
+    ctx.restart();
+    net::tcp_socket client{ctx};
+    net::tcp_socket server;
+    net::run_async(ctx.get_executor())(accept_and_hold(&acceptor, &server));
+    net::run_async(ctx.get_executor())(connect_only(&client, ep));
+    ctx.run();
+    CHECK(server.is_open());
+}
+
+auto sleep_for(net::io_context* ctx, milliseconds d) CO2_BEG(net::task<>, (ctx, d), net::steady_timer timer{*ctx};
+                                                              net::io_result<> r;) {
+    timer.expires_after(d);
+    CO2_AWAIT_SET(r, timer.wait());
+}
+CO2_END
+
+// 关闭带着排队连接的接受器：排队的连接被关闭，客户端读到 EOF；上下文继续运行其它工作
+//（退役的多发操作的终止 CQE 在这期间被安全处理）。
+void closing_acceptor_drops_queued_connections() {
+    test_context ctx;
+    std::vector<net::tcp_socket> clients;
+    {
+        net::tcp_acceptor acceptor{ctx, net::ip::tcp::endpoint{net::ip::address_v4::loopback(), 0}};
+        auto const ep = loopback_endpoint(acceptor);
+        for (auto i = 0; i != 3; ++i) clients.emplace_back(ctx);
+        for (auto& c : clients) net::run_async(ctx.get_executor())(connect_only(&c, ep));
+        ctx.run();
+        ctx.restart();
+    } // 接受器销毁：监听描述符与排队的连接一起关闭
+    std::vector<std::error_code> results(3);
+    for (auto i = 0U; i != 3U; ++i)
+        net::run_async(ctx.get_executor(), [&, i](std::error_code e) { results[i] = e; },
+                       [](std::exception_ptr) { CHECK(false); })(blocked_read(&clients[i]));
+    net::run_async(ctx.get_executor())(sleep_for(&ctx, milliseconds{20}));
+    ctx.run();
+    for (auto const& ec : results)
+        CHECK(ec == net::error::eof || ec == std::errc::connection_reset);
+}
+
+// assign 一个已在监听的描述符：accept() 直接可用。
+void assigning_a_listening_descriptor() {
+    test_context ctx;
+    auto const raw = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    CHECK(raw >= 0);
+    auto const one = 1;
+    ::setsockopt(raw, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in local{};
+    local.sin_family = AF_INET;
+    local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    CHECK(::bind(raw, reinterpret_cast<sockaddr const*>(&local), sizeof(local)) == 0);
+    CHECK(::listen(raw, 16) == 0);
+    net::tcp_acceptor acceptor{ctx};
+    CHECK(not acceptor.assign(net::ip::tcp::v4(), raw));
+    auto const ep = loopback_endpoint(acceptor);
+    net::tcp_socket client{ctx};
+    net::tcp_socket server;
+    net::run_async(ctx.get_executor())(accept_and_hold(&acceptor, &server));
+    net::run_async(ctx.get_executor())(connect_only(&client, ep));
+    ctx.run();
+    CHECK(server.is_open());
+    // release：描述符交回调用方，接受器不再拥有它。
+    auto const released = acceptor.release();
+    CHECK(released == raw);
+    CHECK(not acceptor.is_open());
+    ::close(released);
+}
+
 void endpoints_and_options() {
     connected_pair pair;
     std::error_code ec;
@@ -400,6 +534,10 @@ int main() {
     tcp_socket_behind_any_stream();
     many_clients_on_several_threads();
     single_thread_hint_promise();
+    connections_arriving_before_accept_are_queued();
+    pending_accept_is_cancelled_by_stop_token_then_acceptor_keeps_working();
+    closing_acceptor_drops_queued_connections();
+    assigning_a_listening_descriptor();
     endpoints_and_options();
     std::cout << "tcp tests passed\n";
     return 0;

@@ -1,6 +1,9 @@
 #pragma once
 
 #include <atomic>
+#include <vector>
+#include <memory>
+#include <mutex>
 
 #include <sys/socket.h>
 #include <sys/uio.h>
@@ -100,6 +103,26 @@ struct uring_socket_op final : uring_op {
     late_init<stop_callback<cancel_uring_socket_op>> stop_cb;
 };
 
+// 多发 accept（照 Corosio 的 io_uring_multishot_acceptor_base）：listen() 时武装一个带
+// IORING_ACCEPT_MULTISHOT 的 ACCEPT SQE，内核每接受一个连接就送一个带 F_MORE 的 CQE——有等待
+// 的 accept() 就交给它，否则 fd 停进 parked 队列；accept() 先看 parked 队列、再投机 accept4、最后
+// 作为 waiter 挂起而不提交 SQE。终止 CQE（无 F_MORE）后重新武装。拥有者关闭 / 释放描述符时把
+// 本操作退役给后端持有到终止 CQE（内核仍引用 user_data）。on_complete / rearm 在环锁内调用。
+struct uring_multishot_accept_op final : uring_op {
+    uring_multishot_accept_op(uring_socket& owner_, int const listen_fd_) noexcept : owner{&owner_}, listen_fd{listen_fd_} {
+        persistent = true;
+        counts_as_work = false; // 内部机制；用户可见的工作按每次 accept() 计
+    }
+
+    void prepare(io_uring_sqe& sqe) noexcept override;
+    void on_complete(int res, unsigned flags) noexcept override;
+    void complete() noexcept override {}
+    bool rearm() noexcept override;
+
+    uring_socket* owner; // 退役后为空：之后送来的 fd 直接关闭
+    int listen_fd;
+};
+
 struct uring_socket final : socket_impl {
     uring_socket(io_context& context, uring_backend& backend) noexcept;
     ~uring_socket() override;
@@ -112,6 +135,7 @@ struct uring_socket final : socket_impl {
     void cancel() noexcept override;
     int release() noexcept override;
     int native_handle() const noexcept override { return fd_; }
+    std::error_code listen(int backlog) noexcept override;
 
     void begin_read(span<mutable_buffer const> buffers) noexcept override;
     void begin_write(span<const_buffer const> buffers) noexcept override;
@@ -134,16 +158,49 @@ struct uring_socket final : socket_impl {
     }
     speculation_state& speculation() noexcept { return speculation_; }
 
+    // 取消一个方向的操作：多发模式下停着的 accept waiter 在本对象内完成，其余交给后端。
+    void cancel_op(uring_socket_op& op) noexcept;
+
+    // 多发 accept 的 CQE（环锁内，由 uring_multishot_accept_op 转来）。
+    void on_multishot_accept(int res, unsigned flags) noexcept;
+    bool multishot_wants_rearm() const noexcept { return acceptor_ && not acceptor_->broken; }
+
   private:
-    void cancel_pending(uring_socket_op& op) noexcept;
+    // 多发 accept 状态，只有监听套接字才分配（普通套接字不为它付一个字节的构造成本）。
+    // mutex 保护 parked 与 waiting（CQE 在事件循环线程，accept() / 取消可能在别的线程）。
+    struct acceptor_state {
+        std::mutex mutex;
+        std::vector<int> parked;   // FIFO：[head, size) 是排队的 fd
+        std::size_t head = 0;
+        std::unique_ptr<uring_multishot_accept_op> op;
+        bool waiting = false; // read_op_ 作为 waiter 停着（不在环里）
+        bool broken = false;  // 内核拒绝了多发（-EINVAL）：退回每次 accept 一个 SQE
+
+        bool has_parked() const noexcept { return head != parked.size(); }
+        int pop_parked() noexcept {
+            auto const fd = parked[head++];
+            if (head == parked.size()) {
+                parked.clear();
+                head = 0;
+            }
+            return fd;
+        }
+    };
+
     void finish(uring_socket_op& op) noexcept;
+    bool multishot_active() const noexcept { return acceptor_ && acceptor_->op && not acceptor_->broken; }
+    void arm_multishot_accept() noexcept;
+    void retire_multishot_accept() noexcept;
+    void close_parked_fds() noexcept;
 
     io_context* context_;
     uring_backend* backend_;
     int fd_ = -1;
+    int family_ = 0;
     speculation_state speculation_;
     uring_socket_op read_op_;
     uring_socket_op write_op_;
+    std::unique_ptr<acceptor_state> acceptor_;
 };
 
 } // namespace detail

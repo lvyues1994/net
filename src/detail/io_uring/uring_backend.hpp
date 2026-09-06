@@ -50,6 +50,15 @@ struct uring_backend final : execution_context::service, io_backend {
     // 尚未提交 → 记下，submit 时返回 false。
     void cancel(uring_op& op) noexcept;
 
+    // 退役一个常驻操作（多发 accept 的拥有者关闭 / 释放描述符时）：所有权转给后端。在飞则请求
+    // 取消并持有到终止 CQE；在延迟队列则摘下；之后由 run() 删除。内核仍可能引用它的 user_data，
+    // 所以拥有者不能自己删。调用方已把操作里指向自己的指针清空。
+    void retire(std::unique_ptr<uring_op> op) noexcept;
+
+    // 环锁（多发操作的 on_complete 在锁内被调用；它们需要在锁内提交替代操作时用 submit_locked）。
+    std::mutex& mutex() noexcept { return mutex_; }
+    void submit_locked(uring_op& op) noexcept;
+
   protected:
     void shutdown() override;
 
@@ -60,6 +69,7 @@ struct uring_backend final : execution_context::service, io_backend {
         void prepare(io_uring_sqe& sqe) noexcept override;
         void on_complete(int res, unsigned flags) noexcept override;
         void complete() noexcept override {}
+        bool rearm() noexcept override { return true; }
 
         int fd = -1;
         bool multishot = true;
@@ -93,9 +103,10 @@ struct uring_backend final : execution_context::service, io_backend {
         unsigned flags;
     };
 
-    std::vector<reaped_cqe> reaped_;   // 只有运行 run 的线程触碰
-    std::vector<uring_op*> completed_; // 同上
+    std::vector<reaped_cqe> reaped_;    // 只有运行 run 的线程触碰
+    std::vector<reaped_cqe> completed_; // 同上
     std::vector<uring_op*> rearm_;     // 同上
+    std::vector<std::unique_ptr<uring_op>> retired_; // 锁内
     bool shut_down_ = false;
 };
 

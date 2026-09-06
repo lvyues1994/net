@@ -90,6 +90,8 @@ struct uring {
 
 // 运行时探测：本进程能否创建 io_uring（内核支持且未被 seccomp / sysctl 禁用）。
 bool uring_available() noexcept;
+// 内核 ≥ 5.19：IORING_ACCEPT_MULTISHOT 可用（没有 feature 位，按 uname 判断）。
+bool multishot_accept_supported() noexcept;
 
 } // namespace detail
 } // namespace net

@@ -114,6 +114,11 @@ void reactor_socket::cancel() noexcept {
     if (fd_ >= 0) backend_->cancel_ops(state_);
 }
 
+std::error_code reactor_socket::listen(int const backlog) noexcept {
+    if (::listen(fd_, backlog) != 0) return posix::last_error();
+    return {};
+}
+
 int reactor_socket::release() noexcept {
     if (fd_ < 0) return -1;
     backend_->deregister_descriptor(state_);

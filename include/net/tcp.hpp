@@ -102,6 +102,11 @@ struct tcp_acceptor : socket_base {
         return open_raw(protocol.family(), protocol.type(), protocol.protocol());
     }
 
+    // 接管一个现成的描述符（已在监听的描述符可以直接 accept()）。
+    std::error_code assign(protocol_type const& protocol, native_handle_type const fd) noexcept {
+        return assign_raw(protocol.family(), protocol.type(), protocol.protocol(), fd);
+    }
+
     std::error_code bind(endpoint_type const& endpoint) noexcept {
         return bind_raw(endpoint.data(), static_cast<socklen_t>(endpoint.size()));
     }
