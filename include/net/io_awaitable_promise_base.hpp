@@ -76,6 +76,7 @@ template <class Inner> struct env_awaiter {
     }
 
     auto await_resume() -> decltype(std::declval<Inner&>().await_resume()) {
+        CO2_CONTRACT_CHECK(env != nullptr); // 未经 start() 直接 resume() 的 task 没有环境
         set_cached_frame_allocator(env->frame_allocator);
         return inner.await_resume();
     }

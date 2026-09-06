@@ -50,6 +50,10 @@ struct connect_outcome {
 };
 connect_outcome connect(int fd, sockaddr const* address, socklen_t length) noexcept;
 std::error_code connect_result(int fd) noexcept; // SO_ERROR
+// 非阻塞 connect 之后套接字可写时调用：SO_ERROR 非零 → 失败（done）；为零且 getpeername 成功 →
+// 连上（done）；为零但 ENOTCONN → 可写只是过期的就绪位（未连接套接字最初就报 EPOLLOUT|EPOLLHUP），
+// 连接仍在进行（done = false，继续等）。
+connect_outcome connect_completed(int fd) noexcept;
 
 } // namespace posix
 } // namespace detail

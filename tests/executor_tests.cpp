@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <mutex>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -175,6 +176,47 @@ void strand_dispatch_is_inline_inside_the_strand() {
 }
 
 // ---------------------------------------------------------------------------
+
+auto throws_after_hop(net::io_context* ctx) CO2_BEG(net::task<>, (ctx), net::steady_timer t{*ctx}; net::io_result<> r;) {
+    t.expires_after(std::chrono::microseconds{1});
+    CO2_AWAIT_SET(r, t.wait());
+    throw std::runtime_error{"boom"};
+}
+CO2_END
+
+auto bump_after_hop(net::io_context* ctx, int* counter) CO2_BEG(net::task<>, (ctx, counter), net::steady_timer t{*ctx};
+                                                                  net::io_result<> r;) {
+    t.expires_after(std::chrono::microseconds{1});
+    CO2_AWAIT_SET(r, t.wait());
+    *counter += 1;
+}
+CO2_END
+
+// 一个续体在 strand 上抛出（run_async 默认重抛）之后，strand 必须仍能排空后续的投递——曾经会带着
+// locked == true 离开，之后的所有投递都被吞掉。
+void strand_survives_a_throwing_continuation() {
+    net::io_context ctx;
+    auto strand = net::make_strand(ctx.get_executor());
+    auto counter = 0;
+    net::run_async(strand)(throws_after_hop(&ctx));
+    for (auto i = 0; i != 5; ++i) net::run_async(strand)(bump_after_hop(&ctx, &counter));
+    auto thrown = 0;
+    for (;;) {
+        try {
+            ctx.run();
+            break;
+        } catch (std::runtime_error const&) {
+            ++thrown; // 从 run() 抛出；继续跑剩下的
+        }
+    }
+    CHECK_EQ(thrown, 1);
+    CHECK_EQ(counter, 5);
+    // 之后的投递也照常工作。
+    ctx.restart();
+    net::run_async(strand)(bump_after_hop(&ctx, &counter));
+    ctx.run();
+    CHECK_EQ(counter, 6);
+}
 
 void any_executor_equality_and_target() {
     net::io_context a;
@@ -350,6 +392,7 @@ int main() {
     io_context_runs_on_multiple_threads();
     strand_serializes_on_a_thread_pool();
     strand_dispatch_is_inline_inside_the_strand();
+    strand_survives_a_throwing_continuation();
     any_executor_equality_and_target();
     services_are_singletons_with_ordered_shutdown();
     recycling_resource_reuses_blocks();

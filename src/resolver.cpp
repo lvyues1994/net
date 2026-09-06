@@ -49,9 +49,11 @@ struct resolver_impl {
     explicit resolver_impl(io_context& context_);
     ~resolver_impl() { CO2_CONTRACT_CHECK(not pending); }
 
+    // 工作线程调用：post 之后协程可能立刻在 io 线程上恢复、结束并销毁本对象，所以先取执行器。
     void complete() noexcept {
+        auto const executor = context->get_executor();
         env->executor.post(cont);
-        context->get_executor().on_work_finished();
+        executor.on_work_finished();
     }
 
     io_context* context;

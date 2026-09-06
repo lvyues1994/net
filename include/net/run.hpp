@@ -103,9 +103,10 @@ template <class Ex = detail::inherit_executor> struct run_launcher {
         : executor_(std::move(executor)), token_(std::move(token)), resource_{resource},
           has_executor_{has_executor}, has_token_{has_token},
           saved_{get_cached_frame_allocator()} {
-        // 子链的帧分配器：显式给出的 > 新执行器上下文的默认 > 父链当前的。
+        // 子链的帧分配器：显式给出的 > 父链当前的。换执行器不换分配器：子帧活到父协程从
+        // co_await 返回之后才释放（住在父帧的 awaiter 槽里），若用目标上下文的分配器，目标上下文
+        // 可能在工作计数归零后（例如 pool.join() 之后）先于子帧析构，释放时就落在已销毁的分配器上。
         auto* effective = resource_;
-        if (effective == nullptr && has_executor_) effective = context_allocator(executor_);
         if (effective == nullptr) effective = saved_;
         resource_ = effective;
         set_cached_frame_allocator(effective);

@@ -230,7 +230,7 @@ src/detail/reactor/     就绪型后端族：reactor_backend + epoll / poll / se
 src/detail/io_uring/    完成型后端：裸系统调用的 io_uring 环、提交/取消/收割、套接字与定时器实现
 src/tls/                TLS 引擎（OpenSSL API 子集，OpenSSL / BoringSSL 共用）与驱动协程
 benchmarks/             bench_core / bench_net / bench_tls / bench_asio（Boost.Asio 对照）与 harness
-docs/                   architecture.md（分层与决策）、backends.md（后端设计与 io_uring / IOCP 接入）、tls.md、benchmarks.md（与 Asio 对照）
+docs/                   architecture.md（分层、决策、审查记录）、backends.md（后端设计与 io_uring / IOCP 接入）、tls.md、benchmarks.md（与 Asio 对照）
 tests/  examples/  .github/workflows/ci.yml
 ```
 

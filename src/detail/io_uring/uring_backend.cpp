@@ -104,6 +104,7 @@ void uring_backend::shutdown() {
     shut_down_ = true;
     deferred_head_ = nullptr;
     deferred_tail_ = nullptr;
+    pending_cancels_.clear();
     retired_.clear();
 }
 
@@ -220,11 +221,44 @@ void uring_backend::retire(std::unique_ptr<uring_op> op) noexcept {
 
 void uring_backend::submit_cancel_locked(uring_op& op) noexcept {
     auto* const sqe = ring_.get_sqe();
-    if (sqe == nullptr) return; // 环满：放弃这次取消（操作会自然完成）
+    if (sqe == nullptr) {
+        // 环满：记下，run() 补发。丢掉取消会让一个对端永不发数据的读挂到永远，或让退役的多发
+        // accept 在已关闭的描述符上继续接受。
+        if (not op.cancel_pending) {
+            op.cancel_pending = true;
+            pending_cancels_.push_back(&op);
+        }
+        return;
+    }
+    op.cancel_pending = false;
     sqe->opcode = op.cancel_opcode();
     sqe->fd = -1;
     sqe->addr = user_data_of(&op);
     sqe->user_data = cancel_marker;
+    ring_.flush();
+}
+
+void uring_backend::forget_pending_cancel_locked(uring_op& op) noexcept {
+    op.cancel_pending = false;
+    for (auto it = pending_cancels_.begin(); it != pending_cancels_.end(); ++it) {
+        if (*it != &op) continue;
+        pending_cancels_.erase(it);
+        return;
+    }
+}
+
+void uring_backend::flush_pending_cancels_locked() noexcept {
+    while (not pending_cancels_.empty()) {
+        auto* const op = pending_cancels_.back(); // 仍在飞：完成时已经被 forget_pending_cancel_locked 摘掉
+        auto* const sqe = ring_.get_sqe();
+        if (sqe == nullptr) return; // 仍然满
+        pending_cancels_.pop_back();
+        op->cancel_pending = false;
+        sqe->opcode = op->cancel_opcode();
+        sqe->fd = -1;
+        sqe->addr = user_data_of(op);
+        sqe->user_data = cancel_marker;
+    }
     ring_.flush();
 }
 
@@ -272,6 +306,7 @@ void uring_backend::run(long const timeout_ms) {
             if (rc < 0) throw std::system_error{-rc, std::system_category(), "io_uring_register(ENABLE_RINGS)"};
         }
         drain_deferred_locked();
+        flush_pending_cancels_locked();
         to_submit = ring_.flush();
         inflight = inflight_;
         if (block) waiting_ = true;
@@ -316,6 +351,7 @@ void uring_backend::run(long const timeout_ms) {
         for (auto const& entry : reaped_) {
             auto* const op = entry.op;
             auto const more = (entry.flags & IORING_CQE_F_MORE) != 0U;
+            if (op->cancel_pending && not more) forget_pending_cancel_locked(*op); // 自己完成了：取消不必再发，且 op 随后可能被销毁
             if (not op->persistent) {
                 op->in_flight = false;
                 --inflight_;
@@ -332,6 +368,7 @@ void uring_backend::run(long const timeout_ms) {
             if (not try_submit_locked(*op)) push_deferred_locked(*op);
         rearm_.clear();
         drain_deferred_locked();
+        flush_pending_cancels_locked();
         ring_.flush(); // 下一次 run() 一并提交
         // 退役操作：终止 CQE 已到（不在飞、不在延迟队列）就删除。
         for (auto it = retired_.begin(); it != retired_.end();) {

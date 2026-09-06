@@ -61,20 +61,20 @@ struct is_stream : std::integral_constant<bool, is_read_stream<S>::value && is_w
 
 // ---- 组合算法 ----
 
-// 读满整个缓冲区序列（或直到错误）。返回 {ec, 已读字节数}。
+// 读满整个缓冲区序列（或直到错误）。返回 {ec, 已读字节数}。序列可以有任意多个缓冲区：每次从
+// 已读到的位置重新展平接下来的至多 max_iovec 个。
 template <class Stream, class MutableBufferSequence>
 auto read(Stream& stream, MutableBufferSequence buffers)
-    CO2_BEG((task<io_result<std::size_t>>), (stream, buffers), mutable_buffer_array<> remaining;
-            std::size_t total{}; io_result<std::size_t> partial;) {
+    CO2_BEG((task<io_result<std::size_t>>), (stream, buffers), std::size_t const goal{buffer_size(buffers)};
+            mutable_buffer_array<> window; std::size_t total{}; io_result<std::size_t> partial;) {
     static_assert(is_read_stream<Stream>::value, "net::read requires a ReadStream");
     static_assert(is_mutable_buffer_sequence<MutableBufferSequence>::value,
                   "net::read requires a MutableBufferSequence");
-    remaining = mutable_buffer_array<>{buffers};
-    while (not remaining.empty()) {
-        CO2_AWAIT_SET(partial, stream.read_some(remaining));
+    while (total < goal) {
+        window = mutable_buffer_array<>{buffers, total};
+        CO2_AWAIT_SET(partial, stream.read_some(window));
         total += partial.value;
         if (partial.ec) CO2_RETURN((io_result<std::size_t>{partial.ec, total}));
-        remaining.consume(partial.value);
     }
     CO2_RETURN((io_result<std::size_t>{std::error_code{}, total}));
 }
@@ -83,17 +83,16 @@ CO2_END
 // 写出整个缓冲区序列（或直到错误）。返回 {ec, 已写字节数}。
 template <class Stream, class ConstBufferSequence>
 auto write(Stream& stream, ConstBufferSequence buffers)
-    CO2_BEG((task<io_result<std::size_t>>), (stream, buffers), const_buffer_array<> remaining;
-            std::size_t total{}; io_result<std::size_t> partial;) {
+    CO2_BEG((task<io_result<std::size_t>>), (stream, buffers), std::size_t const goal{buffer_size(buffers)};
+            const_buffer_array<> window; std::size_t total{}; io_result<std::size_t> partial;) {
     static_assert(is_write_stream<Stream>::value, "net::write requires a WriteStream");
     static_assert(is_const_buffer_sequence<ConstBufferSequence>::value,
                   "net::write requires a ConstBufferSequence");
-    remaining = const_buffer_array<>{buffers};
-    while (not remaining.empty()) {
-        CO2_AWAIT_SET(partial, stream.write_some(remaining));
+    while (total < goal) {
+        window = const_buffer_array<>{buffers, total};
+        CO2_AWAIT_SET(partial, stream.write_some(window));
         total += partial.value;
         if (partial.ec) CO2_RETURN((io_result<std::size_t>{partial.ec, total}));
-        remaining.consume(partial.value);
     }
     CO2_RETURN((io_result<std::size_t>{std::error_code{}, total}));
 }
@@ -104,7 +103,7 @@ namespace detail {
 // 在 [data, data + size) 中从 from 起查找 delimiter；找到返回分隔符结束位置，否则返回 npos。
 inline std::size_t find_delimiter(char const* const data, std::size_t const size,
                                   std::size_t const from, std::string const& delimiter) noexcept {
-    if (delimiter.empty() || size < delimiter.size()) return static_cast<std::size_t>(-1);
+    if (size < delimiter.size()) return static_cast<std::size_t>(-1);
     auto const last = size - delimiter.size();
     for (auto index = from; index <= last; ++index)
         if (std::memcmp(data + index, delimiter.data(), delimiter.size()) == 0)

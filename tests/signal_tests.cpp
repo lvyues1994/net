@@ -65,6 +65,19 @@ void cancel_aborts_the_wait() {
     CHECK(result.ec == net::error::operation_aborted);
 }
 
+// 没在等时 cancel() 返回 0，且不能给下一次 wait() 留下"已取消"标记。
+void cancel_without_a_pending_wait_is_a_no_op() {
+    test_context ctx;
+    net::signal_set signals{ctx, SIGUSR1};
+    CHECK_EQ(signals.cancel(), 0U);
+    net::io_result<int> result{};
+    net::run_async(ctx.get_executor(), [&](net::io_result<int> v) { result = v; }, [](std::exception_ptr) { CHECK(false); })(wait_signal(&signals));
+    net::run_async(ctx.get_executor())(raise_later(&ctx, SIGUSR1));
+    ctx.run();
+    CHECK(not result.ec);
+    CHECK_EQ(result.value, SIGUSR1);
+}
+
 void stop_token_aborts_the_wait() {
     test_context ctx;
     net::signal_set signals{ctx, SIGUSR1};
@@ -112,6 +125,7 @@ int main() {
     raised_signal_completes_the_wait();
     early_signal_is_queued();
     cancel_aborts_the_wait();
+    cancel_without_a_pending_wait_is_a_no_op();
     stop_token_aborts_the_wait();
     every_registered_set_receives_the_signal();
     removed_signal_is_not_delivered();

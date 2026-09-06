@@ -47,11 +47,15 @@ bool reactor_socket_op::perform() noexcept {
         bytes_transferred = outcome.bytes;
         return true;
     }
-    case kind::connect:
-        // 只在可写时被调用：结果在 SO_ERROR 里。
-        ec = posix::connect_result(fd);
+    case kind::connect: {
+        // 可写时被调用。可写位可能是过期的（未连接套接字最初就报 EPOLLOUT|EPOLLHUP，或描述符 /
+        // 状态地址复用带来的迟到事件）：SO_ERROR 为零还要 getpeername 确认真的连上了。
+        auto const outcome = posix::connect_completed(fd);
+        if (not outcome.done) return false;
+        ec = outcome.ec;
         bytes_transferred = 0U;
         return true;
+    }
     case kind::accept: {
         auto const outcome = posix::accept(fd);
         if (not outcome.done) return false;
@@ -175,6 +179,8 @@ void reactor_socket::begin_connect(sockaddr const* const address, socklen_t cons
         op.ec = open(family, type, protocol);
         if (op.ec) return; // 同步失败
     }
+    // 未连接的套接字一注册就报 EPOLLOUT|EPOLLHUP：那次"可写"对 connect 毫无意义，先清掉。
+    backend_->clear_ready(state_, write_ready_bit);
     auto const outcome = posix::connect(fd_, address, length);
     op.ec = outcome.ec;
     op.immediate = outcome.done; // EINPROGRESS → 等待可写

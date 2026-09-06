@@ -223,7 +223,15 @@ void uring_socket::arm_multishot_accept() noexcept {
     if (not acceptor_) acceptor_.reset(new acceptor_state{});
     if (acceptor_->op) return;
     acceptor_->op.reset(new uring_multishot_accept_op{*this, fd_});
+    acceptor_->armed = true;
     if (not backend_->submit(*acceptor_->op)) acceptor_->op.reset(); // 上下文已 shutdown
+}
+
+// 终止错误之后由 accept() 重新武装（调用方已在 acceptor 锁内把 armed 置真并释放了锁：不能持
+// acceptor 锁调 submit——锁序是环锁 → acceptor 锁）。
+void uring_socket::rearm_multishot_accept() noexcept {
+    if (not acceptor_ || not acceptor_->op) return;
+    backend_->submit(*acceptor_->op);
 }
 
 void uring_socket::retire_multishot_accept() noexcept {
@@ -253,8 +261,10 @@ void uring_socket::close_parked_fds() noexcept {
 
 void uring_socket::cancel_op(uring_socket_op& op) noexcept {
     if (not op.pending) return;
-    if (&op == &read_op_ && op.op_kind == uring_socket_op::kind::accept && multishot_active()) {
-        // 多发模式的 accept 是停着的 waiter，不在环里：在这里完成它。
+    if (&op == &read_op_ && op.op_kind == uring_socket_op::kind::accept && acceptor_) {
+        // 多发模式的 accept 是停着的 waiter，不在环里：在这里完成它。不在停着（已交付、或退回一次性
+        // 后已作为 SQE 提交）就交给后端——对既不在飞也不在延迟队列的操作它只记 cancel_requested，
+        // finish 会清掉。
         auto deliver = false;
         {
             std::lock_guard<std::mutex> lock{acceptor_->mutex};
@@ -264,12 +274,13 @@ void uring_socket::cancel_op(uring_socket_op& op) noexcept {
             }
         }
         if (deliver) {
+            auto const executor = context_->get_executor(); // complete() 之后不再碰 this
             op.ec = make_error_code(error::operation_aborted);
             op.accepted_fd = -1;
             op.complete();
-            context_->get_executor().on_work_finished();
+            executor.on_work_finished();
+            return;
         }
-        return;
     }
     backend_->cancel(op);
 }
@@ -310,8 +321,11 @@ void uring_socket::on_multishot_accept(int const res, unsigned const flags) noex
     auto deliver = false;
     auto resubmit_oneshot = false;
     auto& state = *acceptor_;
+    auto const executor = context_->get_executor(); // complete() 之后不再碰 this
     {
         std::lock_guard<std::mutex> lock{state.mutex};
+        if (not more) state.armed = false;
+        state.rearm_after_terminal = false;
         if (res >= 0) {
             if (state.waiting) {
                 state.waiting = false;
@@ -322,29 +336,40 @@ void uring_socket::on_multishot_accept(int const res, unsigned const flags) noex
             } else {
                 state.parked.push_back(res);
             }
+            // 成功交付后内核放弃了多发（罕见）：立刻重新武装。
+            if (not more) {
+                state.rearm_after_terminal = true;
+                state.armed = true;
+            }
         } else if (not more && (res == -EINVAL || res == -EOPNOTSUPP)) {
             // 内核不接受多发（uname 判断失误）：退回每次 accept 一个 SQE；停着的 waiter 改为一次性提交。
-            state.broken = true;
+            state.broken.store(true, std::memory_order_relaxed);
             if (state.waiting) {
                 state.waiting = false;
                 resubmit_oneshot = true;
             }
-        } else if (not more && res != -ECANCELED && state.waiting) {
-            // 终止错误（如 EMFILE）交给等待者；之后 rearm() 重新武装。
-            state.waiting = false;
-            read_op_.accepted_fd = -1;
-            read_op_.ec = error_from_result(res);
-            deliver = true;
+        } else if (not more && res != -ECANCELED) {
+            // 终止错误（如 EMFILE / ENFILE）：有等待者就交给它，否则留给下一次 accept()；不立刻重新
+            // 武装——内核会在 backlog 非空、fd 用尽的状态下原地打转（每次 CQE 都是同一个错误）。
+            // 下一次 accept() 重新武装。
+            if (state.waiting) {
+                state.waiting = false;
+                read_op_.accepted_fd = -1;
+                read_op_.ec = error_from_result(res);
+                deliver = true;
+            } else {
+                state.terminal_error = -res;
+            }
         }
     }
     if (deliver) {
         read_op_.complete();
-        context_->get_executor().on_work_finished();
+        executor.on_work_finished();
     }
     if (resubmit_oneshot) {
         // waiter 停着时已计过一份工作；submit_locked 会再计一份，这里抵掉。
         backend_->submit_locked(read_op_);
-        context_->get_executor().on_work_finished();
+        executor.on_work_finished();
     }
 }
 
@@ -470,9 +495,30 @@ bool uring_socket::ready(op_direction const direction) noexcept {
     }
     case uring_socket_op::kind::accept: {
         if (multishot_active()) {
-            std::lock_guard<std::mutex> lock{acceptor_->mutex};
-            if (acceptor_->has_parked()) {
-                op.accepted_fd = acceptor_->pop_parked();
+            auto pending_error = 0;
+            auto need_arm = false;
+            auto parked_fd = -1;
+            {
+                std::lock_guard<std::mutex> lock{acceptor_->mutex};
+                if (acceptor_->terminal_error != 0) {
+                    pending_error = acceptor_->terminal_error; // 上一次没人等时到达的终止错误
+                    acceptor_->terminal_error = 0;
+                } else if (acceptor_->has_parked()) {
+                    parked_fd = acceptor_->pop_parked();
+                }
+                if (not acceptor_->armed) { // 终止错误之后：由这次 accept 重新武装
+                    acceptor_->armed = true;
+                    need_arm = true;
+                }
+            }
+            if (need_arm) rearm_multishot_accept(); // 锁外：锁序是环锁 → acceptor 锁
+            if (pending_error != 0) {
+                op.ec = std::error_code{pending_error, std::system_category()};
+                op.accepted_fd = -1;
+                return true;
+            }
+            if (parked_fd >= 0) {
+                op.accepted_fd = parked_fd;
                 op.accepted_family = family_;
                 op.ec.clear();
                 return true;
@@ -515,6 +561,23 @@ coroutine_handle<> uring_socket::suspend(op_direction const direction, coroutine
     if (direction == op_direction::read && op.op_kind == uring_socket_op::kind::accept && multishot_active()) {
         // 多发模式：不提交 SQE，作为 waiter 停着，由多发 CQE 交付。回调已装好：之后到达的停止请求
         // 经 cancel_op 看到 waiting 完成我们；之前到达的在这里检测。
+        // 终止错误之后多发没在武装：先（在发布之前、锁外）重新武装，否则 waiter 会等到永远。
+        auto need_arm = false;
+        {
+            std::lock_guard<std::mutex> lock{acceptor_->mutex};
+            if (acceptor_->terminal_error != 0) {
+                // ready() 已处理过这一情形；这里只可能是 ready() 与 suspend() 之间到达的终止错误。
+                op.ec = std::error_code{acceptor_->terminal_error, std::system_category()};
+                acceptor_->terminal_error = 0;
+                op.accepted_fd = -1;
+                return h; // 交付错误；重新武装留给下一次 accept()
+            }
+            if (not acceptor_->armed) {
+                acceptor_->armed = true;
+                need_arm = true;
+            }
+        }
+        if (need_arm) rearm_multishot_accept(); // 尚未发布，可以碰 this / backend_；锁外（锁序：环锁 → acceptor 锁）
         std::lock_guard<std::mutex> lock{acceptor_->mutex};
         if (acceptor_->has_parked()) {
             op.accepted_fd = acceptor_->pop_parked();

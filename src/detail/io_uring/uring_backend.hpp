@@ -86,6 +86,8 @@ struct uring_backend final : execution_context::service, io_backend {
     bool remove_deferred_locked(uring_op& op) noexcept;
     void drain_deferred_locked() noexcept;
     void submit_cancel_locked(uring_op& op) noexcept;
+    void flush_pending_cancels_locked() noexcept;
+    void forget_pending_cancel_locked(uring_op& op) noexcept;
 
     io_context* context_;
     std::mutex mutex_;
@@ -107,6 +109,7 @@ struct uring_backend final : execution_context::service, io_backend {
     std::vector<reaped_cqe> completed_; // 同上
     std::vector<uring_op*> rearm_;     // 同上
     std::vector<std::unique_ptr<uring_op>> retired_; // 锁内
+    std::vector<uring_op*> pending_cancels_;          // 锁内：环满时没发出去的取消请求
     bool shut_down_ = false;
 };
 

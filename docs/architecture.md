@@ -226,3 +226,36 @@ stop_callback（回调 `cancel_op`）、`start_op`；排队后复查 `stop_reque
 - `when_any` 异构结果用 tuple 而不是 variant；
 - 两段调用的求值顺序在 C++14 未规定：提供工厂形态作为确定性替代；
 - 操作状态住在 I/O 对象里而不是 awaiter 里（awaiter 需要放进 co2 固定容量的槽位）。
+
+## 审查记录（2026-09）
+
+两轮独立审查（平台层 / 抽象层）对照上面的不变量逐路径核对，发现并修掉的问题，按严重度：
+
+| 层 | 问题 | 触发 | 修法 / 回归测试 |
+| --- | --- | --- | --- |
+| 反应器 | connect 报假成功：未连接套接字一注册就报 `EPOLLOUT\|EPOLLHUP`，过期的可写位让 `start_op` 立刻 `perform()`，`SO_ERROR == 0` 就当连上了 | `open()` 之后有任何挂起点再 `connect()`（resolve 后 connect 是常态） | `perform()` 用 `getpeername` 确认（`ENOTCONN` → 继续等），`begin_connect` 先清位；`tcp_tests::connect_after_idle_open_never_reports_a_false_success`（accept 队列满的监听端口作为确定性的 SYN_SENT 目标） |
+| strand | 某个续体抛出后 `on_drain` 带着 `locked == true` 和一批未恢复的续体离开，之后所有投递被吞 | `run_async` 默认 `rethrow_error` 在 strand 上 | 异常时把剩余批次放回队首、重新排队排空帧再重抛；`executor_tests::strand_survives_a_throwing_continuation` |
+| resolver | 工作线程 `complete()` 在 `post` 之后读成员：协程可能已在 io 线程上结束并销毁 resolver | 任何 resolve | 先取执行器再 post |
+| 组合算法 | `read` / `write` 只展平前 16 个缓冲区，之后的静默丢弃 | 序列超过 `max_iovec` 个非空缓冲区 | 每次从已传输位置重新展平；`stream_tests::read_and_write_cover_sequences_longer_than_max_iovec` |
+| 缓冲区概念 | `is_*_buffer_sequence` 接受"可转换为缓冲区"的用户类型，单元素遍历返回转换临时对象的地址 | 用户类型带 `operator const_buffer()` | 只认缓冲区类型本身 + 元素可转换的范围；编译期 `static_assert` 回归 |
+| signal_set | 没在等时 `cancel()` 留下 `cancel_requested`，下一次 `wait()` 被误中止 | 关闭流程里先 `cancel()` 再 `wait()` | 只有 stop_token 路径记标记；`signal_tests::cancel_without_a_pending_wait_is_a_no_op` |
+| io_uring | SQ 满时取消 SQE 被静默丢弃：对端永不发数据的读挂到永远；退役的多发 accept 在已关闭的描述符上继续接受 | 1024 个 SQ 项在高负载下并不难满 | `cancel_pending` + 后端的待发取消列表，`run()` 有空位时补发；操作自己完成时摘掉 |
+| io_uring | 多发 accept 终止错误（EMFILE）立刻重武装 → 内核原地打转 100% CPU；没人等时错误被丢 | fd 用尽 | 终止错误不重武装，记下交给下一次 `accept()`，由它重新武装 |
+| io_uring | `broken`（退回一次性）锁外读：EINVAL 退回路径与取消竞争会丢掉取消 | 老内核 | `broken` 原子；`cancel_op` 在 acceptor 锁内看 `waiting`，否则交给后端取消 |
+| io_uring | `IORING_ENTER_EXT_ARG` 在 5.5–5.10 上 `-EINVAL` | 老内核的 `run_for` | `uring_available()` 要求 `IORING_FEAT_EXT_ARG` |
+| 组合子 | `when_all` / `when_any` 逐个"建 runner + 启动"，第 k 个建 runner 抛出时前 k-1 个已在飞 → 析构在飞的 task 是契约违规 | `bad_alloc` | 两阶段：先建全部 runner（唯一会抛的步骤），再一次性启动 |
+| run(ex) | 子帧用目标上下文的分配器，但子帧活到父协程从 co_await 返回；目标上下文可能先析构 | `recycling` 默认 + `pool.join()` 后父协程才恢复 | 换执行器不换分配器（显式 `run(mr)` 除外） |
+| run_async | 工作计数在状态（帧）释放之前归还 | — | 守卫先于状态声明 |
+| any_stream | `start()` 不检查上一个操作是否还在；`await_ready` 抛出时标志泄漏；`new S` 裸指针在 `adopt` 抛出时泄漏 | 误用 / OOM | 契约检查前移；守卫；`unique_ptr` |
+| 其它 | `dynamic_container_buffer::prepare(0)` 对空 vector 取 `&v[0]`；`built_in_frame_allocator()` 内联在头里、取决于构建宏（ODR） | — | 判空；移到 .cpp |
+
+审查确认干净的部分：`io_context` 调度器（工作计数、stop/restart、截止、反应器交接、自打断避免）、
+三条发布规则在全部 `suspend()` 路径上的落实、锁序（环锁 → acceptor 锁 → io_context 锁；反应器锁
+→ 信号锁 → io_context 锁，无反向边）、`uring_backend::run` 的 happens-before 与 F_MORE / 退役处理、
+帧所有权（没有恢复已销毁帧的路径）、线程局部帧分配器槽位在所有恢复路径上的保存与恢复、组合子
+计数器与结果槽的内存序、strand 串行化与再入、`recycling_memory_resource`。
+
+有意保留的限制（已写进相应文档）：TLS 的 `shutdown()` 不能与挂起的读重叠（两者都读底层流；
+Corosio 支持重叠）；`close()` / `cancel()` 不是跨线程安全的（用 stop_token 从别的线程取消）；
+`thread_pool` 上没有 `run()` 可以重抛，协程逃出的异常会 `std::terminate`——在池上启动的链应给
+`on_error`；`when_any` 输掉的读可能已消费数据（首个完成者胜出语义固有）。

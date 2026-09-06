@@ -40,6 +40,7 @@ struct uring_op {
     bool cancel_requested = false; // 提交前收到取消
     bool persistent = false;       // 常驻 / 多发：见文件头
     bool retired = false;          // 拥有者已放手，由后端持有到终止 CQE 后删除
+    bool cancel_pending = false;   // 取消 SQE 因环满没发出去：run() 有空位时补发
     bool counts_as_work = true;
     uring_op* next = nullptr;      // 延迟队列链接
 };

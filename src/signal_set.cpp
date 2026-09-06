@@ -90,10 +90,12 @@ struct signal_set_impl {
         queued.push_back(signal_number);
     }
 
-    // 锁内。
-    bool cancel_locked() noexcept {
+    // 锁内。from_stop_token：停止请求在"回调装好、尚未挂起"的窗口里到达时记为 cancel_requested，
+    // await_suspend 看到即中止；用户的 cancel() 对没在等的 set 不能留下标记，否则下一次 wait()
+    // 会被误中止。
+    bool cancel_locked(bool const from_stop_token) noexcept {
         if (not waiting) {
-            cancel_requested = true; // 回调装好、尚未挂起：await_suspend 看到即中止
+            if (from_stop_token) cancel_requested = true;
             return false;
         }
         waiting = false;
@@ -191,7 +193,7 @@ signal_set_impl::~signal_set_impl() { CO2_CONTRACT_CHECK(not pending); }
 void cancel_signal_wait::operator()() const noexcept {
     auto& state = signal_state::instance();
     std::lock_guard<std::mutex> lock{state.mutex};
-    impl->cancel_locked();
+    impl->cancel_locked(true);
 }
 
 } // namespace detail
@@ -314,7 +316,7 @@ std::error_code signal_set::clear() noexcept {
 std::size_t signal_set::cancel() noexcept {
     auto& state = detail::signal_state::instance();
     std::lock_guard<std::mutex> lock{state.mutex};
-    return impl_->cancel_locked() ? 1U : 0U;
+    return impl_->cancel_locked(false) ? 1U : 0U;
 }
 
 signal_wait_awaitable signal_set::wait() noexcept {

@@ -64,12 +64,14 @@ template <class Ex, class T, class OnValue, class OnError> struct run_async_stat
     run_async_state& operator=(run_async_state const&) = delete;
 
     static coroutine_handle<> on_complete(void* const user) {
-        std::unique_ptr<run_async_state> self{static_cast<run_async_state*>(user)};
-        // 处理器可能抛出（默认的 on_error 就是重抛）：状态释放与工作计数由守卫保证。
+        // 处理器可能抛出（默认的 on_error 就是重抛）：状态释放与工作计数由守卫保证。守卫先于 self
+        // 声明，于是后析构：工作计数在帧（连同它用的分配器引用）释放之后才归还——"工作归零"意味着
+        // 所有帧都已释放。
         struct finish {
             Ex executor;
             ~finish() { executor.on_work_finished(); }
-        } guard{self->executor};
+        } guard{static_cast<run_async_state*>(user)->executor};
+        std::unique_ptr<run_async_state> self{static_cast<run_async_state*>(user)};
         auto const error = task_access::exception(self->t);
         if (error)
             self->on_error(error);

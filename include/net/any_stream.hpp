@@ -107,7 +107,19 @@ template <class Buffer, class Direction> struct any_stream_base {
             self->vt_->construct_awaitable(self->stream_, self->awaitable_storage_,
                                            self->pending_.to_span());
             self->awaitable_active_ = true;
-            return self->vt_->await_ready(self->awaitable_storage_);
+            struct disarm_on_throw {
+                any_stream_base* s;
+                bool armed;
+                ~disarm_on_throw() {
+                    if (armed) {
+                        s->vt_->destroy_awaitable(s->awaitable_storage_);
+                        s->awaitable_active_ = false;
+                    }
+                }
+            } guard{self, true};
+            auto const ready = self->vt_->await_ready(self->awaitable_storage_);
+            guard.armed = false;
+            return ready;
         }
 
         coroutine_handle<> await_suspend(coroutine_handle<> const h, io_env const* const env) {
@@ -138,6 +150,7 @@ template <class Buffer, class Direction> struct any_stream_base {
 
     template <class Sequence> awaitable start(Sequence const& buffers) noexcept {
         CO2_CONTRACT_CHECK(stream_ != nullptr);
+        CO2_CONTRACT_CHECK(not awaitable_active_); // 同一方向同时只能有一个操作：第二个会覆盖第一个的缓冲区
         pending_ = buffer_array<Buffer, max_iovec>{buffers};
         return awaitable{this};
     }
@@ -208,7 +221,9 @@ struct any_read_stream : detail::any_stream_base<mutable_buffer, detail::read_di
                            is_read_stream<S>::value &&
                            not std::is_same<typename std::decay<S>::type, any_read_stream>::value>::type>
     explicit any_read_stream(S stream) {
-        this->adopt(new S(std::move(stream)), true);
+        std::unique_ptr<S> owned{new S(std::move(stream))};
+        this->adopt(owned.get(), true); // adopt 可能抛出（awaiter 存储分配）：那时 owned 仍负责释放
+        owned.release();
     }
 
     // 引用：调用方保证流比本对象活得久。
@@ -234,7 +249,9 @@ struct any_write_stream : detail::any_stream_base<const_buffer, detail::write_di
                            is_write_stream<S>::value &&
                            not std::is_same<typename std::decay<S>::type, any_write_stream>::value>::type>
     explicit any_write_stream(S stream) {
-        this->adopt(new S(std::move(stream)), true);
+        std::unique_ptr<S> owned{new S(std::move(stream))};
+        this->adopt(owned.get(), true);
+        owned.release();
     }
 
     template <class S, class = typename std::enable_if<is_write_stream<S>::value>::type>

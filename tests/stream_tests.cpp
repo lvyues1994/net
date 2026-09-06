@@ -4,7 +4,9 @@
 #include <cstddef>
 #include <cstdlib>
 #include <new>
+#include <array>
 #include <string>
+#include <vector>
 
 #include "net/any_stream.hpp"
 #include "net/dynamic_buffer.hpp"
@@ -58,6 +60,18 @@ static_assert(net::is_read_stream<net::any_read_stream>::value, "");
 static_assert(not net::is_write_stream<net::any_read_stream>::value, "");
 static_assert(not net::is_read_stream<int>::value, "");
 
+// 缓冲区序列概念只认缓冲区类型本身与"元素可转换为缓冲区"的范围：一个自身可转换为缓冲区的用户类型
+// 不算序列（单元素遍历返回对象地址，对转换出的临时对象会悬空）。
+struct convertible_to_buffer {
+    char data[4];
+    operator net::const_buffer() const noexcept { return net::const_buffer{data, sizeof(data)}; }
+};
+static_assert(not net::is_const_buffer_sequence<convertible_to_buffer>::value, "");
+static_assert(net::is_const_buffer_sequence<net::const_buffer>::value, "");
+static_assert(net::is_const_buffer_sequence<net::mutable_buffer>::value, "");
+static_assert(net::is_const_buffer_sequence<std::vector<convertible_to_buffer>>::value, "");
+static_assert(not net::is_mutable_buffer_sequence<net::const_buffer>::value, "");
+
 template <class T> T run_task(net::task<T> t) {
     net::io_context ctx;
     T result{};
@@ -83,6 +97,45 @@ void read_fills_the_whole_buffer_across_partial_reads() {
     CHECK(not r.ec);
     CHECK_EQ(r.value, 10U);
     CHECK_EQ(std::string(out, 10), "abcdefghij");
+}
+
+// 超过 max_iovec（16）个缓冲区的序列：read / write 必须覆盖全部，而不是只处理前 16 个。
+auto read_vec(memory_stream& s, std::vector<net::mutable_buffer> buffers)
+    CO2_BEG((net::task<net::io_result<std::size_t>>), (s, buffers), net::io_result<std::size_t> r;) {
+    CO2_AWAIT_SET(r, net::read(s, buffers));
+    CO2_RETURN(r);
+}
+CO2_END
+
+auto write_vec(memory_stream& s, std::vector<net::const_buffer> buffers)
+    CO2_BEG((net::task<net::io_result<std::size_t>>), (s, buffers), net::io_result<std::size_t> r;) {
+    CO2_AWAIT_SET(r, net::write(s, buffers));
+    CO2_RETURN(r);
+}
+CO2_END
+
+void read_and_write_cover_sequences_longer_than_max_iovec() {
+    constexpr auto count = 40U; // > 16
+    std::string source;
+    for (auto i = 0U; i != count; ++i) source += static_cast<char>('a' + i % 26U);
+    memory_stream s{source, "", 7};
+    std::vector<std::array<char, 1>> cells(count);
+    std::vector<net::mutable_buffer> buffers;
+    for (auto& cell : cells) buffers.push_back(net::buffer(cell));
+    auto const r = run_task(read_vec(s, buffers));
+    CHECK(not r.ec);
+    CHECK_EQ(r.value, static_cast<std::size_t>(count));
+    std::string got;
+    for (auto const& cell : cells) got += cell[0];
+    CHECK_EQ(got, source);
+
+    memory_stream w{"", "", 5};
+    std::vector<net::const_buffer> pieces;
+    for (auto i = 0U; i != count; ++i) pieces.push_back(net::buffer(&source[i], 1));
+    auto const wr = run_task(write_vec(w, pieces));
+    CHECK(not wr.ec);
+    CHECK_EQ(wr.value, static_cast<std::size_t>(count));
+    CHECK_EQ(w.output, source);
 }
 
 void read_reports_eof_with_partial_count() {
@@ -124,6 +177,24 @@ void read_until_finds_the_delimiter() {
     CHECK_EQ(r.value, 16U);
     CHECK_EQ(line.substr(0, r.value), "GET / HTTP/1.1\r\n");
     CHECK(line.size() >= r.value); // 分隔符之后的数据可能也已读入
+}
+
+// 空分隔符立即匹配（与 Asio 一致），不消费输入。
+auto read_line_with(memory_stream& s, std::string* line, std::string delimiter)
+    CO2_BEG((net::task<net::io_result<std::size_t>>), (s, line, delimiter), net::dynamic_container_buffer<std::string> buf{*line};
+            net::io_result<std::size_t> r;) {
+    CO2_AWAIT_SET(r, net::read_until(s, buf, delimiter));
+    CO2_RETURN(r);
+}
+CO2_END
+
+void read_until_empty_delimiter_matches_immediately() {
+    memory_stream s{"payload", "", 5};
+    std::string line;
+    auto const r = run_task(read_line_with(s, &line, ""));
+    CHECK(not r.ec);
+    CHECK_EQ(r.value, 0U);
+    CHECK_EQ(s.input, "payload");
 }
 
 void read_until_reports_eof() {
@@ -199,6 +270,8 @@ void operator delete(void* const p, std::size_t) noexcept { std::free(p); }
 
 int main() {
     read_fills_the_whole_buffer_across_partial_reads();
+    read_and_write_cover_sequences_longer_than_max_iovec();
+    read_until_empty_delimiter_matches_immediately();
     read_reports_eof_with_partial_count();
     write_pushes_everything_across_partial_writes();
     read_until_finds_the_delimiter();

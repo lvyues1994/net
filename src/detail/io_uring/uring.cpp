@@ -217,7 +217,9 @@ bool uring_available() noexcept {
     auto const fd = sys_io_uring_setup(2U, &params);
     if (fd < 0) return false;
     ::close(fd);
-    return (params.features & IORING_FEAT_NODROP) != 0U; // 需要 5.5+ 的语义（ACCEPT / CONNECT / ASYNC_CANCEL）
+    // 5.5+ 的语义（ACCEPT / CONNECT / ASYNC_CANCEL）与 5.11+ 的 EXT_ARG（带超时的等待用它）。
+    constexpr auto required = static_cast<unsigned>(IORING_FEAT_NODROP | IORING_FEAT_EXT_ARG);
+    return (params.features & required) == required;
 }
 
 } // namespace detail

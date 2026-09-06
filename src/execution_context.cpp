@@ -4,6 +4,14 @@
 
 namespace net {
 
+memory_resource* execution_context::built_in_frame_allocator() noexcept {
+#if defined(NET_DEFAULT_FRAME_ALLOCATOR_RECYCLING)
+    return default_frame_allocator_.get();
+#else
+    return new_delete_resource();
+#endif
+}
+
 execution_context::execution_context()
     : default_frame_allocator_{new recycling_memory_resource{}},
 #if defined(NET_DEFAULT_FRAME_ALLOCATOR_RECYCLING)

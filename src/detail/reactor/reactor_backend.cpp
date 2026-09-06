@@ -193,6 +193,11 @@ bool reactor_backend::start_op(descriptor_state& state, op_direction const direc
     return false;
 }
 
+void reactor_backend::clear_ready(descriptor_state& state, unsigned const bits) noexcept {
+    std::lock_guard<std::mutex> lock{mutex_};
+    state.ready &= ~bits;
+}
+
 bool reactor_backend::cancel_op(descriptor_state& state, op_direction const direction,
                                 reactor_op& op) noexcept {
     auto const index = static_cast<unsigned>(direction);

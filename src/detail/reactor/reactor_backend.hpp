@@ -48,6 +48,8 @@ struct reactor_backend final : execution_context::service, io_backend, event_sin
     // 启动操作。就绪位命中时先在调用线程上 perform()：完成则返回 true（调用方自己恢复
     // 协程，不会再调用 complete()）；否则排队并返回 false。
     bool start_op(descriptor_state& state, op_direction direction, reactor_op& op) noexcept;
+    // 丢掉尚未消费的就绪位（connect 之前：未连接套接字的初始"可写"是过期的）。
+    void clear_ready(descriptor_state& state, unsigned bits) noexcept;
     // 仍排队时摘下并以 operation_aborted 完成，返回 true；否则返回 false。
     bool cancel_op(descriptor_state& state, op_direction direction, reactor_op& op) noexcept;
     void cancel_ops(descriptor_state& state) noexcept;

@@ -164,7 +164,11 @@ struct uring_socket final : socket_impl {
 
     // 多发 accept 的 CQE（环锁内，由 uring_multishot_accept_op 转来）。
     void on_multishot_accept(int res, unsigned flags) noexcept;
-    bool multishot_wants_rearm() const noexcept { return acceptor_ && not acceptor_->broken; }
+    // 终止 CQE 后（环锁内、run 线程）：成功交付后立刻重新武装；终止错误（EMFILE 之类）不立刻重武装
+    //——那会在内核里原地打转（backlog 非空、fd 用尽）——而是留给下一次 accept() 重新武装。
+    bool multishot_wants_rearm() const noexcept {
+        return acceptor_ && not acceptor_->broken.load(std::memory_order_relaxed) && acceptor_->rearm_after_terminal;
+    }
 
   private:
     // 多发 accept 状态，只有监听套接字才分配（普通套接字不为它付一个字节的构造成本）。
@@ -174,8 +178,12 @@ struct uring_socket final : socket_impl {
         std::vector<int> parked;   // FIFO：[head, size) 是排队的 fd
         std::size_t head = 0;
         std::unique_ptr<uring_multishot_accept_op> op;
-        bool waiting = false; // read_op_ 作为 waiter 停着（不在环里）
-        bool broken = false;  // 内核拒绝了多发（-EINVAL）：退回每次 accept 一个 SQE
+        bool waiting = false;          // read_op_ 作为 waiter 停着（不在环里）
+        bool armed = false;            // 多发 SQE 在内核里（提交到终止 CQE 之间）
+        bool rearm_after_terminal = false; // 终止 CQE 后是否立刻重新武装（run 线程内读写）
+        int terminal_error = 0;        // 没有等待者时到达的终止错误（如 EMFILE），交给下一次 accept()
+        std::atomic<bool> broken{false}; // 内核拒绝了多发（-EINVAL）：退回每次 accept 一个 SQE。
+                                         // 锁外读（ready / suspend / cancel_op），故原子
 
         bool has_parked() const noexcept { return head != parked.size(); }
         int pop_parked() noexcept {
@@ -189,7 +197,10 @@ struct uring_socket final : socket_impl {
     };
 
     void finish(uring_socket_op& op) noexcept;
-    bool multishot_active() const noexcept { return acceptor_ && acceptor_->op && not acceptor_->broken; }
+    bool multishot_active() const noexcept {
+        return acceptor_ && acceptor_->op && not acceptor_->broken.load(std::memory_order_relaxed);
+    }
+    void rearm_multishot_accept() noexcept;
     void arm_multishot_accept() noexcept;
     void retire_multishot_accept() noexcept;
     void close_parked_fds() noexcept;

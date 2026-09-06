@@ -139,7 +139,11 @@ template <class... As> struct when_any_awaitable {
 
     coroutine_handle<> await_suspend(coroutine_handle<> const awaiting, io_env const* const env) {
         state.begin(awaiting, env, count);
-        start_all(std::make_index_sequence<count>{});
+        // 两阶段启动：先为全部子任务建好 runner（唯一可能抛出的步骤：帧分配、移动 awaitable），
+        // 再一次性武装并启动。若在第 k 个子任务处抛出，此前建好的 runner 都还没启动，销毁它们是
+        // 合法的；否则已经在飞的兄弟会带着指向本对象的续体被析构。
+        prepare_all(std::make_index_sequence<count>{});
+        launch_all(std::make_index_sequence<count>{});
         if (state.finish_start()) return awaiting;
         return noop_coroutine();
     }
@@ -163,18 +167,27 @@ template <class... As> struct when_any_awaitable {
     template <std::size_t I>
     using result_at = awaitable_result_t<typename std::tuple_element<I, std::tuple<As...>>::type>;
 
-    template <std::size_t... I> void start_all(std::index_sequence<I...>) {
-        int const ordered[] = {0, (start_one<I>(), 0)...};
+    template <std::size_t... I> void prepare_all(std::index_sequence<I...>) {
+        int const ordered[] = {0, (prepare_one<I>(), 0)...};
         static_cast<void>(ordered);
     }
 
-    template <std::size_t I> void start_one() {
+    template <std::size_t... I> void launch_all(std::index_sequence<I...>) noexcept {
+        int const ordered[] = {0, (launch_one<I>(), 0)...};
+        static_cast<void>(ordered);
+    }
+
+    template <std::size_t I> void prepare_one() {
         auto& slot = children[I];
         slot.owner = this;
         slot.index = I;
         slot.frame.set(&on_child_done<I>, &slot);
         slot.runner = make_runner(std::move(std::get<I>(awaitables)), &std::get<I>(results),
                                   std::is_void<result_at<I>>{});
+    }
+
+    template <std::size_t I> void launch_one() noexcept {
+        auto& slot = children[I];
         task_access::arm(slot.runner, slot.frame.handle(), &state.child_env);
         slot.runner.handle().resume();
     }
@@ -230,6 +243,7 @@ template <class A> struct when_any_range_awaitable {
 
     coroutine_handle<> await_suspend(coroutine_handle<> const awaiting, io_env const* const env) {
         state.begin(awaiting, env, awaitables.size());
+        // 两阶段启动（见定长版本）：先建全部 runner，再启动。
         for (auto index = std::size_t{}; index != awaitables.size(); ++index) {
             auto& slot = *children[index].slot;
             slot.owner = this;
@@ -237,6 +251,9 @@ template <class A> struct when_any_range_awaitable {
             slot.frame.set(&on_child_done, &slot);
             slot.runner = make_runner(std::move(awaitables[index]), &results[index],
                                       std::is_void<child_result>{});
+        }
+        for (auto index = std::size_t{}; index != awaitables.size(); ++index) {
+            auto& slot = *children[index].slot;
             task_access::arm(slot.runner, slot.frame.handle(), &state.child_env);
             slot.runner.handle().resume();
         }

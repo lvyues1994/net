@@ -110,17 +110,19 @@ struct is_buffer_range<T, Buffer, true>
 
 } // namespace detail
 
+// 单个缓冲区只认 mutable_buffer / const_buffer 本身（不接受"可转换为缓冲区"的用户类型：单元素遍历
+// 返回的是对象自身的地址，对转换产生的临时对象会悬空）。序列的元素可以是任何可转换为缓冲区的
+// 类型，遍历时逐个物化。
 template <class T>
 struct is_mutable_buffer_sequence
-    : std::integral_constant<
-          bool, std::is_convertible<typename std::decay<T>::type, mutable_buffer>::value ||
-                    detail::is_buffer_range<typename std::decay<T>::type, mutable_buffer>::value> {};
+    : std::integral_constant<bool, std::is_same<typename std::decay<T>::type, mutable_buffer>::value ||
+                                       detail::is_buffer_range<typename std::decay<T>::type, mutable_buffer>::value> {};
 
 template <class T>
 struct is_const_buffer_sequence
-    : std::integral_constant<
-          bool, std::is_convertible<typename std::decay<T>::type, const_buffer>::value ||
-                    detail::is_buffer_range<typename std::decay<T>::type, const_buffer>::value> {};
+    : std::integral_constant<bool, std::is_same<typename std::decay<T>::type, const_buffer>::value ||
+                                       std::is_same<typename std::decay<T>::type, mutable_buffer>::value ||
+                                       detail::is_buffer_range<typename std::decay<T>::type, const_buffer>::value> {};
 
 // ---- 统一遍历 ----
 
@@ -130,17 +132,15 @@ inline const_buffer const* buffer_sequence_begin(const_buffer const& b) noexcept
 inline const_buffer const* buffer_sequence_end(const_buffer const& b) noexcept { return &b + 1; }
 
 template <class Sequence,
-          class = typename std::enable_if<
-              not std::is_convertible<Sequence const&, const_buffer>::value &&
-              not std::is_convertible<Sequence const&, mutable_buffer>::value>::type>
+          class = typename std::enable_if<not std::is_same<typename std::decay<Sequence>::type, const_buffer>::value &&
+                                          not std::is_same<typename std::decay<Sequence>::type, mutable_buffer>::value>::type>
 auto buffer_sequence_begin(Sequence const& sequence) noexcept -> decltype(std::begin(sequence)) {
     return std::begin(sequence);
 }
 
 template <class Sequence,
-          class = typename std::enable_if<
-              not std::is_convertible<Sequence const&, const_buffer>::value &&
-              not std::is_convertible<Sequence const&, mutable_buffer>::value>::type>
+          class = typename std::enable_if<not std::is_same<typename std::decay<Sequence>::type, const_buffer>::value &&
+                                          not std::is_same<typename std::decay<Sequence>::type, mutable_buffer>::value>::type>
 auto buffer_sequence_end(Sequence const& sequence) noexcept -> decltype(std::end(sequence)) {
     return std::end(sequence);
 }
@@ -280,11 +280,20 @@ template <class Buffer, std::size_t N> struct buffer_array {
 
     buffer_array() noexcept = default;
 
-    // 跳过空缓冲区；超过 N 个的元素被截断（部分传输是合法的：调用方会再次调用）。
-    template <class Sequence> explicit buffer_array(Sequence const& sequence) noexcept {
+    // 跳过空缓冲区；超过 N 个的元素被截断（部分传输是合法的：*_some 的调用方会再次调用；组合算法
+    // read / write 用带 skip 的构造从上次消费到的位置重新展平，不会丢掉第 N 个之后的缓冲区）。
+    template <class Sequence> explicit buffer_array(Sequence const& sequence) noexcept : buffer_array{sequence, 0U} {}
+
+    // 跳过序列开头 skip 字节后展平接下来的至多 N 个非空缓冲区。
+    template <class Sequence> buffer_array(Sequence const& sequence, std::size_t skip) noexcept {
         auto const last = buffer_sequence_end(sequence);
         for (auto it = buffer_sequence_begin(sequence); it != last && count_ != N; ++it) {
-            auto const b = Buffer(*it);
+            auto b = Buffer(*it);
+            if (skip != 0U) {
+                auto const step = b.size() < skip ? b.size() : skip;
+                b += step;
+                skip -= step;
+            }
             if (b.size() == 0U) continue;
             buffers_[count_++] = b;
         }

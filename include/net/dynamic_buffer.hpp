@@ -100,6 +100,7 @@ template <class Container> struct dynamic_container_buffer {
         if (in_size_ > max_size_ || n > max_size_ - in_size_)
             throw std::length_error{"dynamic_container_buffer too long"};
         container_->resize(in_size_ + n);
+        if (container_->empty()) return mutable_buffer{nullptr, 0U}; // 空 vector 上 &(*c)[0] 是未定义行为
         return mutable_buffer{&(*container_)[0] + in_size_, n};
     }
 

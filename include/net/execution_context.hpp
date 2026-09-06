@@ -85,13 +85,9 @@ struct execution_context {
     void destroy() noexcept;
 
   private:
-    memory_resource* built_in_frame_allocator() noexcept {
-#if defined(NET_DEFAULT_FRAME_ALLOCATOR_RECYCLING)
-        return default_frame_allocator_.get();
-#else
-        return new_delete_resource();
-#endif
-    }
+    // 在 execution_context.cpp 里定义：取决于构建选项 NET_DEFAULT_FRAME_ALLOCATOR，不能内联在头里
+    //（不同 TU 看到不同宏会违反 ODR）。
+    memory_resource* built_in_frame_allocator() noexcept;
 
     template <class T, class = void> struct key_type_of {
         using type = T;

@@ -148,6 +148,65 @@ auto connect_only(net::tcp_socket* sock, net::ip::tcp::endpoint ep) CO2_BEG(net:
 }
 CO2_END
 
+// 先 open()，等一会（让反应器看到未连接套接字最初的 EPOLLOUT|EPOLLHUP 边沿并记下"可写"），再
+// connect 一个 accept 队列已满的监听端口：内核直接丢弃 SYN（tcp_abort_on_overflow=0，不回 RST），
+// 连接停在 SYN_SENT。connect 必须一直在进行（定时器赢），绝不能"成功"——过期的可写位曾让
+// connect 在 SYN 还在路上时就报成功，之后第一次写才看到错误。
+using connect_or_timeout = net::when_any_result<std::tuple<>>;
+
+// backlog 0 的监听套接字 + 一个已完成的连接把队列填满；返回监听端口（描述符由调用方持有）。
+struct full_backlog {
+    int listener = -1;
+    int filler = -1;
+    net::ip::tcp::endpoint endpoint;
+
+    full_backlog() {
+        listener = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        CHECK(listener >= 0);
+        sockaddr_in local{};
+        local.sin_family = AF_INET;
+        local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        CHECK(::bind(listener, reinterpret_cast<sockaddr const*>(&local), sizeof(local)) == 0);
+        CHECK(::listen(listener, 0) == 0);
+        socklen_t length = sizeof(local);
+        CHECK(::getsockname(listener, reinterpret_cast<sockaddr*>(&local), &length) == 0);
+        endpoint = net::ip::tcp::endpoint{net::ip::address_v4::loopback(), ntohs(local.sin_port)};
+        filler = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        CHECK(filler >= 0);
+        CHECK(::connect(filler, reinterpret_cast<sockaddr const*>(&local), sizeof(local)) == 0); // 占满队列
+    }
+    ~full_backlog() {
+        ::close(filler);
+        ::close(listener);
+    }
+};
+
+auto open_idle_then_connect(net::io_context* ctx, net::ip::tcp::endpoint ep, connect_or_timeout* out, bool* really_connected)
+    CO2_BEG(net::task<>, (ctx, ep, out, really_connected), net::tcp_socket sock{*ctx}; net::steady_timer timer{*ctx};
+            net::io_result<> t; std::error_code ec;) {
+    CHECK(not sock.open(net::ip::tcp::v4()));
+    timer.expires_after(milliseconds{5});
+    CO2_AWAIT_SET(t, timer.wait());
+    timer.expires_after(milliseconds{150});
+    CO2_AWAIT_SET(*out, net::when_any(sock.connect(ep), timer.wait()));
+    sock.remote_endpoint(ec);
+    *really_connected = not ec;
+}
+CO2_END
+
+void connect_after_idle_open_never_reports_a_false_success() {
+    test_context ctx{2}; // 第二个线程让反应器在 open 与 connect 之间有机会轮询
+    full_backlog blackhole;
+    connect_or_timeout result;
+    auto connected = true;
+    net::run_async(ctx.get_executor())(open_idle_then_connect(&ctx, blackhole.endpoint, &result, &connected));
+    std::thread second{[&] { ctx.run(); }};
+    ctx.run();
+    second.join();
+    CHECK_EQ(result.index, 1U); // 定时器赢：连接仍在进行
+    CHECK(not connected);
+}
+
 struct connected_pair {
     test_context ctx;
     net::tcp_acceptor acceptor{ctx, net::ip::tcp::endpoint{net::ip::address_v4::loopback(), 0}};
@@ -526,6 +585,7 @@ void endpoints_and_options() {
 int main() {
     loopback_echo();
     connect_to_a_closed_port_fails();
+    connect_after_idle_open_never_reports_a_false_success();
     cancel_aborts_a_pending_read();
     close_aborts_a_pending_read();
     stop_token_aborts_a_pending_read();

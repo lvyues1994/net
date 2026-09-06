@@ -86,13 +86,36 @@ template <class Ex> struct strand_impl : std::enable_shared_from_this<strand_imp
             self->head = nullptr;
             self->tail = nullptr;
         }
-        {
+        try {
             strand_call_stack::scope scope{self};
             while (batch != nullptr) {
                 auto* const c = batch;
                 batch = c->next;
                 safe_resume(c->h);
             }
+        } catch (...) {
+            // 某个续体抛出（例如 run_async 默认的 rethrow_error）：不能带着 locked == true 和一批未
+            // 恢复的续体离开——那会让这个 strand 之后吞掉所有投递。把剩余批次放回队首、重新排队
+            // 排空帧，再把异常交给执行器的 run()。
+            std::unique_lock<std::mutex> lock{self->mutex};
+            if (batch != nullptr) {
+                auto* last = batch;
+                while (last->next != nullptr)
+                    last = last->next;
+                last->next = self->head;
+                self->head = batch;
+                if (self->tail == nullptr) self->tail = last;
+            }
+            if (self->head == nullptr) {
+                self->locked = false;
+                lock.unlock();
+                keep.reset(); // 可能销毁 self，此后不再触碰
+                throw;
+            }
+            self->keepalive = std::move(keep);
+            lock.unlock();
+            self->executor.post(self->drain_cont);
+            throw;
         }
         std::unique_lock<std::mutex> lock{self->mutex};
         if (self->head == nullptr) {

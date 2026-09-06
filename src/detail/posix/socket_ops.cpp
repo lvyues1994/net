@@ -144,6 +144,16 @@ std::error_code connect_result(int const fd) noexcept {
     return pending_error == 0 ? std::error_code{} : std::error_code{pending_error, std::system_category()};
 }
 
+connect_outcome connect_completed(int const fd) noexcept {
+    auto const ec = connect_result(fd);
+    if (ec) return connect_outcome{true, ec};
+    sockaddr_storage peer{};
+    auto length = static_cast<socklen_t>(sizeof(peer));
+    if (::getpeername(fd, reinterpret_cast<sockaddr*>(&peer), &length) == 0) return connect_outcome{true, {}};
+    if (errno == ENOTCONN) return connect_outcome{false, {}}; // 还在 SYN_SENT：可写位是过期的
+    return connect_outcome{true, last_error()};
+}
+
 } // namespace posix
 } // namespace detail
 } // namespace net
