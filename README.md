@@ -191,12 +191,18 @@ Linux 7.0，单线程：
 | --- | --- | --- | --- | --- |
 | TCP 回显往返 64 B（µs） | 4.85 | 4.88 | 4.99 | 4.95 |
 | TCP 回显往返 4 KiB（µs） | 5.30 | 5.34 | 5.42 | 5.42 |
-| TCP 吞吐，64 KiB 写（MiB/s） | 10006 | 9564 | 10171 | 9981 |
+| TCP 吞吐，64 KiB 写（MiB/s，5 次运行的范围） | 9736–9984 | 9731–10520 | 9885–10709 | 9798–10399 |
 | 定时器到期 + 恢复（µs） | 2.94 | 3.00 | 2.79 | 1.97 |
 
-一个连接的回环里四种后端的差别在噪声之内（瓶颈是 4 次系统调用 + 2 次唤醒）；io_uring 的
-定时器（`IORING_OP_TIMEOUT`）比就绪型后端的定时器堆 + 解复用器超时快约 1 µs。TLS 的数字
-（OpenSSL 与 BoringSSL 对照）见 `docs/tls.md`。
+一个连接的回环里四种后端的差别在噪声之内：吞吐行单次运行的波动就有 ±5%，瓶颈是内核回环
+路径里的两次内存拷贝，事件机制只占很小一部分。io_uring 在这条基准里**不会**比 epoll 快，
+这是结构性的（`strace -c` 可验证，`bench_net --backend io_uring`）：实现先做一次投机的非阻塞
+系统调用，命中时两者都是 1 次系统调用；未命中时 epoll 是 `read`(EAGAIN) + `epoll_wait` 两次，
+io_uring 是 `read`(EAGAIN) + `io_uring_enter`(提交) + `io_uring_enter`(等待) 三次。io_uring 的
+收益来自单连接 ping-pong 之外的东西——多连接下一次 `io_uring_enter` 批量提交、多发
+（multishot）接收、注册缓冲区、零拷贝发送——这些本实现尚未使用。io_uring 的定时器
+（`IORING_OP_TIMEOUT`）比就绪型后端的定时器堆 + 解复用器超时快约 1 µs。TLS 的数字（OpenSSL 与
+BoringSSL 对照）见 `docs/tls.md`。
 
 ## 目录
 

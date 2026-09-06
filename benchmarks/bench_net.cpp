@@ -163,10 +163,16 @@ void bench_backend(bench::options const& o, net::backend_kind const kind, std::v
 
 int main(int argc, char** argv) {
     auto const o = bench::options::parse(argc, argv);
+    // --backend <epoll|poll|select|io_uring>：只跑一个后端（便于 strace / perf 单独观察）。
+    std::string only;
+    for (auto i = 1; i < argc; ++i)
+        if (std::string{argv[i]} == "--backend" && i + 1 < argc) only = argv[++i];
     std::vector<bench::result> results;
     for (auto const kind : {net::backend_kind::epoll, net::backend_kind::poll, net::backend_kind::select,
-                            net::backend_kind::io_uring})
+                            net::backend_kind::io_uring}) {
+        if (not only.empty() && only != net::to_string(kind)) continue;
         bench_backend(o, kind, results);
+    }
     bench::print_table("net backend benchmarks (single-threaded io_context, loopback)", results);
     return 0;
 }
