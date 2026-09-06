@@ -42,6 +42,11 @@ struct tcp_socket : socket_base {
         return assign_raw(protocol.family(), protocol.type(), protocol.protocol(), fd);
     }
 
+    // 内部：接受器交来的、已非阻塞 + CLOEXEC 的描述符。
+    std::error_code adopt_accepted(protocol_type const& protocol, native_handle_type const fd) noexcept {
+        return adopt_raw(protocol.family(), protocol.type(), protocol.protocol(), fd);
+    }
+
     std::error_code bind(endpoint_type const& endpoint) noexcept {
         return bind_raw(endpoint.data(), static_cast<socklen_t>(endpoint.size()));
     }

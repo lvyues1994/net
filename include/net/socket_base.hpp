@@ -157,6 +157,8 @@ struct socket_base {
   protected:
     std::error_code open_raw(int family, int type, int protocol) noexcept;
     std::error_code assign_raw(int family, int type, int protocol, native_handle_type fd) noexcept;
+    // 描述符由本库创建（已非阻塞 + CLOEXEC）：accept 的对端套接字用它。
+    std::error_code adopt_raw(int family, int type, int protocol, native_handle_type fd) noexcept;
     std::error_code bind_raw(sockaddr const* address, socklen_t length) noexcept;
     std::error_code listen_raw(int backlog) noexcept;
     std::error_code shutdown_raw(int how) noexcept;

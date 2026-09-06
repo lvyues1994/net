@@ -147,10 +147,16 @@ target_link_libraries(my-target PRIVATE net::net)
 异常）、定时器、TCP 回环（取消、EOF、超时、多线程、接受器：连接先到后取 / 取消 / 关闭丢弃排队连接 / assign
 已监听的描述符）、UDP、DNS、信号、TLS（握手 / 回显 /
 干净关闭、证书与主机名校验失败、验证回调、传输截断、ALPN、3 MiB 经 `any_stream` 传输、取消、
-版本不匹配、拥有式流与移动），以及一个契约违规测试。平台测试为 epoll / poll / select /
-io_uring 各编译一个变体（`<name>`、`<name>_poll`、`<name>_select`、`<name>_io_uring`），后端
-不可用时以退出码 77 跳过；共 34 个，全部在 ASan+UBSan+LSan 与 TSan 下、OpenSSL 与 BoringSSL
-两个提供者下通过。
+版本不匹配、拥有式流与移动、同一条流上全双工、`when_any` 握手超时、多线程 + strand 会话），以及
+一个契约违规测试。`stress_tests` 把这些原语组合起来放到 4 个线程上加随机性：回显风暴、
+多线程 `when_any(read, timer)`、随机时刻的取消风暴、200 个随机到期 / 随机取消的定时器、64 个
+并发连接的接受风暴、io_context 与 thread_pool 交替、strand 串行化、按种子随机动作的混沌会话、
+`stop()` / `restart()` / `run_for` 带着在飞操作、UDP `when_any`（`stress_tests <名字>` 单跑，
+`NET_TEST_REPEAT=n` 重复）。平台测试为 epoll / poll / select / io_uring 各编译一个变体
+（`<name>`、`<name>_poll`、`<name>_select`、`<name>_io_uring`），后端不可用时以退出码 77 跳过；
+共 38 个，全部在 ASan+UBSan+LSan 与 TSan 下（含 `taskset -c 0,1` 模拟 CI 的 2 核调度反复运行）、
+OpenSSL 与 BoringSSL 两个提供者下通过。TSan 只抑制未插桩的 libcrypto / libssl 内部
+（`tests/tsan.supp`）。
 
 CI（`.github/workflows/ci.yml`）：GCC / Clang × Debug / Release × 两种默认帧分配器的构建与
 测试、ASan+UBSan 与 TSan 全量运行、BoringSSL 提供者作业（FetchContent 构建并缓存）、quick 模式
@@ -164,8 +170,11 @@ CI（`.github/workflows/ci.yml`）：GCC / Clang × Debug / Release × 两种默
 ## 性能
 
 `benchmarks/`（`-DNET_BUILD_BENCHMARKS=ON`，Release；`--quick` 供 CI）。无第三方依赖的小
-harness：多轮取中位数，全局 `operator new` 计数给出 allocs/op。i7-13700KF、GCC 13 -O3、
-Linux 7.0，单线程：
+harness：多轮取中位数，全局 `operator new` 计数给出 allocs/op。**与 Boost.Asio 的逐行对照
+（callbacks 与 C++20 awaitable 两种写法）见 `docs/benchmarks.md`**：协程机制与执行器 hop 同一
+量级或更快（启动一条链快 3 倍），定时器快 20%，TCP 往返慢 10–15%（系统调用数相同，差在每次
+完成经 io_context 互斥锁三次；Asio 用线程局部私有队列 + 原子工作计数——已列为下一步优化）。
+i7-13700KF、GCC 13 -O3、Linux 7.0，单线程：
 
 | 核心路径（`bench_core`） | ns/op | allocs/op |
 | --- | --- | --- |
@@ -220,8 +229,8 @@ src/detail/posix/       POSIX 系统调用封装
 src/detail/reactor/     就绪型后端族：reactor_backend + epoll / poll / select 解复用器
 src/detail/io_uring/    完成型后端：裸系统调用的 io_uring 环、提交/取消/收割、套接字与定时器实现
 src/tls/                TLS 引擎（OpenSSL API 子集，OpenSSL / BoringSSL 共用）与驱动协程
-benchmarks/             bench_core / bench_net / bench_tls 与 harness
-docs/                   architecture.md（分层与决策）、backends.md（后端设计与 io_uring / IOCP 接入）、tls.md
+benchmarks/             bench_core / bench_net / bench_tls / bench_asio（Boost.Asio 对照）与 harness
+docs/                   architecture.md（分层与决策）、backends.md（后端设计与 io_uring / IOCP 接入）、tls.md、benchmarks.md（与 Asio 对照）
 tests/  examples/  .github/workflows/ci.yml
 ```
 

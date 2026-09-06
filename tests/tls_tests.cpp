@@ -2,9 +2,12 @@
 // any_stream（类型擦除的 TLS）、取消、协议版本不匹配、上下文配置错误。OpenSSL 与 BoringSSL
 // 共用（差异处按 is_boringssl() 分支）。
 
+#include <atomic>
 #include <chrono>
 #include <cstring>
+#include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "net/any_stream.hpp"
@@ -12,6 +15,7 @@
 #include "net/io_context.hpp"
 #include "net/ip.hpp"
 #include "net/run_async.hpp"
+#include "net/strand.hpp"
 #include "net/stream.hpp"
 #include "net/task.hpp"
 #include "net/tcp.hpp"
@@ -20,6 +24,7 @@
 #include "net/tls/error.hpp"
 #include "net/tls/stream.hpp"
 #include "net/when_all.hpp"
+#include "net/when_any.hpp"
 
 #include "check.hpp"
 #include "tls_test_certs.hpp"
@@ -451,6 +456,153 @@ void owning_stream_and_move() {
     CHECK_EQ(reply, "owned");
 }
 
+// ---------------------------------------------------------------------------
+// 组合：全双工（同一条 TLS 流上读与写并发——写门闩、KeyUpdate 应答等都走这条路）、握手超时
+//（when_any 取消握手中的底层读）、多线程 io_context 上每个会话一个 strand。
+
+auto duplex_side(net::tls::openssl_stream* tls, net::tls::role r, std::size_t count, std::size_t* received)
+    CO2_BEG(net::task<>, (tls, r, count, received), net::io_result<> h; net::any_stream erased{tls};
+            std::tuple<std::size_t, std::size_t> both; net::io_result<> s;) {
+    CO2_AWAIT_SET(h, tls->handshake(r));
+    CHECK(not h.ec);
+    // 同时发 count 字节、收 count 字节。
+    CO2_AWAIT_SET(both, net::when_all(source_all(erased, count), sink_all(erased, count)));
+    CHECK_EQ(std::get<0>(both), count);
+    *received = std::get<1>(both);
+    if (r == net::tls::role::client) {
+        CO2_AWAIT_SET(s, tls->shutdown());
+        CHECK(not s.ec);
+    }
+}
+CO2_END
+
+auto server_duplex_then_shutdown(net::tls::openssl_stream* tls, std::size_t count, std::size_t* received)
+    CO2_BEG(net::task<>, (tls, count, received), char buf[8]; net::io_result<std::size_t> r; net::io_result<> s;) {
+    CO2_AWAIT(duplex_side(tls, net::tls::role::server, count, received));
+    // 客户端先 shutdown：读到 eof 后回 close_notify。
+    CO2_AWAIT_SET(r, tls->read_some(net::buffer(buf)));
+    CHECK(r.ec == net::error::eof);
+    CO2_AWAIT_SET(s, tls->shutdown());
+    CHECK(not s.ec);
+}
+CO2_END
+
+void full_duplex_on_one_stream() {
+    connected_pair pair;
+    auto server_ctx = server_context();
+    auto client_ctx = client_context();
+    net::tls::openssl_stream server{&pair.server, server_ctx};
+    net::tls::openssl_stream client{&pair.client, client_ctx};
+    client.set_hostname("localhost");
+    constexpr std::size_t count = 512U * 1024U + 333U;
+    auto server_got = std::size_t{};
+    auto client_got = std::size_t{};
+    net::run_async(pair.ctx.get_executor())(server_duplex_then_shutdown(&server, count, &server_got));
+    net::run_async(pair.ctx.get_executor())(duplex_side(&client, net::tls::role::client, count, &client_got));
+    pair.ctx.run();
+    CHECK_EQ(server_got, count);
+    CHECK_EQ(client_got, count);
+}
+
+using handshake_or_timeout = net::when_any_result<std::tuple<>>; // 两个子任务载荷都为空：同类，不是 tuple
+
+auto handshake_with_timeout(net::io_context* ctx, net::tls::stream* tls, handshake_or_timeout* out)
+    CO2_BEG(net::task<>, (ctx, tls, out), net::steady_timer timer{*ctx};) {
+    timer.expires_after(milliseconds{30});
+    CO2_AWAIT_SET(*out, net::when_any(tls->handshake(net::tls::role::client), timer.wait()));
+}
+CO2_END
+
+void handshake_timeout_via_when_any() {
+    connected_pair pair; // 服务端从不握手
+    auto client_ctx = client_context();
+    net::tls::openssl_stream client{&pair.client, client_ctx};
+    handshake_or_timeout result;
+    net::run_async(pair.ctx.get_executor())(handshake_with_timeout(&pair.ctx, &client, &result));
+    pair.ctx.run();
+    CHECK_EQ(result.index, 1U); // 定时器赢；握手内部的读以 operation_aborted 结束并被丢弃
+    CHECK(not result.ec);
+}
+
+// 每个会话一个 strand：会话的两端各自在自己的 strand 上跑（一条 TLS 流上的全部操作都在同一个
+// strand 里），io_context 用 4 个线程。
+auto tls_server_echo_rounds(net::tls::openssl_stream* tls, int rounds, std::atomic<long>* echoed)
+    CO2_BEG(net::task<>, (tls, rounds, echoed), net::io_result<> h; int i{}; char buf[128]; net::io_result<std::size_t> r;
+            net::io_result<std::size_t> w; net::io_result<> s;) {
+    CO2_AWAIT_SET(h, tls->handshake(net::tls::role::server));
+    CHECK(not h.ec);
+    for (i = 0; i != rounds; ++i) {
+        CO2_AWAIT_SET(r, tls->read_some(net::buffer(buf)));
+        CHECK(not r.ec);
+        CO2_AWAIT_SET(w, net::write(*tls, net::buffer(buf, r.value)));
+        CHECK(not w.ec);
+        echoed->fetch_add(static_cast<long>(w.value));
+    }
+    CO2_AWAIT_SET(r, tls->read_some(net::buffer(buf)));
+    CHECK(r.ec == net::error::eof);
+    CO2_AWAIT_SET(s, tls->shutdown());
+    CHECK(not s.ec);
+}
+CO2_END
+
+auto tls_client_rounds(net::tls::openssl_stream* tls, int rounds, std::atomic<long>* sent)
+    CO2_BEG(net::task<>, (tls, rounds, sent), net::io_result<> h; int i{}; std::string payload; std::string reply;
+            net::io_result<std::size_t> w; net::io_result<std::size_t> r; net::io_result<> s;) {
+    CO2_AWAIT_SET(h, tls->handshake(net::tls::role::client));
+    CHECK(not h.ec);
+    for (i = 0; i != rounds; ++i) {
+        payload.assign(static_cast<std::size_t>(1 + (i * 13) % 100), static_cast<char>('a' + i % 26));
+        reply.assign(payload.size(), '\0');
+        CO2_AWAIT_SET(w, net::write(*tls, net::buffer(payload)));
+        CHECK(not w.ec);
+        CO2_AWAIT_SET(r, net::read(*tls, net::buffer(reply)));
+        CHECK(not r.ec);
+        CHECK(reply == payload);
+        sent->fetch_add(static_cast<long>(payload.size()));
+    }
+    CO2_AWAIT_SET(s, tls->shutdown());
+    CHECK(not s.ec);
+}
+CO2_END
+
+struct tls_session_pair {
+    net::tcp_socket client;
+    net::tcp_socket server;
+    std::unique_ptr<net::tls::openssl_stream> client_tls;
+    std::unique_ptr<net::tls::openssl_stream> server_tls;
+};
+
+void multithreaded_sessions_each_on_a_strand() {
+    test_context ctx{4};
+    net::tcp_acceptor acceptor{ctx, net::ip::tcp::endpoint{net::ip::address_v4::loopback(), 0}};
+    auto server_ctx = server_context();
+    auto client_ctx = client_context();
+    constexpr auto sessions = 8;
+    constexpr auto rounds = 20;
+    std::vector<tls_session_pair> pairs(sessions);
+    for (auto& p : pairs) {
+        p.client = net::tcp_socket{ctx};
+        net::run_async(ctx.get_executor())(accept_into(&acceptor, &p.server));
+        net::run_async(ctx.get_executor())(connect_to(&p.client, loopback_endpoint(acceptor)));
+        ctx.run();
+        ctx.restart();
+        p.client_tls.reset(new net::tls::openssl_stream{&p.client, client_ctx});
+        p.client_tls->set_hostname("localhost");
+        p.server_tls.reset(new net::tls::openssl_stream{&p.server, server_ctx});
+    }
+    std::atomic<long> sent{0};
+    std::atomic<long> echoed{0};
+    for (auto& p : pairs) {
+        net::run_async(net::make_strand(ctx.get_executor()))(tls_server_echo_rounds(p.server_tls.get(), rounds, &echoed));
+        net::run_async(net::make_strand(ctx.get_executor()))(tls_client_rounds(p.client_tls.get(), rounds, &sent));
+    }
+    std::vector<std::thread> threads;
+    for (auto i = 0; i != 4; ++i) threads.emplace_back([&] { ctx.run(); });
+    for (auto& t : threads) t.join();
+    CHECK(sent.load() > 0);
+    CHECK_EQ(sent.load(), echoed.load());
+}
+
 } // namespace
 
 int main() {
@@ -466,6 +618,9 @@ int main() {
     protocol_version_mismatch_fails();
     context_reports_configuration_errors();
     owning_stream_and_move();
+    full_duplex_on_one_stream();
+    handshake_timeout_via_when_any();
+    multithreaded_sessions_each_on_a_strand();
     std::cout << "tls tests passed (" << net::tls::provider_name() << ")\n";
     return 0;
 }

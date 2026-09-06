@@ -29,15 +29,19 @@ struct result {
 struct options {
     bool quick = false;
     std::size_t rounds = 5;
+    std::string only; // 只跑名字包含它的行（便于 strace / perf 单独观察）
 
     static options parse(int const argc, char** const argv) {
         options o;
         for (auto i = 1; i < argc; ++i) {
             if (std::strcmp(argv[i], "--quick") == 0) o.quick = true;
             if (std::strcmp(argv[i], "--rounds") == 0 && i + 1 < argc) o.rounds = static_cast<std::size_t>(std::atoi(argv[++i]));
+            if (std::strcmp(argv[i], "--only") == 0 && i + 1 < argc) o.only = argv[++i];
         }
         return o;
     }
+
+    bool selected(std::string const& name) const noexcept { return only.empty() || name.find(only) != std::string::npos; }
 
     std::size_t scale(std::size_t const n) const noexcept { return quick ? std::max<std::size_t>(n / 20U, 1U) : n; }
 };
@@ -45,6 +49,7 @@ struct options {
 // body(iterations) 执行 iterations 次操作；预热一轮后测 rounds 轮取中位数。
 template <class Body>
 result run(options const& o, std::string name, std::size_t const iterations, Body&& body, std::string note = {}) {
+    if (not o.selected(name)) return result{std::move(name), 0.0, 0.0, 0U, "skipped"};
     body(iterations / 10U + 1U); // 预热（帧分配器缓存、页）
     std::vector<double> samples;
     auto total_allocs = 0.0;
@@ -67,9 +72,11 @@ inline void print_table(char const* const title, std::vector<result> const& resu
     std::printf("\n%s\n", title);
     std::printf("%-46s %12s %10s %10s  %s\n", "benchmark", "ns/op", "allocs/op", "iters", "note");
     std::printf("%-46s %12s %10s %10s  %s\n", "---------", "-----", "---------", "-----", "----");
-    for (auto const& r : results)
+    for (auto const& r : results) {
+        if (r.iterations == 0U) continue; // --only 过滤掉的
         std::printf("%-46s %12.1f %10.3f %10zu  %s\n", r.name.c_str(), r.ns_per_op, r.allocs_per_op, r.iterations,
                     r.note.c_str());
+    }
     std::fflush(stdout);
 }
 

@@ -85,7 +85,8 @@ jobs:
             prefix: ""
           - name: TSan
             flags: -fsanitize=thread -fno-omit-frame-pointer
-            env: TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1
+            # suppressions：只抑制未插桩的 libcrypto / libssl 内部（见 tests/tsan.supp）
+            env: TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1:suppressions=$GITHUB_WORKSPACE/tests/tsan.supp
             # 新内核的 ASLR 布局与 TSan 的影子内存冲突：关掉本进程的 ASLR。
             prefix: setarch x86_64 -R
     steps:
@@ -199,7 +200,7 @@ jobs:
       - name: Install packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build libssl-dev
+          sudo apt-get install -y ninja-build libssl-dev libboost-dev
 
       - name: Configure
         run: |
@@ -221,6 +222,7 @@ jobs:
             ./bench_core --quick
             ./bench_net --quick
             ./bench_tls --quick
+            [ -x ./bench_asio ] && ./bench_asio --quick
           } | tee ../../benchmark-results.txt
           {
             echo '## Benchmarks (quick mode, shared CI runner: numbers are indicative only)'

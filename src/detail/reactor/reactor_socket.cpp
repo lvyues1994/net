@@ -85,18 +85,23 @@ reactor_socket::~reactor_socket() {
 
 std::error_code reactor_socket::open(int const family, int const type, int const protocol) noexcept {
     if (fd_ >= 0) return make_error_code(error::already_open);
-    auto const created = posix::create_socket(family, type, protocol);
+    auto const created = posix::create_socket(family, type, protocol); // 已带 SOCK_NONBLOCK | SOCK_CLOEXEC
     if (created < 0) return posix::last_error();
-    auto const ec = assign(family, type, protocol, created);
+    auto const ec = adopt(family, type, protocol, created);
     if (ec) posix::close_socket(created);
     return ec;
 }
 
-std::error_code reactor_socket::assign(int, int, int, int const fd) noexcept {
+std::error_code reactor_socket::assign(int const family, int const type, int const protocol, int const fd) noexcept {
     if (fd_ >= 0) return make_error_code(error::already_open);
-    auto ec = posix::set_nonblocking_cloexec(fd);
+    auto const ec = posix::set_nonblocking_cloexec(fd);
     if (ec) return ec;
-    ec = backend_->register_descriptor(state_, fd);
+    return adopt(family, type, protocol, fd);
+}
+
+std::error_code reactor_socket::adopt(int, int, int, int const fd) noexcept {
+    if (fd_ >= 0) return make_error_code(error::already_open);
+    auto const ec = backend_->register_descriptor(state_, fd);
     if (ec) return ec;
     fd_ = fd;
     return {};

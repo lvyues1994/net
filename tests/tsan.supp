@@ -1,0 +1,7 @@
+# ThreadSanitizer 抑制：只针对未插桩的 OpenSSL / BoringSSL 内部。
+#
+# 多个线程共享一个 tls::context（SSL_CTX）时，libcrypto 内部的证书存储 / ASN1 缓存用自己的锁与
+# 原子引用计数同步；TSan 看不到未插桩库里的原子操作，会把它们报成竞争（两侧栈都在 libcrypto
+# 里）。本库自己的代码不在抑制范围内。用法：TSAN_OPTIONS=suppressions=tests/tsan.supp
+race:libcrypto.so
+race:libssl.so

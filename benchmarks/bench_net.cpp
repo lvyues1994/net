@@ -2,6 +2,8 @@
 // 调度开销。单线程 io_context，一个连接。
 
 #include <chrono>
+
+#include <sys/socket.h>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -116,12 +118,14 @@ auto accept_n(net::tcp_acceptor* acceptor, std::size_t n)
 }
 CO2_END
 
-// 客户端依次建立 n 个连接（每个连上即关）。
+// 客户端依次建立 n 个连接（每个连上即关）。SO_LINGER{0}：关闭时发 RST 而不进 TIME_WAIT——
+// 否则十几万个连接后内核的 TIME_WAIT 表让 connect 变慢 4 倍，数字取决于之前跑过什么。
 auto connect_n(net::io_context* ctx, net::ip::tcp::endpoint ep, std::size_t n)
-    CO2_BEG(net::task<>, (ctx, ep, n), std::size_t i{}; net::tcp_socket sock{*ctx}; net::io_result<> c;) {
+    CO2_BEG(net::task<>, (ctx, ep, n), std::size_t i{}; net::tcp_socket sock{*ctx}; net::io_result<> c; ::linger lg{1, 0};) {
     for (i = 0; i != n; ++i) {
         sock.close();
         sock.open(net::ip::tcp::v4());
+        ::setsockopt(sock.native_handle(), SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
         CO2_AWAIT_SET(c, sock.connect(ep));
         if (c.ec) break;
     }

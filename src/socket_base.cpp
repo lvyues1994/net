@@ -114,6 +114,11 @@ std::error_code socket_base::open_raw(int const family, int const type, int cons
     return impl_->open(family, type, protocol);
 }
 
+std::error_code socket_base::adopt_raw(int const family, int const type, int const protocol,
+                                       native_handle_type const fd) noexcept {
+    return impl_->adopt(family, type, protocol, fd);
+}
+
 std::error_code socket_base::assign_raw(int const family, int const type, int const protocol,
                                         native_handle_type const fd) noexcept {
     CO2_CONTRACT_CHECK(impl_ != nullptr);

@@ -131,6 +131,7 @@ struct uring_socket final : socket_impl {
 
     std::error_code open(int family, int type, int protocol) noexcept override;
     std::error_code assign(int family, int type, int protocol, int fd) noexcept override;
+    std::error_code adopt(int family, int type, int protocol, int fd) noexcept override;
     std::error_code close() noexcept override;
     void cancel() noexcept override;
     int release() noexcept override;

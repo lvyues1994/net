@@ -94,7 +94,7 @@ io_result<tcp_socket> tcp_accept_awaitable::await_resume() noexcept {
     if (result.ec || fd < 0) return result;
     auto const protocol = family == AF_INET6 ? ip::tcp::v6() : ip::tcp::v4();
     auto peer = tcp_socket{impl->context()};
-    result.ec = peer.assign(protocol, fd);
+    result.ec = peer.adopt_accepted(protocol, fd); // accept4(SOCK_NONBLOCK | SOCK_CLOEXEC) 出来的
     if (result.ec) {
         ::close(fd);
         return result;
