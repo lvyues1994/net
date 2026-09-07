@@ -18,6 +18,7 @@
 #include "net/io_awaitable_promise_base.hpp"
 #include "net/io_env.hpp"
 #include "net/io_result.hpp"
+#include "net/local.hpp"
 #include "net/memory_resource.hpp"
 #include "net/run.hpp"
 #include "net/run_async.hpp"

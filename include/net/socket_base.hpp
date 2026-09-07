@@ -174,9 +174,9 @@ struct socket_base {
     // 未打开时先按给定协议打开。
     socket_connect_awaitable start_connect(sockaddr const* address, socklen_t length, int family,
                                            int type, int protocol) noexcept;
-    // sender 指向至少 capacity 字节的地址存储，由内核回填。
+    // sender 指向至少 capacity 字节的地址存储，由内核回填；sender_length 非空时收到实际地址长度。
     socket_read_awaitable start_receive_from(span<mutable_buffer const> buffers, sockaddr* sender,
-                                             socklen_t capacity) noexcept;
+                                             socklen_t capacity, socklen_t* sender_length = nullptr) noexcept;
     socket_write_awaitable start_send_to(span<const_buffer const> buffers, sockaddr const* target,
                                          socklen_t length) noexcept;
 

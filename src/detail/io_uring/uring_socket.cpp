@@ -127,8 +127,12 @@ void uring_socket_op::on_complete(int const res, unsigned) noexcept {
         ec = res == 0 ? make_error_code(error::eof) : std::error_code{};
         bytes_transferred = static_cast<std::size_t>(res);
         return;
-    case kind::write:
     case kind::receive_from:
+        if (address_out != nullptr && address_length_out != nullptr) *address_length_out = message.msg_namelen;
+        ec.clear();
+        bytes_transferred = static_cast<std::size_t>(res);
+        return;
+    case kind::write:
     case kind::send_to:
         ec.clear();
         bytes_transferred = static_cast<std::size_t>(res);
@@ -388,12 +392,13 @@ void uring_socket::begin_write(span<const_buffer const> const buffers) noexcept 
 }
 
 void uring_socket::begin_receive_from(span<mutable_buffer const> const buffers, sockaddr* const sender,
-                                      socklen_t const capacity) noexcept {
+                                      socklen_t const capacity, socklen_t* const sender_length) noexcept {
     CO2_CONTRACT_CHECK(not read_op_.pending);
     read_op_.op_kind = uring_socket_op::kind::receive_from;
     read_op_.read_buffers = mutable_buffer_array<>{buffers};
     read_op_.address_out = sender;
     read_op_.address_length = capacity;
+    read_op_.address_length_out = sender_length;
 }
 
 void uring_socket::begin_send_to(span<const_buffer const> const buffers, sockaddr const* const target,
@@ -458,7 +463,7 @@ bool uring_socket::ready(op_direction const direction) noexcept {
     case uring_socket_op::kind::receive_from: {
         if (op.read_buffers.total_size() == 0U) break;
         if (not spec.may_read()) return false;
-        auto const outcome = posix::recvmsg(fd_, op.read_buffers, op.address_out, op.address_length);
+        auto const outcome = posix::recvmsg(fd_, op.read_buffers, op.address_out, op.address_length, op.address_length_out);
         if (not outcome.done) {
             spec.on_read_exhausted();
             return false;

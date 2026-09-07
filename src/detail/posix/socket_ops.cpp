@@ -84,7 +84,7 @@ io_outcome writev(int const fd, const_buffer_array<> const& buffers) noexcept {
 }
 
 io_outcome recvmsg(int const fd, mutable_buffer_array<> const& buffers, sockaddr* const sender,
-                   socklen_t const capacity) noexcept {
+                   socklen_t const capacity, socklen_t* const sender_length) noexcept {
     iovec vectors[max_iovec];
     auto const count = fill_iovec(vectors, buffers);
     for (;;) {
@@ -95,6 +95,7 @@ io_outcome recvmsg(int const fd, mutable_buffer_array<> const& buffers, sockaddr
         message.msg_iovlen = count;
         auto const n = ::recvmsg(fd, &message, 0);
         if (n < 0 && errno == EINTR) continue;
+        if (n >= 0 && sender != nullptr && sender_length != nullptr) *sender_length = message.msg_namelen;
         return transfer_outcome(n, false); // 数据报：0 字节是合法的空报文
     }
 }

@@ -88,6 +88,7 @@ struct uring_socket_op final : uring_op {
     msghdr message{};
 
     sockaddr* address_out = nullptr; // receive_from：调用方的地址存储
+    socklen_t* address_length_out = nullptr; // receive_from：内核报告的地址长度写到这里（可空）
     sockaddr_storage address{};       // send_to / connect 的目标；accept 的对端
     socklen_t address_length = 0;
     int accepted_fd = -1;
@@ -140,7 +141,8 @@ struct uring_socket final : socket_impl {
 
     void begin_read(span<mutable_buffer const> buffers) noexcept override;
     void begin_write(span<const_buffer const> buffers) noexcept override;
-    void begin_receive_from(span<mutable_buffer const> buffers, sockaddr* sender, socklen_t capacity) noexcept override;
+    void begin_receive_from(span<mutable_buffer const> buffers, sockaddr* sender, socklen_t capacity,
+                            socklen_t* sender_length) noexcept override;
     void begin_send_to(span<const_buffer const> buffers, sockaddr const* target, socklen_t length) noexcept override;
     void begin_connect(sockaddr const* address, socklen_t length, int family, int type, int protocol) noexcept override;
     void begin_accept() noexcept override;

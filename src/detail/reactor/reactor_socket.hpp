@@ -44,6 +44,7 @@ struct reactor_socket_op final : reactor_op {
     // receive_from：address_out 指向调用方的地址存储（容量 address_length）；
     // send_to：address 是目标。
     sockaddr* address_out = nullptr;
+    socklen_t* address_length_out = nullptr; // receive_from：内核报告的地址长度写到这里（可空）
     sockaddr_storage address{};
     socklen_t address_length = 0;
     int accepted_fd = -1;
@@ -73,8 +74,8 @@ struct reactor_socket final : socket_impl {
 
     void begin_read(span<mutable_buffer const> buffers) noexcept override;
     void begin_write(span<const_buffer const> buffers) noexcept override;
-    void begin_receive_from(span<mutable_buffer const> buffers, sockaddr* sender,
-                            socklen_t capacity) noexcept override;
+    void begin_receive_from(span<mutable_buffer const> buffers, sockaddr* sender, socklen_t capacity,
+                            socklen_t* sender_length) noexcept override;
     void begin_send_to(span<const_buffer const> buffers, sockaddr const* target,
                        socklen_t length) noexcept override;
     void begin_connect(sockaddr const* address, socklen_t length, int family, int type,

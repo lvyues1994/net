@@ -33,7 +33,7 @@ bool reactor_socket_op::perform() noexcept {
         return true;
     }
     case kind::receive_from: {
-        auto const outcome = posix::recvmsg(fd, read_buffers, address_out, address_length);
+        auto const outcome = posix::recvmsg(fd, read_buffers, address_out, address_length, address_length_out);
         if (not outcome.done) return false;
         ec = outcome.ec;
         bytes_transferred = outcome.bytes;
@@ -151,12 +151,13 @@ void reactor_socket::begin_write(span<const_buffer const> const buffers) noexcep
 }
 
 void reactor_socket::begin_receive_from(span<mutable_buffer const> const buffers, sockaddr* const sender,
-                                        socklen_t const capacity) noexcept {
+                                        socklen_t const capacity, socklen_t* const sender_length) noexcept {
     CO2_CONTRACT_CHECK(not read_op_.pending);
     read_op_.op_kind = reactor_socket_op::kind::receive_from;
     read_op_.read_buffers = mutable_buffer_array<>{buffers};
     read_op_.address_out = sender;
     read_op_.address_length = capacity;
+    read_op_.address_length_out = sender_length;
 }
 
 void reactor_socket::begin_send_to(span<const_buffer const> const buffers, sockaddr const* const target,

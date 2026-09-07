@@ -73,8 +73,9 @@ struct socket_impl {
     // write / connect / send_to。
     virtual void begin_read(span<mutable_buffer const> buffers) noexcept = 0;
     virtual void begin_write(span<const_buffer const> buffers) noexcept = 0;
+    // sender_length 非空时，完成后写入内核报告的地址长度（Unix 域端点的长度由路径决定）。
     virtual void begin_receive_from(span<mutable_buffer const> buffers, sockaddr* sender,
-                                    socklen_t capacity) noexcept = 0;
+                                    socklen_t capacity, socklen_t* sender_length) noexcept = 0;
     virtual void begin_send_to(span<const_buffer const> buffers, sockaddr const* target,
                                socklen_t length) noexcept = 0;
     // 未打开时先按给定协议打开；connect 的同步结果（成功 / 失败 / EINPROGRESS）在这里确定。

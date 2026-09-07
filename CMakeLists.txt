@@ -56,6 +56,7 @@ set(net_concrete_sources
     src/udp.cpp
     src/timer.cpp
     src/file.cpp
+    src/local.cpp
     src/resolver.cpp
     src/signal_set.cpp)
 

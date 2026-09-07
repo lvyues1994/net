@@ -31,8 +31,9 @@ std::error_code close_socket(int fd) noexcept;
 
 io_outcome readv(int fd, mutable_buffer_array<> const& buffers) noexcept;   // 0 字节 → error::eof
 io_outcome writev(int fd, const_buffer_array<> const& buffers) noexcept;
+// sender_length：入为容量，出为内核报告的地址长度（sender 为空时忽略）。
 io_outcome recvmsg(int fd, mutable_buffer_array<> const& buffers, sockaddr* sender,
-                   socklen_t capacity) noexcept;
+                   socklen_t capacity, socklen_t* sender_length = nullptr) noexcept;
 io_outcome sendmsg(int fd, const_buffer_array<> const& buffers, sockaddr const* target,
                    socklen_t length) noexcept;
 // 返回值：fd >= 0 成功；-1 且 done 为假表示 EAGAIN；-1 且 ec 非空表示错误。
