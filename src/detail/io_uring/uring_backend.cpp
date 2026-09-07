@@ -13,6 +13,7 @@
 #include "net/io_context.hpp"
 
 #include "detail/io_uring/uring_socket.hpp"
+#include "detail/io_uring/uring_file.hpp"
 #include "detail/io_uring/uring_timer.hpp"
 
 #ifndef IORING_POLL_ADD_MULTI
@@ -116,6 +117,10 @@ std::unique_ptr<socket_impl> uring_backend::create_socket(io_context& context) {
 
 std::unique_ptr<timer_impl> uring_backend::create_timer(io_context& context) {
     return std::unique_ptr<timer_impl>{new uring_timer{context, *this}};
+}
+
+std::unique_ptr<file_impl> uring_backend::create_file(io_context& context) {
+    return std::unique_ptr<file_impl>{new uring_file{context, *this}};
 }
 
 std::error_code uring_backend::register_signal_reader(int const read_fd, void (*const deliver)(int)) noexcept {

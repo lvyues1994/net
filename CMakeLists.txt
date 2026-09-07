@@ -55,16 +55,19 @@ set(net_concrete_sources
     src/tcp.cpp
     src/udp.cpp
     src/timer.cpp
+    src/file.cpp
     src/resolver.cpp
     src/signal_set.cpp)
 
 set(net_posix_sources
-    src/detail/posix/socket_ops.cpp)
+    src/detail/posix/socket_ops.cpp
+    src/detail/posix/file_ops.cpp)
 
 set(net_reactor_sources
     src/detail/reactor/reactor_backend.cpp
     src/detail/reactor/reactor_socket.cpp
     src/detail/reactor/reactor_timer.cpp
+    src/detail/reactor/reactor_file.cpp
     src/detail/reactor/epoll_demultiplexer.cpp
     src/detail/reactor/poll_demultiplexer.cpp
     src/detail/reactor/select_demultiplexer.cpp)
@@ -73,7 +76,8 @@ set(net_io_uring_sources
     src/detail/io_uring/uring.cpp
     src/detail/io_uring/uring_backend.cpp
     src/detail/io_uring/uring_socket.cpp
-    src/detail/io_uring/uring_timer.cpp)
+    src/detail/io_uring/uring_timer.cpp
+    src/detail/io_uring/uring_file.cpp)
 
 # ---- TLS 提供者 ----
 #

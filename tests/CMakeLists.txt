@@ -16,6 +16,7 @@ set(net_platform_test_sources
     udp_tests.cpp
     resolver_tests.cpp
     signal_tests.cpp
+    file_tests.cpp
     stress_tests.cpp)
 if(net_has_tls)
     list(APPEND net_platform_test_sources tls_tests.cpp)

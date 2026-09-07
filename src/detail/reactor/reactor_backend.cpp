@@ -14,6 +14,7 @@
 #include "net/io_context.hpp"
 
 #include "detail/reactor/reactor_socket.hpp"
+#include "detail/reactor/reactor_file.hpp"
 #include "detail/reactor/reactor_timer.hpp"
 
 namespace net {
@@ -64,6 +65,10 @@ std::unique_ptr<socket_impl> reactor_backend::create_socket(io_context& context)
 
 std::unique_ptr<timer_impl> reactor_backend::create_timer(io_context& context) {
     return std::unique_ptr<timer_impl>{new reactor_timer{context, *this}};
+}
+
+std::unique_ptr<file_impl> reactor_backend::create_file(io_context& context) {
+    return std::unique_ptr<file_impl>{new reactor_file{context}};
 }
 
 // ---- 信号泵 ----

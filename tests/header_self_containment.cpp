@@ -11,6 +11,7 @@
 #include "net/error.hpp"
 #include "net/execution_context.hpp"
 #include "net/executor_ref.hpp"
+#include "net/file.hpp"
 #include "net/immediate.hpp"
 #include "net/io_awaitable_promise_base.hpp"
 #include "net/io_context.hpp"

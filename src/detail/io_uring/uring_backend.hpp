@@ -36,6 +36,7 @@ struct uring_backend final : execution_context::service, io_backend {
     void interrupt() noexcept override;
     std::unique_ptr<socket_impl> create_socket(io_context& context) override;
     std::unique_ptr<timer_impl> create_timer(io_context& context) override;
+    std::unique_ptr<file_impl> create_file(io_context& context) override;
     std::error_code register_signal_reader(int read_fd, void (*deliver)(int signal_number)) noexcept override;
     char const* name() const noexcept override { return "io_uring"; }
 

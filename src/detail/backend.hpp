@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <system_error>
 
@@ -95,6 +96,34 @@ struct socket_impl {
     virtual bool has_pending() const noexcept = 0;
 };
 
+// 文件的实现（Paper 10）。两种公共类型（顺序的 stream_file、按偏移的 random_access_file）都建立在同一
+// 个按偏移读写的实现上：stream_file 自己维护位置。常规文件没有"就绪"概念——就绪型后端在 ready()
+// 里同步 pread/pwrite（POSIX 回退），完成型后端提交 READV/WRITEV 带偏移的 SQE。
+struct file_impl {
+    file_impl() = default;
+    file_impl(file_impl const&) = delete;
+    file_impl& operator=(file_impl const&) = delete;
+    virtual ~file_impl() = default;
+
+    virtual io_context& context() const noexcept = 0;
+
+    // ---- 同步 ----
+    virtual std::error_code assign(int fd) noexcept = 0; // 接管已打开的描述符
+    virtual std::error_code close() noexcept = 0;
+    virtual void cancel() noexcept = 0;
+    virtual int release() noexcept = 0;
+    virtual int native_handle() const noexcept = 0;
+
+    // ---- 异步（三步协议，每个方向一个操作） ----
+    virtual void begin_read(std::uint64_t offset, span<mutable_buffer const> buffers) noexcept = 0;
+    virtual void begin_write(std::uint64_t offset, span<const_buffer const> buffers) noexcept = 0;
+    virtual bool ready(op_direction direction) noexcept = 0;
+    virtual coroutine_handle<> suspend(op_direction direction, coroutine_handle<> h, io_env const* env) noexcept = 0;
+    virtual io_result<std::size_t> finish_transfer(op_direction direction) noexcept = 0;
+
+    virtual bool has_pending() const noexcept = 0;
+};
+
 struct timer_impl {
     using time_point = std::chrono::steady_clock::time_point;
 
@@ -132,6 +161,7 @@ struct io_backend {
     // ---- 工厂 ----
     virtual std::unique_ptr<socket_impl> create_socket(io_context& context) = 0;
     virtual std::unique_ptr<timer_impl> create_timer(io_context& context) = 0;
+    virtual std::unique_ptr<file_impl> create_file(io_context& context) = 0;
 
     // 监视信号自管道的读端：可读时排空它，并对每个信号号调用 deliver。POSIX 后端实现；
     // 完成型后端可以用 poll-add / 等待对象实现同一语义。
