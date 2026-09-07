@@ -16,6 +16,7 @@
 #include "net/ip.hpp"
 #include "net/run_async.hpp"
 #include "net/strand.hpp"
+#include "net/source_sink.hpp"
 #include "net/stream.hpp"
 #include "net/task.hpp"
 #include "net/tcp.hpp"
@@ -603,6 +604,58 @@ void multithreaded_sessions_each_on_a_strand() {
     CHECK_EQ(sent.load(), echoed.load());
 }
 
+// ---- WriteSink 适配器在 TLS 上：write_eof 是 close_notify（shutdown()），对端读到干净的 eof ----
+
+auto tls_sink_send(net::tls::openssl_stream* tls, std::string payload)
+    CO2_BEG((net::task<net::io_result<std::size_t>>), (tls, payload), net::io_result<> h;
+            net::stream_write_sink<net::tls::openssl_stream> sink{*tls}; net::io_result<std::size_t> r;) {
+    CO2_AWAIT_SET(h, tls->handshake(net::tls::role::client));
+    CHECK(not h.ec);
+    CO2_AWAIT_SET(r, sink.write_eof(net::buffer(payload)));
+    CO2_RETURN(r);
+}
+CO2_END
+
+auto tls_read_until_eof(net::tls::openssl_stream* tls, std::string* out)
+    CO2_BEG((net::task<std::error_code>), (tls, out), net::io_result<> h; char buf[4096]; net::io_result<std::size_t> r;
+            net::io_result<> s;) {
+    CO2_AWAIT_SET(h, tls->handshake(net::tls::role::server));
+    CHECK(not h.ec);
+    for (;;) {
+        CO2_AWAIT_SET(r, tls->read_some(net::buffer(buf)));
+        if (r.ec) break;
+        out->append(buf, r.value);
+    }
+    if (r.ec == net::error::eof) {
+        CO2_AWAIT_SET(s, tls->shutdown());
+        CHECK(not s.ec);
+    }
+    CO2_RETURN(r.ec);
+}
+CO2_END
+
+void write_sink_eof_is_close_notify() {
+    connected_pair pair;
+    auto server_ctx = server_context();
+    auto client_ctx = client_context();
+    net::tls::openssl_stream server{&pair.server, server_ctx};
+    net::tls::openssl_stream client{&pair.client, client_ctx};
+    client.set_hostname("localhost");
+    std::string const payload(64U * 1024U + 5U, 't');
+    std::string received;
+    std::error_code read_ec;
+    net::io_result<std::size_t> sent;
+    net::run_async(pair.ctx.get_executor(), [&](std::error_code e) { read_ec = e; }, [](std::exception_ptr) { CHECK(false); })(
+        tls_read_until_eof(&server, &received));
+    net::run_async(pair.ctx.get_executor(), [&](net::io_result<std::size_t> v) { sent = v; }, [](std::exception_ptr) { CHECK(false); })(
+        tls_sink_send(&client, payload));
+    pair.ctx.run();
+    CHECK(not sent.ec);
+    CHECK_EQ(sent.value, payload.size());
+    CHECK(read_ec == net::error::eof); // 干净的 close_notify，不是 stream_truncated
+    CHECK(received == payload);
+}
+
 } // namespace
 
 int main() {
@@ -621,6 +674,7 @@ int main() {
     full_duplex_on_one_stream();
     handshake_timeout_via_when_any();
     multithreaded_sessions_each_on_a_strand();
+    write_sink_eof_is_close_notify();
     std::cout << "tls tests passed (" << net::tls::provider_name() << ")\n";
     return 0;
 }

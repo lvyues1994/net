@@ -4,6 +4,7 @@ set(net_test_sources
     executor_tests.cpp
     buffer_tests.cpp
     stream_tests.cpp
+    source_sink_tests.cpp
     header_self_containment.cpp)
 
 # 平台测试：同一份源码为每个后端各编译一个变体（<name>、<name>_poll、<name>_select、
@@ -54,6 +55,7 @@ endforeach()
 # 误报 -Wmismatched-new-delete（配对是正确的）。
 if(NET_COMPILER_HAS_WMISMATCHED_NEW_DELETE)
     target_compile_options(stream_tests PRIVATE -Wno-mismatched-new-delete)
+    target_compile_options(source_sink_tests PRIVATE -Wno-mismatched-new-delete)
 endif()
 
 foreach(source IN LISTS net_platform_test_sources)

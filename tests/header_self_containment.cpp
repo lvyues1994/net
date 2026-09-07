@@ -1,6 +1,7 @@
 // 每个公共头都能独立包含（先单独包含再包含全部，验证没有隐藏的顺序依赖）。
 
 #include "net/any_executor.hpp"
+#include "net/any_source_sink.hpp"
 #include "net/any_stream.hpp"
 #include "net/buffers.hpp"
 #include "net/config.hpp"
@@ -24,6 +25,7 @@
 #include "net/socket_base.hpp"
 #include "net/span.hpp"
 #include "net/strand.hpp"
+#include "net/source_sink.hpp"
 #include "net/stream.hpp"
 #include "net/task.hpp"
 #include "net/tcp.hpp"

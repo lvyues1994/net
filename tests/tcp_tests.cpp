@@ -14,11 +14,13 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "net/any_source_sink.hpp"
 #include "net/any_stream.hpp"
 #include "net/error.hpp"
 #include "net/io_context.hpp"
 #include "net/ip.hpp"
 #include "net/run_async.hpp"
+#include "net/source_sink.hpp"
 #include "net/stream.hpp"
 #include "net/task.hpp"
 #include "net/tcp.hpp"
@@ -564,6 +566,72 @@ void assigning_a_listening_descriptor() {
     ::close(released);
 }
 
+// ---- 第二族流概念在 TCP 上：write_eof → shutdown(send)，对端读到 eof；BufferSink 的 commit_eof 同样 ----
+
+auto read_all_until_eof(net::tcp_socket* sock, std::string* out)
+    CO2_BEG((net::task<std::error_code>), (sock, out), char buf[1024]; net::io_result<std::size_t> r;) {
+    for (;;) {
+        CO2_AWAIT_SET(r, sock->read_some(net::buffer(buf)));
+        if (r.ec) CO2_RETURN(r.ec);
+        out->append(buf, r.value);
+    }
+}
+CO2_END
+
+auto erased_sink_send(net::any_write_sink* sink, std::string payload)
+    CO2_BEG((net::task<net::io_result<std::size_t>>), (sink, payload), net::io_result<std::size_t> r;) {
+    CO2_AWAIT_SET(r, sink->write_eof(net::buffer(payload)));
+    CO2_RETURN(r);
+}
+CO2_END
+
+auto source_to_tcp_sink(net::memory_source* source, net::any_buffer_sink* sink)
+    CO2_BEG((net::task<net::io_result<std::size_t>>), (source, sink), net::io_result<std::size_t> r;) {
+    CO2_AWAIT_SET(r, net::transfer_to_sink(*source, *sink));
+    CO2_RETURN(r);
+}
+CO2_END
+
+void write_sink_eof_is_tcp_shutdown() {
+    connected_pair pair;
+    auto adapter = net::as_write_sink(pair.client);
+    net::any_write_sink sink{&adapter};
+    std::string const payload(200U * 1024U, 'w');
+    std::string received;
+    std::error_code read_ec;
+    net::io_result<std::size_t> sent;
+    net::run_async(pair.ctx.get_executor(), [&](std::error_code e) { read_ec = e; }, [](std::exception_ptr) { CHECK(false); })(
+        read_all_until_eof(&pair.server, &received));
+    net::run_async(pair.ctx.get_executor(), [&](net::io_result<std::size_t> v) { sent = v; }, [](std::exception_ptr) { CHECK(false); })(
+        erased_sink_send(&sink, payload));
+    pair.ctx.run();
+    CHECK(not sent.ec);
+    CHECK_EQ(sent.value, payload.size());
+    CHECK(read_ec == net::error::eof); // write_eof → shutdown(send) → 对端 eof
+    CHECK(received == payload);
+}
+
+void buffer_sink_commit_eof_is_tcp_shutdown() {
+    connected_pair pair;
+    auto adapter = net::as_buffer_sink(pair.client, 4096U);
+    net::any_buffer_sink sink{&adapter};
+    std::string const payload(100U * 1024U + 17U, 'b');
+    net::memory_source source{net::buffer(payload)};
+    std::string received;
+    std::error_code read_ec;
+    net::io_result<std::size_t> moved;
+    net::run_async(pair.ctx.get_executor(), [&](std::error_code e) { read_ec = e; }, [](std::exception_ptr) { CHECK(false); })(
+        read_all_until_eof(&pair.server, &received));
+    net::run_async(pair.ctx.get_executor(), [&](net::io_result<std::size_t> v) { moved = v; }, [](std::exception_ptr) { CHECK(false); })(
+        source_to_tcp_sink(&source, &sink));
+    pair.ctx.run();
+    CHECK(not moved.ec);
+    CHECK_EQ(moved.value, payload.size());
+    CHECK(read_ec == net::error::eof); // commit_eof → shutdown(send)
+    CHECK(received == payload);
+    CHECK(adapter.finished());
+}
+
 void endpoints_and_options() {
     connected_pair pair;
     std::error_code ec;
@@ -598,6 +666,8 @@ int main() {
     pending_accept_is_cancelled_by_stop_token_then_acceptor_keeps_working();
     closing_acceptor_drops_queued_connections();
     assigning_a_listening_descriptor();
+    write_sink_eof_is_tcp_shutdown();
+    buffer_sink_commit_eof_is_tcp_shutdown();
     endpoints_and_options();
     std::cout << "tcp tests passed\n";
     return 0;

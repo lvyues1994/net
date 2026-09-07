@@ -7,6 +7,7 @@
 #include "net/any_stream.hpp"
 #include "net/buffers.hpp"
 #include "net/io_result.hpp"
+#include "net/source_sink.hpp"
 #include "net/task.hpp"
 #include "net/tls/context.hpp"
 
@@ -127,6 +128,15 @@ struct openssl_stream final : stream {
     any_stream stream_; // 必须在 impl_ 之前：impl 持有它的指针
     std::unique_ptr<detail::openssl_stream_impl, detail::openssl_stream_impl_deleter> impl_;
 };
+
+// WriteSink 适配器（source_sink.hpp）的流结束定制点：TLS 的 EOF 是 close_notify（shutdown()）。
+// 模板而不是 stream& 重载：对 openssl_stream 这类派生类，两个参数都精确匹配才能压过通用回退。
+template <class S, class = typename std::enable_if<std::is_base_of<stream, S>::value>::type>
+auto signal_stream_eof(S& secure, net::detail::eof_preferred) CO2_BEG((task<io_result<>>), (secure), io_result<> r;) {
+    CO2_AWAIT_SET(r, secure.shutdown());
+    CO2_RETURN(r);
+}
+CO2_END
 
 } // namespace tls
 } // namespace net

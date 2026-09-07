@@ -9,6 +9,7 @@
 #include "net/io_result.hpp"
 #include "net/ip.hpp"
 #include "net/socket_base.hpp"
+#include "net/source_sink.hpp"
 
 // TCP（P4100R1 §8.8 Paper 11）：tcp_socket 满足 Stream；tcp_acceptor 的 accept() 交出新的
 // tcp_socket。API 形态与 Networking TS 一致，去掉 async_ 前缀与完成令牌：
@@ -128,5 +129,11 @@ struct tcp_acceptor : socket_base {
   private:
     friend struct tcp_accept_awaitable;
 };
+
+// WriteSink 适配器（source_sink.hpp）的流结束定制点：TCP 的 EOF 就是 shutdown(send)。
+inline auto signal_stream_eof(tcp_socket& socket, detail::eof_preferred) CO2_BEG((task<io_result<>>), (socket)) {
+    CO2_RETURN((io_result<>{socket.shutdown(shutdown_type::send)}));
+}
+CO2_END
 
 } // namespace net
