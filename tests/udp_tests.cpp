@@ -5,6 +5,7 @@
 #include "net/io_context.hpp"
 #include "net/error.hpp"
 #include "net/ip.hpp"
+#include "net/multicast.hpp"
 #include "net/run_async.hpp"
 #include "net/stream.hpp"
 #include "net/task.hpp"
@@ -106,12 +107,78 @@ void cancel_aborts_a_pending_receive() {
     CHECK(ec == net::error::operation_aborted);
 }
 
+// ---- 组播选项（Paper 11）：在回环接口上加入 239.255.0.1，自己发自己收；hops / loopback / 出向接口 ----
+
+void multicast_options_join_send_receive_leave() {
+    test_context ctx;
+    auto const group = net::ip::make_address("239.255.0.1");
+    CHECK(group.to_v4().is_multicast());
+    net::udp_socket receiver{ctx};
+    CHECK(not receiver.open(net::ip::udp::v4()));
+    CHECK(not receiver.set_option(net::socket_option::reuse_address{true}));
+    CHECK(not receiver.bind(net::ip::udp::endpoint{net::ip::address_v4::any(), 0}));
+    // 在回环接口上加入组
+    auto const join_ec = receiver.set_option(net::ip::multicast::join_group{group.to_v4(), net::ip::address_v4::loopback()});
+    if (join_ec) {
+        std::cout << "multicast join not permitted here (" << join_ec.message() << "), skipping\n";
+        return;
+    }
+    net::udp_socket sender{ctx, net::ip::udp::endpoint{net::ip::address_v4::loopback(), 0}};
+    CHECK(not sender.set_option(net::ip::multicast::outbound_interface{net::ip::address_v4::loopback()}));
+    CHECK(not sender.set_option(net::ip::multicast::hops{1}));
+    CHECK(not sender.set_option(net::ip::multicast::enable_loopback{true}));
+    // 读回：hops 与 loopback
+    net::ip::multicast::hops hops_back;
+    CHECK(not sender.get_option(hops_back));
+    CHECK_EQ(hops_back.value(), 1);
+    net::ip::multicast::enable_loopback loop_back;
+    CHECK(not sender.get_option(loop_back));
+    CHECK(static_cast<bool>(loop_back));
+    // 单播 TTL 也在同一族里
+    CHECK(not sender.set_option(net::ip::unicast::hops{7}));
+    net::ip::unicast::hops ttl_back;
+    CHECK(not sender.get_option(ttl_back));
+    CHECK_EQ(ttl_back.value(), 7);
+
+    std::error_code ec;
+    auto const port = receiver.local_endpoint(ec).port();
+    net::ip::udp::endpoint const target{group, port};
+    net::ip::udp::endpoint from;
+    std::string got;
+    auto sent = std::size_t{};
+    net::run_async(ctx.get_executor(), [&](std::string s) { got = std::move(s); }, [](std::exception_ptr) { CHECK(false); })(
+        receive_one(&receiver, &from));
+    net::run_async(ctx.get_executor(), [&](std::size_t n) { sent = n; }, [](std::exception_ptr) { CHECK(false); })(
+        send_one(&sender, target, "multicast"));
+    ctx.run();
+    CHECK_EQ(sent, 9U);
+    CHECK_EQ(got, "multicast");
+    CHECK(from.address().is_loopback());
+    // 离开组
+    CHECK(not receiver.set_option(net::ip::multicast::leave_group{group.to_v4(), net::ip::address_v4::loopback()}));
+    // 再离开一次：不在组里 → EADDRNOTAVAIL
+    auto const twice = receiver.set_option(net::ip::multicast::leave_group{group.to_v4(), net::ip::address_v4::loopback()});
+    CHECK(twice == std::errc::address_not_available);
+    // v6 形态的选项至少构造正确（level / name / size）
+    net::ip::multicast::join_group const v6_join{net::ip::make_address("ff02::1").to_v6(), 1UL};
+    CHECK_EQ(v6_join.level(), IPPROTO_IPV6);
+    CHECK_EQ(v6_join.name(), IPV6_JOIN_GROUP);
+    CHECK_EQ(v6_join.size(), sizeof(ipv6_mreq));
+    net::ip::multicast::outbound_interface const v6_if{1U};
+    CHECK_EQ(v6_if.level(), IPPROTO_IPV6);
+    CHECK_EQ(v6_if.size(), sizeof(unsigned int));
+    auto v6_hops = net::ip::multicast::hops{3};
+    v6_hops.for_v6();
+    CHECK_EQ(v6_hops.name(), IPV6_MULTICAST_HOPS);
+}
+
 } // namespace
 
 int main() {
     datagram_roundtrip();
     connected_socket_uses_send_and_receive();
     cancel_aborts_a_pending_receive();
+    multicast_options_join_send_receive_leave();
     std::cout << "udp tests passed\n";
     return 0;
 }

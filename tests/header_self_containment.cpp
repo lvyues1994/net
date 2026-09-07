@@ -20,6 +20,7 @@
 #include "net/local.hpp"
 #include "net/ip.hpp"
 #include "net/memory_resource.hpp"
+#include "net/multicast.hpp"
 #include "net/resolver.hpp"
 #include "net/run.hpp"
 #include "net/run_async.hpp"
