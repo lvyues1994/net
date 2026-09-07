@@ -64,6 +64,11 @@ coroutine_handle<> await_suspend(coroutine_handle<> h, io_env const* env);
 | `DynamicBuffer` | `flat_dynamic_buffer`, `dynamic_buffer(vector/string)` | `dynamic_buffer.hpp` |
 | `ReadStream` / `WriteStream` / `Stream` | `is_read_stream` / `is_write_stream` / `is_stream`；`read` / `write` / `read_until` | `stream.hpp` |
 | `any_read_stream`, `any_write_stream`, `any_stream` | 同名，零每操作分配 | `any_stream.hpp` |
+| `ReadSource` / `WriteSink`（读满 / 写完 + `write_eof`）、`BufferSource` / `BufferSink`（被调方拥有缓冲区：`pull` / `consume`，`prepare` / `commit` / `commit_eof`）（Paper 6） | `is_read_source` / `is_write_sink` / `is_buffer_source` / `is_buffer_sink`；模型 `memory_source`、`dynamic_buffer_source` / `dynamic_buffer_sink`；适配器 `as_read_source` / `as_write_sink` / `as_buffer_source` / `as_buffer_sink`；`transfer_to_stream` / `transfer_to_sink` | `source_sink.hpp` |
+| `any_read_source`, `any_write_sink`, `any_buffer_source`, `any_buffer_sink` | 同名，零每操作分配；整序列操作按 16 个缓冲区一窗穿过边界；`any_buffer_*` 转发或合成另一族的操作 | `any_source_sink.hpp` |
+| `stream_file`, `random_access_file`, `file_base`（Paper 10） | 同名；`stream_file` 满足 Stream（隐式位置 + `seek`），`random_access_file` 是 `read_some_at` / `write_some_at`；io_uring 走 READV / WRITEV，就绪型后端同步 `preadv` / `pwritev` | `file.hpp` |
+| `local::stream_protocol` / `datagram_protocol`，Unix 域套接字（Paper 11） | `local_stream_socket`, `local_stream_acceptor`, `local_datagram_socket`；端点支持 Linux 抽象命名空间 | `local.hpp` |
+| `ip::multicast::{join_group, leave_group, outbound_interface, hops, enable_loopback}`, `ip::unicast::hops` | 同名，v4 / v6 同一类型 | `multicast.hpp` |
 | `when_all`, `when_any` | 同名，I/O 感知（P4124R0 §2 的表） | `when_all.hpp`, `when_any.hpp` |
 | `thread_pool`, `strand`, `any_executor` | 同名 | `thread_pool.hpp`, `strand.hpp`, `any_executor.hpp` |
 | `io_context`, `steady_timer`, `signal_set`, `tcp_socket`, `tcp_acceptor`, `udp_socket`, `resolver`, `ip::*` | 同名（Networking TS 形态去掉 `async_` 与完成令牌） | `io_context.hpp`, `timer.hpp`, `signal_set.hpp`, `tcp.hpp`, `udp.hpp`, `resolver.hpp`, `ip.hpp` |
@@ -143,9 +148,13 @@ target_link_libraries(my-target PRIVATE net::net)
 ```
 
 测试覆盖：task / 环境传播 / 帧分配器（含多线程回收器）、执行器（多线程 `run()`、strand
-串行化、服务、后端选择）、缓冲区、流与 `any_stream`（零分配断言）、组合子（错误传播、取消、
+串行化、服务、后端选择）、缓冲区、流与 `any_stream`（零分配断言）、源 / 汇（概念判定、模型、
+适配器、`transfer`、四个 `any_*` 的零分配 / 40 缓冲区窗口化 / 转发与合成两条路径）、组合子（错误传播、取消、
 异常）、定时器、TCP 回环（取消、EOF、超时、多线程、接受器：连接先到后取 / 取消 / 关闭丢弃排队连接 / assign
-已监听的描述符）、UDP、DNS、信号、TLS（握手 / 回显 /
+已监听的描述符、`write_eof` / `commit_eof` → `shutdown(send)`）、UDP（含组播加入 / 发送 / 收到 / 离开与
+选项读回）、Unix 域套接字（文件系统路径与抽象命名空间回显、数据报与发送方端点）、文件（写-读回-eof-seek、
+`read_until`、经 `as_buffer_source` 发到 TCP、按偏移读写与洞 / 越界 / resize、两个句柄并发读、打开标志与错误）、
+DNS、信号、TLS（握手 / 回显 /
 干净关闭、证书与主机名校验失败、验证回调、传输截断、ALPN、3 MiB 经 `any_stream` 传输、取消、
 版本不匹配、拥有式流与移动、同一条流上全双工、`when_any` 握手超时、多线程 + strand 会话），以及
 一个契约违规测试。`stress_tests` 把这些原语组合起来放到 4 个线程上加随机性：回显风暴、
@@ -154,7 +163,7 @@ target_link_libraries(my-target PRIVATE net::net)
 `stop()` / `restart()` / `run_for` 带着在飞操作、UDP `when_any`（`stress_tests <名字>` 单跑，
 `NET_TEST_REPEAT=n` 重复）。平台测试为 epoll / poll / select / io_uring 各编译一个变体
 （`<name>`、`<name>_poll`、`<name>_select`、`<name>_io_uring`），后端不可用时以退出码 77 跳过；
-共 38 个，全部在 ASan+UBSan+LSan 与 TSan 下（含 `taskset -c 0,1` 模拟 CI 的 2 核调度反复运行）、
+共 47 个，全部在 ASan+UBSan+LSan 与 TSan 下（含 `taskset -c 0,1` 模拟 CI 的 2 核调度反复运行）、
 OpenSSL 与 BoringSSL 两个提供者下通过。TSan 只抑制未插桩的 libcrypto / libssl 内部
 （`tests/tsan.supp`）。
 
@@ -221,13 +230,13 @@ recv、注册缓冲区、零拷贝发送。TLS 的数字（OpenSSL 与 BoringSSL
 ## 目录
 
 ```
-include/net/            公共头：协议核心、执行器、缓冲区、流、组合子（仅头文件）；平台层的具体层接口
+include/net/            公共头：协议核心、执行器、缓冲区、流 / 源 / 汇与类型擦除、组合子（仅头文件）；平台层的具体层接口（套接字、文件、Unix 域、组播选项）
 include/net/tls/        TLS：context / stream / error（公共头不含 OpenSSL 头）
-src/                    具体层：io_context 调度器、套接字/定时器/DNS/信号（只依赖 detail/backend.hpp）
-src/detail/backend.hpp  后端接缝：io_backend / socket_impl / timer_impl（抽象）
-src/detail/posix/       POSIX 系统调用封装
-src/detail/reactor/     就绪型后端族：reactor_backend + epoll / poll / select 解复用器
-src/detail/io_uring/    完成型后端：裸系统调用的 io_uring 环、提交/取消/收割、套接字与定时器实现
+src/                    具体层：io_context 调度器、套接字/文件/定时器/DNS/信号/Unix 域（只依赖 detail/backend.hpp）
+src/detail/backend.hpp  后端接缝：io_backend / socket_impl / file_impl / timer_impl（抽象）
+src/detail/posix/       POSIX 系统调用封装（套接字与文件）
+src/detail/reactor/     就绪型后端族：reactor_backend + epoll / poll / select 解复用器；文件同步回退
+src/detail/io_uring/    完成型后端：裸系统调用的 io_uring 环、提交/取消/收割、套接字 / 文件 / 定时器实现
 src/tls/                TLS 引擎（OpenSSL API 子集，OpenSSL / BoringSSL 共用）与驱动协程
 benchmarks/             bench_core / bench_net / bench_tls / bench_asio（Boost.Asio 对照）与 harness
 docs/                   architecture.md（分层、决策、审查记录）、backends.md（后端设计与 io_uring / IOCP 接入）、tls.md、benchmarks.md（与 Asio 对照）
@@ -236,7 +245,7 @@ tests/  examples/  .github/workflows/ci.yml
 
 ## 尚未提供
 
-文件 I/O、Unix 域套接字、`system_context`、回调风格的流概念（`BufferSource` /
-`BufferSink`）、与 `std::execution` 的桥（P4092/P4093）、IOCP / kqueue 后端（接缝已就位，
+`system_context`、与 `std::execution` 的桥（P4092/P4093）、IOCP / kqueue 后端（接缝已就位，
 方案见 `docs/backends.md`）、wolfSSL 提供者与 TLS 的 PKCS#12 / CRL / SNI 服务端回调 / 会话
-复用（见 `docs/tls.md`）。
+复用（见 `docs/tls.md`）、文件操作的取消在就绪型后端上不可用（同步完成）、io_uring 文件读写
+不使用固定缓冲区 / 注册文件。

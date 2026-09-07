@@ -20,13 +20,14 @@ net 用 C++14 与 co2 实现这套协议：语言里没有 `co_await`，但 co2 
 │ TLS（libnet）   tls::context  tls::stream  openssl_stream            │
 │                 sans-I/O 引擎（OpenSSL / BoringSSL）+ 驱动协程，只依赖 Stream │
 ├──────────────────────────────────────────────────────────────────────┤
-│ 具体层（libnet） io_context  tcp / udp / timer / resolver / signal_set │
+│ 具体层（libnet） io_context  tcp / udp / local / file / timer / resolver / signal_set  multicast 选项 │
 │                 ↓ 抽象接缝 src/detail/backend.hpp                    │
 │ 后端            reactor_backend + demultiplexer{epoll, poll, select} │
 │                 uring_backend（io_uring，完成型）                     │
 ├──────────────────────────────────────────────────────────────────────┤
 │ 组合子        when_all  when_any          detail/combinator          │
 │ 流            stream (read/write/read_until)  any_stream             │
+│ 源 / 汇       source_sink（ReadSource WriteSink BufferSource BufferSink，适配器，transfer）  any_source_sink │
 │ 缓冲区        buffers  dynamic_buffer  span                          │
 ├──────────────────────────────────────────────────────────────────────┤
 │ 执行器        thread_pool  strand  any_executor  executor_ref        │
@@ -41,7 +42,7 @@ net 用 C++14 与 co2 实现这套协议：语言里没有 `co_await`，但 co2 
 ```
 
 依赖只向下。协议核心到组合子仅含头文件、与平台无关；平台层编译进 `libnet.a`：具体层
-只依赖 `src/detail/backend.hpp` 的抽象接口（`io_backend` / `socket_impl` / `timer_impl`），
+只依赖 `src/detail/backend.hpp` 的抽象接口（`io_backend` / `socket_impl` / `file_impl` / `timer_impl`），
 后端实现在 `src/detail/reactor/`（就绪型族）、`src/detail/io_uring/` 与 `src/detail/posix/`，
 全部只在 `src/` 内可见。后端的选择、与 Corosio 的对照、io_uring / IOCP 的接入方案见
 `docs/backends.md`。
@@ -190,6 +191,17 @@ stop_callback（回调 `cancel_op`）、`start_op`；排队后复查 `stop_reque
 ### 其它 I/O 对象
 
 - `steady_timer`：`reactor_timer` 即 `timer_op`；`expires_*` / `cancel` 取消挂起的 wait。
+- 文件（Paper 10）：`stream_file` / `random_access_file` 共用一个按偏移读写的 `file_impl`，
+  `stream_file` 自己维护位置（`seek` 只改位置；`append` 靠 `O_APPEND`）。io_uring 提交带偏移的
+  READV / WRITEV（真正异步，不做投机——常规文件没有非阻塞语义）；就绪型后端对常规文件没有就绪
+  概念（`epoll_ctl` 直接 EPERM），`reactor_file::ready()` 里同步 `preadv` / `pwritev` 完成——与
+  Corosio 的 POSIX 回退相同，代价是这些后端上的文件操作不响应 `stop_token`。
+- Unix 域套接字（Paper 11）：`local_stream_socket` / `local_stream_acceptor` / `local_datagram_socket`
+  是 `socket_base` 上的薄壳，与 TCP / UDP 共用 `socket_impl`（含 io_uring 多发 accept）。端点是
+  `sockaddr_un`，长度由路径决定（抽象命名空间靠长度区分身份），所以 `begin_receive_from` 多了一个
+  `socklen_t* sender_length` 让内核报告的地址长度回到端点里；`local_endpoint` 等经 `resize(len)`。
+- 组播 / 单播选项（`multicast.hpp`）：每个选项同时携带 v4 / v6 两份数据，按地址族选择 level /
+  name / data，走 `socket_base::set_option` / `get_option` 的通用协议。
 - `resolver`：每个 io_context 一个 `resolver_service`，惰性启动一条工作线程串行执行
   `getaddrinfo` / `getnameinfo`；取消不能中断进行中的调用，结果到达后以
   `operation_aborted` 完成。与后端无关。
@@ -198,6 +210,34 @@ stop_callback（回调 `cancel_op`）、`start_op`；排队后复查 `stop_reque
   用一个永不完成的读操作），可读时排空并分发给所有注册了该信号的 signal_set。
 
 锁序：反应器锁 → 解复用器锁；反应器锁 → 信号状态锁 → io_context 队列锁。
+
+## 流概念的第二族：源与汇（Paper 6）
+
+`stream.hpp` 是调用方拥有缓冲区的原语族（`read_some` / `write_some`）。`source_sink.hpp` 补上另外两组：
+
+- 精化：`ReadSource` = `ReadStream` + `read`（读满），`WriteSink` = `WriteStream` + `write` /
+  `write_eof(buffers)` / `write_eof()`。任意 Stream 经 `as_read_source` / `as_write_sink` 提升；`read` /
+  `write` 就是组合算法，`write_eof` 经定制点 `signal_stream_eof(stream, detail::eof_preferred)` 找到流
+  自己的 EOF 语义（`tcp_socket` / `local_stream_socket` → `shutdown(send)`，`tls::stream` → close_notify；
+  没有重载的流无 EOF 可表达，回退版本什么也不做）。定制点用 `eof_preferred : eof_fallback` 的标签
+  排序，TLS 一侧是按 `is_base_of<tls::stream, S>` 约束的模板，否则派生类 `openssl_stream` 会在"第一
+  参数精确 / 第二参数精确"之间二义。
+- 被调方拥有缓冲区：`BufferSource`（`pull(dest) → (ec, span<const_buffer>)` + `consume`，重复 pull
+  不 consume 返回同样数据，耗尽时 `eof` + 空 span）与 `BufferSink`（同步 `prepare(dest) →
+  span<mutable_buffer>` + `commit(n)` / `commit_eof(n)`）。模型：`memory_source`（只读区域）、
+  `dynamic_buffer_source` / `dynamic_buffer_sink`（DynamicBuffer 的两侧）、`stream_buffer_source` /
+  `stream_buffer_sink`（内部存储 + 底层流）。`transfer_to_stream` / `transfer_to_sink` 是论文里的两个
+  示例算法。
+
+`any_source_sink.hpp` 把四个概念类型擦除。与 `any_stream` 一样每次操作零分配，但一个对象有多种操
+作，所以引入通用的 `erased_slot` / `erased_awaitable` / `erased_ops`：槽位按被包装类型全部 awaiter
+的最大尺寸预分配一次，返回给协程的 awaitable 只带"用暂存参数就地构造哪个 awaiter"的函数指针，
+`await_ready` 时才构造（构造出来却没 `co_await` 的 awaitable 不花任何东西）。每个操作的表达式用
+`s()` / `args()` 写一次，既出现在 `decltype` 里（类作用域的静态函数声明）也出现在构造函数里（局部
+lambda）。涉及整个序列的 `read` / `write` / `write_eof(buffers)` 按 `max_iovec` 一窗穿过擦除边界
+（任意长的序列都覆盖，代价是一个组合协程帧，与 `net::read` 相同）。`any_buffer_source` 另外提供
+`read_some` / `read`，`any_buffer_sink` 另外提供 `write_some` / `write` / `write_eof`：被包装类型自己
+满足对应概念（vtable 槽位非空）就转发，否则用 `pull` / `consume` 或 `prepare` / `commit` 合成一次拷贝。
 
 ## 组合子
 

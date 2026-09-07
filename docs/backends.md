@@ -230,6 +230,20 @@ io_uring 378k → 92k。多发 accept：`tcp_tests_io_uring` 的 42 次成功 ac
   都在环锁内；普通操作的完成仍在锁外。锁序是环锁 → acceptor 锁 → io_context 锁，`accept()`
   一侧只拿 acceptor 锁，退回一次性提交时用 `submit_locked`（已持环锁）。
 
+### 文件（Paper 10）与 Unix 域套接字
+
+- `file_impl` 是第二条接缝：`begin_read(offset, buffers)` / `begin_write(offset, buffers)` +
+  同一套 `ready` / `suspend` / `finish_transfer`。`uring_file` 每个方向一个 `uring_file_op`，
+  `prepare()` 填 READV / WRITEV 的 SQE（`sqe.off = offset`，iovec 数组住在操作对象里），`res == 0`
+  的读是 `eof`，取消经 `ASYNC_CANCEL`（已进 io-wq 的操作可能取消不掉，那样它以正常结果完成）。
+  常规文件没有非阻塞语义，所以不做投机：除空序列外每个操作都提交。
+- 就绪型后端：`reactor_file` 不注册到解复用器（`epoll_ctl` 对常规文件 EPERM），`ready()` 里同步
+  `preadv` / `pwritev` 完成并返回 true，`suspend()` 永不被调用。这是 Corosio 的 POSIX 文件回退；
+  代价是这些后端上的文件操作不响应 `stop_token`、也无法取消。
+- Unix 域套接字复用 `socket_impl` 全部机制（含多发 accept、投机 recvmsg）。唯一的接缝改动是
+  `begin_receive_from` 的 `socklen_t* sender_length`：Unix 域端点的长度由路径决定，`recvmsg` /
+  RECVMSG 完成后把 `msg_namelen` 写回端点，UDP 一侧传空。
+
 ## 5. 接入 IOCP
 
 Windows 完成端口同样是完成型，且没有 fd：
