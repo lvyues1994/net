@@ -17,9 +17,7 @@
 #include "net/io_context.hpp"
 #include "net/io_env.hpp"
 #include "net/io_result.hpp"
-#if !NET_PLATFORM_WINDOWS
 #include "net/local.hpp"
-#endif
 #include "net/ip.hpp"
 #include "net/memory_resource.hpp"
 #include "net/multicast.hpp"

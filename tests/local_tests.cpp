@@ -5,7 +5,11 @@
 #include <string>
 
 #include <sys/stat.h>
+#if NET_PLATFORM_WINDOWS
+#include <process.h>
+#else
 #include <unistd.h>
+#endif
 
 #include "net/any_source_sink.hpp"
 #include "net/buffers.hpp"
@@ -22,10 +26,26 @@
 namespace {
 
 static_assert(net::is_stream<net::local_stream_socket>::value, "");
+#if !NET_PLATFORM_WINDOWS
 static_assert(net::is_stream<net::local_datagram_socket>::value, "");
+#endif
+
+std::string process_tag() {
+#if NET_PLATFORM_WINDOWS
+    return std::to_string(::_getpid());
+#else
+    return std::to_string(::getpid());
+#endif
+}
 
 std::string unique_path(char const* const tag) {
-    return "/tmp/net_local_" + std::string{tag} + "_" + std::to_string(::getpid());
+#if NET_PLATFORM_WINDOWS
+    char directory[MAX_PATH + 1] = {};
+    ::GetTempPathA(MAX_PATH + 1, directory);
+    return std::string{directory} + "net_local_" + tag + "_" + process_tag();
+#else
+    return "/tmp/net_local_" + std::string{tag} + "_" + process_tag();
+#endif
 }
 
 struct path_guard {
@@ -34,9 +54,14 @@ struct path_guard {
 };
 
 bool file_exists(std::string const& path) {
+#if NET_PLATFORM_WINDOWS
+    return ::GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+#else
     struct stat st{};
     return ::stat(path.c_str(), &st) == 0;
+#endif
 }
+
 
 template <class T> T run_task(test_context& ctx, net::task<T> t) {
     T result{};
@@ -112,9 +137,10 @@ void stream_echo_over_filesystem_path() {
     CHECK(again.is_open());
 }
 
+#if !NET_PLATFORM_WINDOWS
 void stream_echo_over_abstract_namespace() {
     test_context ctx;
-    std::string name = "net-local-abstract-" + std::to_string(::getpid());
+    std::string name = "net-local-abstract-" + process_tag();
     name.insert(name.begin(), '\0');
     net::local::stream_protocol::endpoint const ep{name};
     CHECK_EQ(ep.path().size(), name.size());
@@ -136,6 +162,7 @@ void stream_echo_over_abstract_namespace() {
     CHECK(client_ec == net::error::eof);
     CHECK_EQ(echoed, "hello over AF_UNIX");
 }
+#endif
 
 auto connect_only(net::local_stream_socket* client, net::local::stream_protocol::endpoint ep)
     CO2_BEG((net::task<std::error_code>), (client, ep), net::io_result<> c;) {
@@ -148,7 +175,8 @@ void connect_errors_are_reported() {
     test_context ctx;
     net::local_stream_socket client{ctx};
     auto const ec = run_task(ctx, connect_only(&client, net::local::stream_protocol::endpoint{"/nonexistent/dir/sock"}));
-    CHECK(ec == std::errc::no_such_file_or_directory);
+    // Windows 的 afunix 对不存在的路径报 WSAECONNREFUSED / ERROR_PATH_NOT_FOUND 之一
+    CHECK(ec == std::errc::no_such_file_or_directory || ec == std::errc::connection_refused);
     // 路径过长
     auto threw = false;
     try {
@@ -205,8 +233,9 @@ void write_sink_eof_is_shutdown() {
     CHECK(received == payload);
 }
 
-// ---- 数据报 ----
+// ---- 数据报（POSIX） ----
 
+#if !NET_PLATFORM_WINDOWS
 auto dgram_exchange(net::local_datagram_socket* a, net::local_datagram_socket* b, net::local::datagram_protocol::endpoint b_ep,
                     std::string* seen_sender, std::string* got)
     CO2_BEG((net::task<std::error_code>), (a, b, b_ep, seen_sender, got), net::io_result<std::size_t> s; net::io_result<std::size_t> r;
@@ -277,16 +306,19 @@ void datagram_connect_send_receive() {
     CHECK_EQ(client.remote_endpoint(ec).path(), gs.path);
     CHECK(not ec);
 }
+#endif
 
 } // namespace
 
 int main() {
     stream_echo_over_filesystem_path();
-    stream_echo_over_abstract_namespace();
     connect_errors_are_reported();
     write_sink_eof_is_shutdown();
+#if !NET_PLATFORM_WINDOWS
+    stream_echo_over_abstract_namespace();
     datagram_send_to_and_receive_from();
     datagram_connect_send_receive();
+#endif
     std::cout << "local socket tests passed\n";
     return 0;
 }

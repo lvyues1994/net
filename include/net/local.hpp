@@ -6,13 +6,13 @@
 #include <system_error>
 
 #include "net/config.hpp"
+#include "net/detail/socket_types.hpp"
 
 #if NET_PLATFORM_WINDOWS
-#error "net/local.hpp: Unix domain sockets are not available in the Windows platform layer yet"
-#endif
-
-#include <sys/socket.h>
+#include <afunix.h> // Windows 10 1803+：AF_UNIX 流套接字（sockaddr_un / UNIX_PATH_MAX）；没有数据报，没有抽象命名空间
+#else
 #include <sys/un.h>
+#endif
 
 #include "net/buffers.hpp"
 #include "net/socket_base.hpp"
@@ -27,7 +27,9 @@
 //   net::local_datagram_socket dgram{ctx, net::local::datagram_protocol::endpoint{"/tmp/app.dgram"}};
 //
 // 端点是 sockaddr_un；路径以 '\0' 开头是 Linux 的抽象命名空间（不在文件系统里，长度决定身份）。
-// 流 / 数据报套接字都建立在 socket_base 上，与 TCP / UDP 共用同一套后端实现（reactor / io_uring）。
+// 流 / 数据报套接字都建立在 socket_base 上，与 TCP / UDP 共用同一套后端实现（reactor / io_uring / IOCP）。
+// Windows（afunix.h）只有流套接字：local_datagram_socket 与 datagram_protocol 在 Windows 上不提供，
+// 抽象命名空间 bind 会失败。
 
 namespace net {
 namespace local {
@@ -59,13 +61,13 @@ template <class Protocol> struct basic_endpoint {
 
     sockaddr* data() noexcept { return reinterpret_cast<sockaddr*>(&data_); }
     sockaddr const* data() const noexcept { return reinterpret_cast<sockaddr const*>(&data_); }
-    std::size_t size() const noexcept { return length_; }
+    std::size_t size() const noexcept { return static_cast<std::size_t>(length_); }
     void resize(std::size_t const n) noexcept { length_ = static_cast<socklen_t>(n <= sizeof(data_) ? n : sizeof(data_)); }
     std::size_t capacity() const noexcept { return sizeof(data_); }
     socklen_t* length_storage() noexcept { return &length_; }
 
     friend bool operator==(basic_endpoint const& a, basic_endpoint const& b) noexcept {
-        return a.length_ == b.length_ && std::memcmp(&a.data_, &b.data_, a.length_) == 0;
+        return a.length_ == b.length_ && std::memcmp(&a.data_, &b.data_, static_cast<std::size_t>(a.length_)) == 0;
     }
     friend bool operator!=(basic_endpoint const& a, basic_endpoint const& b) noexcept { return not(a == b); }
 
@@ -82,6 +84,7 @@ struct stream_protocol {
     friend bool operator==(stream_protocol, stream_protocol) noexcept { return true; }
 };
 
+#if !NET_PLATFORM_WINDOWS
 struct datagram_protocol {
     using endpoint = basic_endpoint<datagram_protocol>;
     int family() const noexcept { return AF_UNIX; }
@@ -89,6 +92,7 @@ struct datagram_protocol {
     int protocol() const noexcept { return 0; }
     friend bool operator==(datagram_protocol, datagram_protocol) noexcept { return true; }
 };
+#endif
 
 } // namespace local
 
@@ -180,8 +184,9 @@ struct local_stream_acceptor : socket_base {
     friend struct local_accept_awaitable;
 };
 
-// ---- 数据报 ----
+// ---- 数据报（POSIX） ----
 
+#if !NET_PLATFORM_WINDOWS
 struct local_datagram_socket : socket_base {
     using protocol_type = local::datagram_protocol;
     using endpoint_type = protocol_type::endpoint;
@@ -244,6 +249,7 @@ struct local_datagram_socket : socket_base {
         return receive(buffers);
     }
 };
+#endif
 
 // WriteSink 适配器（source_sink.hpp）的流结束定制点：与 TCP 一样是 shutdown(send)。
 inline auto signal_stream_eof(local_stream_socket& socket, detail::eof_preferred) CO2_BEG((task<io_result<>>), (socket)) {

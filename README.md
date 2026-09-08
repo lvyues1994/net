@@ -143,14 +143,15 @@ ctest --test-dir build --output-on-failure
 Windows（MSVC，Visual Studio 生成器是多配置的）：
 
 ```bat
-cmake -S . -B build -A x64 -DNET_TLS_PROVIDER=OFF -DNET_CO2_DIR=path\to\coro
+cmake -S . -B build -A x64 -DNET_CO2_DIR=path\to\coro -DOPENSSL_ROOT_DIR="C:/Program Files/OpenSSL"
 cmake --build build --config Debug --parallel
 ctest --test-dir build -C Debug --output-on-failure
 ```
 
 MSVC 需要 `/permissive-`（`not` / `and` 作为关键字）与 `/Zc:preprocessor`（co2 协程 DSL 的标准
-`__VA_ARGS__` 展开），`net::net` 目标以 PUBLIC 编译选项带出去。Windows 上只有 IOCP 一个后端，
-`local.hpp` 暂不可用；在没有 Windows 机器时可以用 llvm-mingw（clang + mingw-w64 头）交叉编译做编译期
+`__VA_ARGS__` 展开），`net::net` 目标以 PUBLIC 编译选项带出去。Windows 上只有 IOCP 一个后端；Unix 域
+只有流套接字（afunix.h，无数据报、无抽象命名空间）；TLS 用 runner / 本机安装的 OpenSSL 3（没有就
+`-DNET_TLS_PROVIDER=OFF`）。在没有 Windows 机器时可以用 llvm-mingw（clang + mingw-w64 头）交叉编译做编译期
 检查：`-DCMAKE_SYSTEM_NAME=Windows -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-clang++`。
 
 抽象层仅含头文件；平台层与 TLS 编译进 `libnet.a`。作为子项目：
@@ -183,7 +184,7 @@ OpenSSL 与 BoringSSL 两个提供者下通过。TSan 只抑制未插桩的 libc
 CI（`.github/workflows/ci.yml`）：GCC / Clang × Debug / Release × 两种默认帧分配器的构建与
 测试、ASan+UBSan 与 TSan 全量运行、BoringSSL 提供者作业（FetchContent 构建并缓存）、quick 模式
 基准（结果写入 step summary 并上传 artifact），以及 MSVC × Debug / Release 的 IOCP 作业
-（windows-latest，TLS 关；cl 的诊断经 `.github/matchers/msvc.json`、ctest 失败经
+（windows-latest，runner 自带的 OpenSSL 3；cl 的诊断经 `.github/matchers/msvc.json`、ctest 失败经
 `.github/scripts/annotate_ctest.py` 变成注解，公开仓库匿名可读）。
 
 `examples/`：`echo_server`（accept 循环 + `any_stream` 会话 + SIGINT 优雅退出，

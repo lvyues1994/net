@@ -18,9 +18,7 @@
 #include "net/io_awaitable_promise_base.hpp"
 #include "net/io_env.hpp"
 #include "net/io_result.hpp"
-#if !NET_PLATFORM_WINDOWS
 #include "net/local.hpp"
-#endif
 #include "net/memory_resource.hpp"
 #include "net/multicast.hpp"
 #include "net/run.hpp"

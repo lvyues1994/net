@@ -1,8 +1,7 @@
 #include "net/local.hpp"
 
+#include <cstdio>
 #include <cstring>
-
-#include <unistd.h>
 
 #include "co2/contract.hpp"
 
@@ -24,14 +23,11 @@ template <class Endpoint> Endpoint endpoint_from(sockaddr_storage const& storage
     return endpoint;
 }
 
-// 绑定前删掉已有的套接字文件（抽象命名空间 / 未命名端点没有文件）。
-void unlink_socket_file(local::basic_endpoint<local::stream_protocol> const& endpoint) noexcept {
+// 绑定前删掉已有的套接字文件（抽象命名空间 / 未命名端点没有文件）。Windows 上套接字文件是重解析点，
+// 普通的 remove 就能删。
+template <class Protocol> void unlink_socket_file(local::basic_endpoint<Protocol> const& endpoint) noexcept {
     auto const path = endpoint.path();
-    if (not path.empty() && path[0] != '\0') ::unlink(path.c_str());
-}
-void unlink_socket_file(local::basic_endpoint<local::datagram_protocol> const& endpoint) noexcept {
-    auto const path = endpoint.path();
-    if (not path.empty() && path[0] != '\0') ::unlink(path.c_str());
+    if (not path.empty() && path[0] != '\0') std::remove(path.c_str());
 }
 
 } // namespace
@@ -102,14 +98,16 @@ io_result<local_stream_socket> local_accept_awaitable::await_resume() noexcept {
     auto peer = local_stream_socket{impl->context()};
     result.ec = peer.adopt_accepted(local::stream_protocol{}, fd);
     if (result.ec) {
-        ::close(fd);
+        detail::close_native_socket(fd);
         return result;
     }
     result.value = std::move(peer);
     return result;
 }
 
-// ---- local_datagram_socket ----
+// ---- local_datagram_socket（POSIX） ----
+
+#if !NET_PLATFORM_WINDOWS
 
 local_datagram_socket::local_datagram_socket(io_context& context, protocol_type const& protocol) : socket_base{context} {
     auto const ec = open(protocol);
@@ -137,5 +135,7 @@ local_datagram_socket::endpoint_type local_datagram_socket::remote_endpoint(std:
     ec = remote_endpoint_raw(reinterpret_cast<sockaddr*>(&storage), &length);
     return ec ? endpoint_type{} : endpoint_from<endpoint_type>(storage, length);
 }
+
+#endif // !NET_PLATFORM_WINDOWS
 
 } // namespace net

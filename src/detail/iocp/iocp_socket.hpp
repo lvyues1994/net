@@ -11,6 +11,7 @@
 #include "detail/backend.hpp"
 #include "detail/iocp/iocp_op.hpp"
 
+#include <afunix.h>  // AF_UNIX 的 sockaddr_un（ConnectEx 前的绑定）
 #include <mswsock.h> // 必须在 winsock2.h（socket_types.hpp）之后
 
 // IOCP 的套接字实现：WSARecv / WSASend / WSARecvFrom / WSASendTo / ConnectEx / AcceptEx，全部重叠，

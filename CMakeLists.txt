@@ -59,11 +59,11 @@ set(net_concrete_sources
     src/file.cpp
     src/resolver.cpp
     src/signal_set.cpp
+    src/local.cpp
     src/detail/timer_heap.cpp
     src/detail/heap_timer.cpp)
 
 set(net_posix_sources
-    src/local.cpp
     src/detail/posix/socket_ops.cpp
     src/detail/posix/file_ops.cpp)
 

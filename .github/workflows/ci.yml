@@ -93,13 +93,30 @@ jobs:
       - name: Register MSVC problem matcher
         run: echo "::add-matcher::.github/matchers/msvc.json"
 
+      # runner 镜像自带 OpenSSL 3（C:\Program Files\OpenSSL）；没有就用 choco 装。DLL 目录进 PATH 供测试运行。
+      - name: Locate OpenSSL
+        id: openssl
+        shell: pwsh
+        run: |
+          $candidates = @("C:\Program Files\OpenSSL", "C:\Program Files\OpenSSL-Win64")
+          $root = $candidates | Where-Object { Test-Path "$_\include\openssl\ssl.h" } | Select-Object -First 1
+          if (-not $root) {
+            choco install openssl -y --no-progress
+            $root = $candidates | Where-Object { Test-Path "$_\include\openssl\ssl.h" } | Select-Object -First 1
+          }
+          if (-not $root) { throw "OpenSSL not found on the runner" }
+          "root=$root" >> $env:GITHUB_OUTPUT
+          "$root\bin" >> $env:GITHUB_PATH
+          Write-Host "OpenSSL at $root"
+
       # Visual Studio 生成器是多配置的：配置阶段不指定类型，构建与测试时用 --config / -C。
-      # TLS 关掉（runner 上没有 OpenSSL），基准也关掉（需要 Boost.Asio）。
+      # 基准关掉（需要 Boost.Asio）。
       - name: Configure
         run: >
           cmake -S . -B build -A x64
           -DNET_CO2_DIR="${{ github.workspace }}/co2"
-          -DNET_TLS_PROVIDER=OFF
+          -DNET_TLS_PROVIDER=OpenSSL
+          -DOPENSSL_ROOT_DIR="${{ steps.openssl.outputs.root }}"
           -DNET_BUILD_BENCHMARKS=OFF
 
       - name: Build
