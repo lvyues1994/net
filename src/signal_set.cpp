@@ -43,17 +43,21 @@ struct signal_state {
 
 #if NET_PLATFORM_WINDOWS
     // Windows 的信号处理函数在别的线程上跑（SIGINT 来自控制台控制线程），没有异步信号安全的顾虑；
-    // "自管道"是一对回环 TCP 套接字：写端 send，读端交给 IOCP 后端做重叠接收。
+    // "自管道"是一对回环 TCP 套接字：写端 send，读端交给 IOCP 后端做重叠接收。一个套接字只能挂到
+    // 一个完成端口，所以每个 io_context 一对（写端登记在 writers_ 里，处理函数向全部写端发送）。
     static void handler(int const signal_number) {
-        auto const s = instance().pipe_write_;
-        if (not socket_is_valid(s)) return;
         auto const value = signal_number;
-        static_cast<void>(::send(s, reinterpret_cast<char const*>(&value), sizeof(value), 0));
+        {
+            auto& self = instance();
+            std::lock_guard<std::mutex> lock{self.writers_mutex_};
+            for (auto const s : self.writers_)
+                static_cast<void>(::send(s, reinterpret_cast<char const*>(&value), sizeof(value), 0));
+        }
         ::signal(signal_number, &handler); // CRT 在投递后把处理函数复位为 SIG_DFL
     }
 
-    std::error_code ensure_pipe() noexcept {
-        if (socket_is_valid(pipe_read_)) return {};
+    // 新建一对；读端交给调用方（后端拥有并关闭），写端登记。
+    std::error_code create_pipe(native_socket_type& read_end, native_socket_type& write_end) noexcept {
         ensure_networking_initialized();
         auto const listener = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (not socket_is_valid(listener)) return last_socket_error();
@@ -83,9 +87,21 @@ struct signal_state {
             if (socket_is_valid(reader)) ::closesocket(reader);
             return ec;
         }
-        pipe_read_ = reader;
-        pipe_write_ = writer;
+        {
+            std::lock_guard<std::mutex> lock{writers_mutex_};
+            writers_.push_back(writer);
+        }
+        read_end = reader;
+        write_end = writer;
         return {};
+    }
+
+    void destroy_pipe(native_socket_type const write_end) noexcept {
+        {
+            std::lock_guard<std::mutex> lock{writers_mutex_};
+            writers_.erase(std::remove(writers_.begin(), writers_.end(), write_end), writers_.end());
+        }
+        ::closesocket(write_end);
     }
 #else
     static void handler(int const signal_number) {
@@ -105,9 +121,8 @@ struct signal_state {
         pipe_write_ = fds[1];
         return {};
     }
-#endif
-
     native_socket_type pipe_read() const noexcept { return pipe_read_; }
+#endif
 
     std::error_code add(signal_set_impl& set, int const signal_number) noexcept;
     std::error_code remove(signal_set_impl& set, int const signal_number) noexcept;
@@ -118,8 +133,13 @@ struct signal_state {
   private:
     signal_state() : registrations_(NSIG), old_actions_(NSIG), installed_(NSIG, false) {}
 
+#if NET_PLATFORM_WINDOWS
+    std::mutex writers_mutex_;
+    std::vector<native_socket_type> writers_;
+#else
     native_socket_type pipe_read_ = invalid_socket;
     native_socket_type pipe_write_ = invalid_socket;
+#endif
     std::vector<std::vector<signal_set_impl*>> registrations_;
 #if NET_PLATFORM_WINDOWS
     using old_action = void (*)(int);
@@ -181,16 +201,36 @@ struct signal_service final : execution_context::service {
     explicit signal_service(execution_context& context) {
         auto& state = signal_state::instance();
         auto fd = invalid_socket;
+#if NET_PLATFORM_WINDOWS
+        {
+            auto const ec = state.create_pipe(fd, write_end_);
+            if (ec) throw std::system_error{ec, "signal_set pipe"};
+        }
+#else
         {
             std::lock_guard<std::mutex> lock{state.mutex};
             auto const ec = state.ensure_pipe();
             if (ec) throw std::system_error{ec, "signal_set pipe"};
             fd = state.pipe_read();
         }
+#endif
         auto const registered = io_context_access::backend(static_cast<io_context&>(context))
                                     .register_signal_reader(fd, &signal_service::deliver);
-        if (registered) throw std::system_error{registered, "signal_set register"};
+        if (registered) {
+#if NET_PLATFORM_WINDOWS
+            state.destroy_pipe(write_end_);
+            write_end_ = invalid_socket;
+            ::closesocket(fd);
+#endif
+            throw std::system_error{registered, "signal_set register"};
+        }
     }
+
+#if NET_PLATFORM_WINDOWS
+    ~signal_service() override {
+        if (socket_is_valid(write_end_)) signal_state::instance().destroy_pipe(write_end_);
+    }
+#endif
 
     void shutdown() override {}
 
@@ -198,6 +238,9 @@ struct signal_service final : execution_context::service {
     static void deliver(int const signal_number) noexcept {
         signal_state::instance().deliver(signal_number);
     }
+#if NET_PLATFORM_WINDOWS
+    native_socket_type write_end_ = invalid_socket;
+#endif
 };
 
 // ---- signal_state ----
