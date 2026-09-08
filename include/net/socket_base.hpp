@@ -33,7 +33,8 @@ struct io_context;
 
 namespace detail {
 struct socket_impl;
-}
+struct socket_access;
+} // namespace detail
 
 enum class shutdown_type : int { receive = shutdown_receive, send = shutdown_send, both = shutdown_both };
 
@@ -153,6 +154,7 @@ struct socket_base {
     std::size_t available(std::error_code& ec) const noexcept;
 
   protected:
+    friend struct detail::socket_access;
     std::error_code open_raw(int family, int type, int protocol) noexcept;
     std::error_code assign_raw(int family, int type, int protocol, native_handle_type fd) noexcept;
     // 描述符由本库创建（已非阻塞 + CLOEXEC）：accept 的对端套接字用它。

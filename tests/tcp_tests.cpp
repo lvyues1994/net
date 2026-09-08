@@ -15,6 +15,7 @@
 #include "net/error.hpp"
 #include "net/io_context.hpp"
 #include "net/ip.hpp"
+#include "net/receive_source.hpp"
 #include "net/run_async.hpp"
 #include "net/source_sink.hpp"
 #include "net/stream.hpp"
@@ -675,6 +676,148 @@ void registered_buffers_round_trip() {
     CHECK(not ec);
 }
 
+// ---- receive_source：被调方拥有缓冲区的接收（io_uring：多发 RECV + 提供缓冲环；其它后端：缓冲池 + read_some） ----
+
+auto drain_source(net::receive_source* source, std::string* out, std::size_t consume_step)
+    CO2_BEG((net::task<std::error_code>), (source, out, consume_step), net::const_buffer scratch[8]; net::io_result<net::const_buffer_span> r;
+            std::size_t take{}; std::size_t total{}; std::size_t i{};) {
+    for (;;) {
+        CO2_AWAIT_SET(r, source->pull(net::const_buffer_span{scratch, 8}));
+        if (r.ec) CO2_RETURN(r.ec);
+        CHECK(not r.value.empty());
+        total = 0;
+        for (i = 0; i != r.value.size(); ++i) total += r.value[i].size();
+        take = consume_step == 0U ? total : (consume_step < total ? consume_step : total);
+        // 只取前 take 字节（可能跨块）
+        for (i = 0; i != r.value.size() && take != 0U; ++i) {
+            auto const n = r.value[i].size() < take ? r.value[i].size() : take;
+            out->append(static_cast<char const*>(r.value[i].data()), n);
+            take -= n;
+        }
+        take = consume_step == 0U ? total : (consume_step < total ? consume_step : total);
+        source->consume(take);
+    }
+}
+CO2_END
+
+auto write_in_pieces(net::tcp_socket* sock, std::string const* payload, std::size_t piece, net::io_context* ctx)
+    CO2_BEG((net::task<std::error_code>), (sock, payload, piece, ctx), std::size_t offset{}; std::size_t n{}; net::io_result<std::size_t> w;
+            net::steady_timer timer{*ctx}; net::io_result<> t;) {
+    while (offset < payload->size()) {
+        n = payload->size() - offset < piece ? payload->size() - offset : piece;
+        CO2_AWAIT_SET(w, net::write(*sock, net::buffer(payload->data() + offset, n)));
+        if (w.ec) CO2_RETURN(w.ec);
+        offset += n;
+        if (offset % (piece * 4U) == 0U) { // 偶尔停一下，让接收端排空
+            timer.expires_after(std::chrono::microseconds{200});
+            CO2_AWAIT_SET(t, timer.wait());
+        }
+    }
+    sock->shutdown(net::shutdown_type::send);
+    CO2_RETURN(std::error_code{});
+}
+CO2_END
+
+void receive_source_delivers_everything(std::size_t const buffers, std::size_t const buffer_size, std::size_t const consume_step) {
+    connected_pair pair;
+    std::string payload;
+    for (auto i = 0U; i != 300U * 1024U + 123U; ++i) payload += static_cast<char>('a' + i % 26U);
+    net::receive_source source{pair.server, buffers, buffer_size};
+    std::string received;
+    std::error_code recv_ec;
+    std::error_code send_ec;
+    net::run_async(pair.ctx.get_executor(), [&](std::error_code e) { recv_ec = e; }, [](std::exception_ptr) { CHECK(false); })(
+        drain_source(&source, &received, consume_step));
+    net::run_async(pair.ctx.get_executor(), [&](std::error_code e) { send_ec = e; }, [](std::exception_ptr) { CHECK(false); })(
+        write_in_pieces(&pair.client, &payload, 7000U, &pair.ctx));
+    pair.ctx.run();
+    CHECK(not send_ec);
+    CHECK(recv_ec == net::error::eof);
+    CHECK(received == payload);
+}
+
+void receive_source_round_trips() {
+    receive_source_delivers_everything(16U, 16U * 1024U, 0U);   // 整块消费
+    receive_source_delivers_everything(2U, 1024U, 0U);         // 小池：io_uring 上走 ENOBUFS → 归还 → 重新武装
+    receive_source_delivers_everything(4U, 4096U, 333U);       // 部分消费：下一次 pull 先给剩下的
+    {
+        connected_pair pair;
+        net::receive_source source{pair.server};
+        std::cout << "receive_source on " << pair.ctx.backend_name() << ": " << (source.kernel_owned() ? "kernel-owned buffers" : "fallback pool")
+                  << "\n";
+    }
+}
+
+auto write_after_delay(net::tcp_socket* sock, std::string payload, net::io_context* ctx, std::chrono::milliseconds delay)
+    CO2_BEG((net::task<>), (sock, payload, ctx, delay), net::steady_timer timer{*ctx}; net::io_result<> t; net::io_result<std::size_t> w;) {
+    timer.expires_after(delay);
+    CO2_AWAIT_SET(t, timer.wait());
+    CO2_AWAIT_SET(w, net::write(*sock, net::buffer(payload)));
+    CHECK(not w.ec);
+}
+CO2_END
+
+// pull 与定时器赛跑：没有数据时超时赢，pull 以 aborted 完成一次，之后照常。
+using pull_or_timeout = net::when_any_result<std::tuple<net::const_buffer_span, std::tuple<>>>;
+
+auto pull_with_timeout(net::receive_source* source, net::io_context* ctx, pull_or_timeout* first, std::string* later)
+    CO2_BEG((net::task<>), (source, ctx, first, later), net::steady_timer timer{*ctx}; net::const_buffer scratch[4];
+            net::io_result<net::const_buffer_span> r;) {
+    timer.expires_after(std::chrono::milliseconds{20});
+    CO2_AWAIT_SET(*first, net::when_any(source->pull(net::const_buffer_span{scratch, 4}), timer.wait()));
+    // 现在对端会写：普通 pull 拿到数据
+    CO2_AWAIT_SET(r, source->pull(net::const_buffer_span{scratch, 4}));
+    CHECK(not r.ec);
+    for (auto const& b : r.value) later->append(static_cast<char const*>(b.data()), b.size());
+    source->consume(later->size());
+}
+CO2_END
+
+void receive_source_pull_is_cancellable() {
+    connected_pair pair;
+    net::receive_source source{pair.server, 4U, 1024U};
+    pull_or_timeout first;
+    std::string later;
+    net::run_async(pair.ctx.get_executor())(pull_with_timeout(&source, &pair.ctx, &first, &later));
+    std::string const payload = "after the timeout";
+    net::run_async(pair.ctx.get_executor())(write_after_delay(&pair.client, payload, &pair.ctx, std::chrono::milliseconds{60}));
+    pair.ctx.run();
+    CHECK(not first.ec);
+    CHECK_EQ(first.index, 1U); // 定时器赢
+    CHECK_EQ(later, payload);
+}
+
+// receive_source 是 BufferSource：直接喂给 transfer_to_stream（Paper 6 的算法组合）。
+auto relay(net::receive_source* source, net::tcp_socket* out)
+    CO2_BEG((net::task<net::io_result<std::size_t>>), (source, out), net::io_result<std::size_t> r;) {
+    CO2_AWAIT_SET(r, net::transfer_to_stream(*source, *out));
+    out->shutdown(net::shutdown_type::send);
+    CO2_RETURN(r);
+}
+CO2_END
+
+void receive_source_composes_with_transfer() {
+    connected_pair first;  // client → server（source 在 server 上）
+    connected_pair second; // second.client → second.server：中继目标
+    net::receive_source source{first.server, 8U, 2048U};
+    std::string payload(100U * 1024U, 'r');
+    std::string received;
+    std::error_code recv_ec;
+    net::io_result<std::size_t> relayed;
+    net::run_async(first.ctx.get_executor(), [&](net::io_result<std::size_t> v) { relayed = v; }, [](std::exception_ptr) { CHECK(false); })(
+        relay(&source, &second.client));
+    net::run_async(first.ctx.get_executor())(write_in_pieces(&first.client, &payload, 9000U, &first.ctx));
+    net::run_async(second.ctx.get_executor(), [&](std::error_code e) { recv_ec = e; }, [](std::exception_ptr) { CHECK(false); })(
+        read_all_until_eof(&second.server, &received));
+    std::thread other{[&] { second.ctx.run(); }};
+    first.ctx.run();
+    other.join();
+    CHECK(not relayed.ec);
+    CHECK_EQ(relayed.value, payload.size());
+    CHECK(recv_ec == net::error::eof);
+    CHECK(received == payload);
+}
+
 void endpoints_and_options() {
     connected_pair pair;
     std::error_code ec;
@@ -714,6 +857,9 @@ int main() {
     write_sink_eof_is_tcp_shutdown();
     buffer_sink_commit_eof_is_tcp_shutdown();
     registered_buffers_round_trip();
+    receive_source_round_trips();
+    receive_source_pull_is_cancellable();
+    receive_source_composes_with_transfer();
     endpoints_and_options();
     std::cout << "tcp tests passed\n";
     return 0;

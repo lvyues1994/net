@@ -60,6 +60,7 @@ set(net_concrete_sources
     src/resolver.cpp
     src/signal_set.cpp
     src/local.cpp
+    src/receive_source.cpp
     src/detail/timer_heap.cpp
     src/detail/heap_timer.cpp)
 
@@ -86,7 +87,8 @@ set(net_io_uring_sources
     src/detail/io_uring/uring_backend.cpp
     src/detail/io_uring/uring_socket.cpp
     src/detail/io_uring/uring_timer.cpp
-    src/detail/io_uring/uring_file.cpp)
+    src/detail/io_uring/uring_file.cpp
+    src/detail/io_uring/uring_receive.cpp)
 
 # ---- TLS 提供者 ----
 #

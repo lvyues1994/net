@@ -37,6 +37,7 @@
 #include "net/backend.hpp"
 #include "net/io_context.hpp"
 #include "net/ip.hpp"
+#include "net/receive_source.hpp"
 #include "net/resolver.hpp"
 #include "net/signal_set.hpp"
 #include "net/socket_base.hpp"

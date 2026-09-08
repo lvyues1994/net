@@ -45,6 +45,8 @@ void close_native_socket(native_socket_type const s) noexcept {
 
 std::error_code last_socket_error() noexcept { return last_error(); }
 
+socket_impl* socket_access::impl(socket_base& socket) noexcept { return socket.impl(); }
+
 void ensure_networking_initialized() noexcept {
 #if NET_PLATFORM_WINDOWS
     struct winsock_session {

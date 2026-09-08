@@ -39,10 +39,30 @@
 namespace net {
 
 struct io_context;
+struct socket_base;
 
 namespace detail {
 
 enum class op_direction : unsigned char { read = 0, write = 1 };
+
+// 被调方拥有缓冲区的接收流（receive_source 的后端实现）：内核 / 后端往它自己的缓冲池里收数据，
+// pull 交出已到达的块，consume 归还。io_uring 用常驻的多发 RECV + 提供缓冲环实现；没有专门实现的
+// 后端返回空指针，receive_source 用套接字的三步读协议 + 自己的缓冲池回退。
+// pull 也是三步协议；同一时刻只能有一个 pull 在飞。
+struct receive_stream_impl {
+    receive_stream_impl() = default;
+    receive_stream_impl(receive_stream_impl const&) = delete;
+    receive_stream_impl& operator=(receive_stream_impl const&) = delete;
+    virtual ~receive_stream_impl() = default;
+
+    virtual bool pull_ready() noexcept = 0;
+    virtual coroutine_handle<> pull_suspend(coroutine_handle<> h, io_env const* env) noexcept = 0;
+    // 把尚未消费的块（最多 dest.size() 个）写进 dest；耗尽 → eof + 空 span。
+    virtual io_result<span<const_buffer>> pull_finish(span<const_buffer> dest) noexcept = 0;
+    virtual void consume(std::size_t n) noexcept = 0;
+    virtual void cancel() noexcept = 0;
+    virtual bool has_pending() const noexcept = 0;
+};
 
 // 关闭一个尚未交给任何实现对象的裸套接字（accept 出来但 adopt 失败的对端等）。
 void close_native_socket(native_socket_type s) noexcept;
@@ -102,6 +122,13 @@ struct socket_impl {
 
     // 是否有未完成的操作（销毁契约用）。
     virtual bool has_pending() const noexcept = 0;
+
+    // 被调方拥有缓冲区的接收流（见 receive_stream_impl）；默认没有专门实现。
+    virtual std::unique_ptr<receive_stream_impl> create_receive_stream(std::size_t buffer_count, std::size_t buffer_size) {
+        static_cast<void>(buffer_count);
+        static_cast<void>(buffer_size);
+        return nullptr;
+    }
 };
 
 // 文件的实现（Paper 10）。两种公共类型（顺序的 stream_file、按偏移的 random_access_file）都建立在同一
@@ -195,6 +222,11 @@ struct io_backend {
 // io_context 的私有入口。
 struct io_context_access {
     static io_backend& backend(io_context& context) noexcept;
+};
+
+// socket_base 的私有入口（receive_source 等建立在套接字之上的具体层对象用）。
+struct socket_access {
+    static socket_impl* impl(socket_base& socket) noexcept;
 };
 
 } // namespace detail

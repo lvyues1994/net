@@ -157,6 +157,7 @@ struct uring_socket final : socket_impl {
     std::error_code finish_accept(int& fd, int& family) noexcept override;
 
     bool has_pending() const noexcept override { return read_op_.pending || write_op_.pending; }
+    std::unique_ptr<receive_stream_impl> create_receive_stream(std::size_t buffer_count, std::size_t buffer_size) override;
 
     uring_backend& backend() noexcept { return *backend_; }
     uring_socket_op& op_for(op_direction const direction) noexcept {

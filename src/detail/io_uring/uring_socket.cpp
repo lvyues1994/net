@@ -13,6 +13,7 @@
 #include "net/io_context.hpp"
 
 #include "detail/io_uring/uring_backend.hpp"
+#include "detail/io_uring/uring_receive.hpp"
 #include "detail/posix/socket_ops.hpp"
 
 namespace net {
@@ -347,6 +348,14 @@ int uring_socket::release() noexcept {
     auto const released = fd_;
     fd_ = -1;
     return released;
+}
+
+std::unique_ptr<receive_stream_impl> uring_socket::create_receive_stream(std::size_t const buffer_count,
+                                                                         std::size_t const buffer_size) {
+    if (fd_ < 0 || not multishot_recv_supported()) return nullptr;
+    std::unique_ptr<uring_receive_stream> stream{new uring_receive_stream{*context_, *backend_, fd_, file_slot_, buffer_count, buffer_size}};
+    if (not stream->valid()) return nullptr; // 环注册失败（内核 / 额度）：回退
+    return std::unique_ptr<receive_stream_impl>{stream.release()};
 }
 
 // ---- 多发 accept 的完成（环锁内） ----
