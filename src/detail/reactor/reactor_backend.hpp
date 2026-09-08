@@ -22,7 +22,7 @@
 namespace net {
 namespace detail {
 
-struct reactor_backend final : execution_context::service, io_backend, event_sink {
+struct reactor_backend final : execution_context::service, io_backend, event_sink, timer_scheduler {
     using key_type = io_backend;
 
     reactor_backend(execution_context& context, std::unique_ptr<demultiplexer> demux);
@@ -55,8 +55,8 @@ struct reactor_backend final : execution_context::service, io_backend, event_sin
     bool cancel_op(descriptor_state& state, op_direction direction, reactor_op& op) noexcept;
     void cancel_ops(descriptor_state& state) noexcept;
 
-    bool add_timer(timer_op& op) noexcept; // 返回 true：已因停止请求同步以 aborted 完成
-    bool cancel_timer(timer_op& op, bool from_stop_token = false) noexcept;
+    bool add_timer(timer_op& op) noexcept override; // 返回 true：已因停止请求同步以 aborted 完成
+    bool cancel_timer(timer_op& op, bool from_stop_token) noexcept override;
 
   protected:
     void shutdown() override;
@@ -88,12 +88,6 @@ struct reactor_backend final : execution_context::service, io_backend, event_sin
     void detach_ops(descriptor_state& state, reactor_op* (&cancelled)[2]) noexcept;
     long long wait_timeout_ns(long limit_ms) const noexcept;
     void arm_timer_fd_locked() noexcept;
-    void pop_expired_timers(std::vector<timer_op*>& expired) noexcept;
-    void heap_push(timer_op& op) noexcept;
-    void heap_remove(std::size_t index) noexcept;
-    void heap_up(std::size_t index) noexcept;
-    void heap_down(std::size_t index) noexcept;
-    void heap_swap(std::size_t a, std::size_t b) noexcept;
 
     void finish_cancelled(reactor_op* const (&cancelled)[2]) noexcept;
 
@@ -101,7 +95,7 @@ struct reactor_backend final : execution_context::service, io_backend, event_sin
     std::unique_ptr<demultiplexer> demux_;
     std::mutex mutex_;
     std::unordered_set<descriptor_state*> registered_;
-    std::vector<timer_op*> timers_;
+    timer_heap timers_;
     std::vector<pending_event> events_;   // 只有运行 run 的线程触碰
     std::vector<completed_op> completed_; // 同上（复用，避免每轮分配）
     std::vector<timer_op*> expired_;      // 同上

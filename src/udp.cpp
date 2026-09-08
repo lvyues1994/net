@@ -12,7 +12,7 @@ namespace {
 udp_socket::endpoint_type endpoint_from(sockaddr_storage const& storage,
                                         socklen_t const length) noexcept {
     auto endpoint = udp_socket::endpoint_type{};
-    if (length <= endpoint.capacity()) std::memcpy(endpoint.data(), &storage, length);
+    if (static_cast<std::size_t>(length) <= endpoint.capacity()) std::memcpy(endpoint.data(), &storage, static_cast<std::size_t>(length));
     return endpoint;
 }
 

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "net/config.hpp"
+
 // 后端标签：在构造 io_context 时选择事件机制。
 //
 //   net::io_context ctx;                 // 默认后端（Linux：epoll）
@@ -19,6 +21,7 @@ enum class backend_kind : unsigned char {
     poll,
     select,
     io_uring,
+    iocp,
 };
 
 struct epoll_t {
@@ -37,12 +40,21 @@ struct io_uring_t {
     static constexpr backend_kind kind = backend_kind::io_uring;
 };
 
+struct iocp_t {
+    static constexpr backend_kind kind = backend_kind::iocp;
+};
+
 constexpr epoll_t epoll{};
 constexpr poll_t poll{};
 constexpr select_t select{};
 constexpr io_uring_t io_uring{};
+constexpr iocp_t iocp{};
 
+#if NET_PLATFORM_WINDOWS
+using default_backend_t = iocp_t;
+#else
 using default_backend_t = epoll_t;
+#endif
 constexpr default_backend_t default_backend{};
 
 inline char const* to_string(backend_kind const kind) noexcept {
@@ -51,6 +63,7 @@ inline char const* to_string(backend_kind const kind) noexcept {
     case backend_kind::poll: return "poll";
     case backend_kind::select: return "select";
     case backend_kind::io_uring: return "io_uring";
+    case backend_kind::iocp: return "iocp";
     }
     return "unknown";
 }

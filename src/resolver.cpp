@@ -9,10 +9,13 @@
 #include "co2/contract.hpp"
 
 #include "net/continuation.hpp"
+#include "net/detail/socket_types.hpp"
 #include "net/detail/storage.hpp"
 #include "net/error.hpp"
 #include "net/execution_context.hpp"
 #include "net/io_context.hpp"
+
+#include "detail/backend.hpp"
 
 namespace net {
 namespace detail {
@@ -28,7 +31,9 @@ std::error_code translate_gai(int const code) noexcept {
     case EAI_SERVICE: return make_error_code(error::service_not_found);
     case EAI_SOCKTYPE: return make_error_code(error::socket_type_not_supported);
     case EAI_MEMORY: return std::make_error_code(std::errc::not_enough_memory);
+#if defined(EAI_SYSTEM)
     case EAI_SYSTEM: return std::error_code{errno, std::system_category()};
+#endif
 #if defined(EAI_NODATA) && EAI_NODATA != EAI_NONAME
     case EAI_NODATA: return make_error_code(error::no_data);
 #endif
@@ -83,7 +88,7 @@ struct resolver_impl {
 
 // 每个 io_context 一个解析服务：一条惰性启动的工作线程串行执行阻塞的 getaddrinfo。
 struct resolver_service final : execution_context::service {
-    explicit resolver_service(execution_context&) {}
+    explicit resolver_service(execution_context&) { ensure_networking_initialized(); }
 
     ~resolver_service() override { stop_worker(); }
 
@@ -175,7 +180,7 @@ struct resolver_service final : execution_context::service {
             if (entry->ai_addrlen > sizeof(sockaddr_storage)) continue;
             raw_endpoint raw{};
             std::memcpy(&raw.storage, entry->ai_addr, entry->ai_addrlen);
-            raw.length = entry->ai_addrlen;
+            raw.length = static_cast<socklen_t>(entry->ai_addrlen);
             raw.host_name = entry->ai_canonname != nullptr ? entry->ai_canonname : job.host;
             raw.service_name = job.service_name;
             job.results.push_back(std::move(raw));
@@ -192,7 +197,7 @@ struct resolver_service final : execution_context::service {
                                         sizeof(service), job.socktype == SOCK_DGRAM ? NI_DGRAM : 0);
         if (code != 0) return translate_gai(code);
         raw_endpoint raw{};
-        std::memcpy(&raw.storage, &job.reverse_address, job.reverse_length);
+        std::memcpy(&raw.storage, &job.reverse_address, static_cast<std::size_t>(job.reverse_length));
         raw.length = job.reverse_length;
         raw.host_name = host;
         raw.service_name = service;
@@ -237,7 +242,7 @@ void resolver_access::start_reverse(resolver_impl& impl, sockaddr const* const a
                                     socklen_t const length, int const socktype) {
     CO2_CONTRACT_CHECK(not impl.pending);
     impl.reverse = true;
-    std::memcpy(&impl.reverse_address, address, length);
+    std::memcpy(&impl.reverse_address, address, static_cast<std::size_t>(length));
     impl.reverse_length = length;
     impl.socktype = socktype;
     impl.cancelled.store(false, std::memory_order_relaxed);

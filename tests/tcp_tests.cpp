@@ -9,10 +9,6 @@
 #include <thread>
 #include <vector>
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
 #include "net/any_source_sink.hpp"
 #include "net/any_stream.hpp"
@@ -29,6 +25,7 @@
 #include "net/when_any.hpp"
 
 #include "check.hpp"
+#include "platform.hpp"
 
 namespace {
 
@@ -156,14 +153,16 @@ CO2_END
 // connect 在 SYN 还在路上时就报成功，之后第一次写才看到错误。
 using connect_or_timeout = net::when_any_result<std::tuple<>>;
 
+#if !NET_PLATFORM_WINDOWS
 // backlog 0 的监听套接字 + 一个已完成的连接把队列填满；返回监听端口（描述符由调用方持有）。
+// （Windows 的 backlog 0 不是"队列满"的语义，这个回归只在 POSIX 上跑。）
 struct full_backlog {
     int listener = -1;
     int filler = -1;
     net::ip::tcp::endpoint endpoint;
 
     full_backlog() {
-        listener = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        listener = net_test::raw_tcp_socket();
         CHECK(listener >= 0);
         sockaddr_in local{};
         local.sin_family = AF_INET;
@@ -173,13 +172,13 @@ struct full_backlog {
         socklen_t length = sizeof(local);
         CHECK(::getsockname(listener, reinterpret_cast<sockaddr*>(&local), &length) == 0);
         endpoint = net::ip::tcp::endpoint{net::ip::address_v4::loopback(), ntohs(local.sin_port)};
-        filler = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        filler = net_test::raw_tcp_socket();
         CHECK(filler >= 0);
         CHECK(::connect(filler, reinterpret_cast<sockaddr const*>(&local), sizeof(local)) == 0); // 占满队列
     }
     ~full_backlog() {
-        ::close(filler);
-        ::close(listener);
+        net_test::close_raw_socket(filler);
+        net_test::close_raw_socket(listener);
     }
 };
 
@@ -208,6 +207,7 @@ void connect_after_idle_open_never_reports_a_false_success() {
     CHECK_EQ(result.index, 1U); // 定时器赢：连接仍在进行
     CHECK(not connected);
 }
+#endif
 
 struct connected_pair {
     test_context ctx;
@@ -541,10 +541,9 @@ void closing_acceptor_drops_queued_connections() {
 // assign 一个已在监听的描述符：accept() 直接可用。
 void assigning_a_listening_descriptor() {
     test_context ctx;
-    auto const raw = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    CHECK(raw >= 0);
-    auto const one = 1;
-    ::setsockopt(raw, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    auto const raw = net_test::raw_tcp_socket();
+    CHECK(net::socket_is_valid(raw));
+    net_test::set_reuse_address(raw);
     sockaddr_in local{};
     local.sin_family = AF_INET;
     local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -563,7 +562,7 @@ void assigning_a_listening_descriptor() {
     auto const released = acceptor.release();
     CHECK(released == raw);
     CHECK(not acceptor.is_open());
-    ::close(released);
+    net_test::close_raw_socket(released);
 }
 
 // ---- 第二族流概念在 TCP 上：write_eof → shutdown(send)，对端读到 eof；BufferSink 的 commit_eof 同样 ----
@@ -653,7 +652,9 @@ void endpoints_and_options() {
 int main() {
     loopback_echo();
     connect_to_a_closed_port_fails();
+#if !NET_PLATFORM_WINDOWS
     connect_after_idle_open_never_reports_a_false_success();
+#endif
     cancel_aborts_a_pending_read();
     close_aborts_a_pending_read();
     stop_token_aborts_a_pending_read();

@@ -9,10 +9,14 @@
 #include "net/memory_resource.hpp"
 
 #include "detail/backend.hpp"
+#if NET_PLATFORM_WINDOWS
+#include "detail/iocp/iocp_backend.hpp"
+#else
 #include "detail/io_uring/uring.hpp"
 #include "detail/io_uring/uring_backend.hpp"
 #include "detail/reactor/demultiplexer.hpp"
 #include "detail/reactor/reactor_backend.hpp"
+#endif
 
 namespace net {
 
@@ -51,12 +55,24 @@ bool thread_runs(io_context const* const context) noexcept {
 
 namespace {
 
+#if NET_PLATFORM_WINDOWS
+
+// Windows 只有一个后端：IOCP。其它标签构造时报 not_supported。
+detail::io_backend& make_backend(io_context& owner, backend_kind const kind, int) {
+    if (kind != backend_kind::iocp)
+        throw std::system_error{std::make_error_code(std::errc::not_supported), "io_context backend"};
+    return owner.make_service<detail::iocp_backend>();
+}
+
+#else
+
 std::unique_ptr<detail::demultiplexer> make_demultiplexer(backend_kind const kind) {
     switch (kind) {
     case backend_kind::epoll: return detail::make_epoll_demultiplexer();
     case backend_kind::poll: return detail::make_poll_demultiplexer();
     case backend_kind::select: return detail::make_select_demultiplexer();
-    case backend_kind::io_uring: break;
+    case backend_kind::io_uring:
+    case backend_kind::iocp: break;
     }
     return detail::make_epoll_demultiplexer();
 }
@@ -66,10 +82,14 @@ std::unique_ptr<detail::demultiplexer> make_demultiplexer(backend_kind const kin
 detail::io_backend& make_backend(io_context& owner, backend_kind const kind, int const concurrency_hint) {
     // single_thread_hint 是调用方的承诺：io_uring 以单提交者模式创建（SINGLE_ISSUER |
     // DEFER_TASKRUN）。其它提示值（包括 1）只是提示，用普通模式。
+    if (kind == backend_kind::iocp)
+        throw std::system_error{std::make_error_code(std::errc::not_supported), "io_context backend"};
     if (kind == backend_kind::io_uring)
         return owner.make_service<detail::uring_backend>(concurrency_hint == single_thread_hint);
     return owner.make_service<detail::reactor_backend>(make_demultiplexer(kind));
 }
+
+#endif
 
 } // namespace
 
@@ -224,10 +244,19 @@ backend_kind io_context::backend() const noexcept { return impl_->kind; }
 
 bool backend_available(backend_kind const kind) noexcept {
     switch (kind) {
+#if NET_PLATFORM_WINDOWS
+    case backend_kind::iocp: return true;
+    case backend_kind::epoll:
+    case backend_kind::poll:
+    case backend_kind::select:
+    case backend_kind::io_uring: return false;
+#else
     case backend_kind::epoll:
     case backend_kind::poll:
     case backend_kind::select: return true;
     case backend_kind::io_uring: return detail::uring_available();
+    case backend_kind::iocp: return false;
+#endif
     }
     return false;
 }

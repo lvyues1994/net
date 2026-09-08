@@ -5,6 +5,12 @@
 #include <string>
 #include <system_error>
 
+#include "net/config.hpp"
+
+#if NET_PLATFORM_WINDOWS
+#error "net/local.hpp: Unix domain sockets are not available in the Windows platform layer yet"
+#endif
+
 #include <sys/socket.h>
 #include <sys/un.h>
 

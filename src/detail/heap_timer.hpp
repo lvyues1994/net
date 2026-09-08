@@ -6,24 +6,24 @@
 #include "net/io_env.hpp"
 
 #include "detail/backend.hpp"
-#include "detail/reactor/reactor_op.hpp"
+#include "detail/timer_heap.hpp"
 
-// 就绪型后端的定时器实现：一个 timer_op，挂在反应器的二叉堆上。
+// 建立在 timer_heap 上的 timer_impl：reactor_backend 与 iocp_backend 共用。就是一个 timer_op——
+// 地址稳定、排队时挂进后端的堆。
 
 namespace net {
 namespace detail {
 
-struct reactor_backend;
-struct reactor_timer;
+struct heap_timer;
 
-struct cancel_reactor_timer {
-    reactor_timer* impl;
+struct cancel_heap_timer {
+    heap_timer* impl;
     void operator()() const noexcept;
 };
 
-struct reactor_timer final : timer_impl, timer_op {
-    reactor_timer(io_context& context, reactor_backend& backend) noexcept;
-    ~reactor_timer() override;
+struct heap_timer final : timer_impl, timer_op {
+    heap_timer(io_context& context, timer_scheduler& scheduler) noexcept;
+    ~heap_timer() override;
 
     io_context& context() const noexcept override { return *context_; }
     time_point expiry() const noexcept override { return timer_op::expiry; }
@@ -37,15 +37,15 @@ struct reactor_timer final : timer_impl, timer_op {
 
     void complete() noexcept override { env_->executor.post(cont_); }
 
-    reactor_backend& backend() noexcept { return *backend_; }
+    timer_scheduler& scheduler() noexcept { return *scheduler_; }
 
   private:
     io_context* context_;
-    reactor_backend* backend_;
+    timer_scheduler* scheduler_;
     continuation cont_;
     io_env const* env_ = nullptr;
     bool pending_ = false;
-    late_init<stop_callback<cancel_reactor_timer>> stop_cb_;
+    late_init<stop_callback<cancel_heap_timer>> stop_cb_;
 };
 
 } // namespace detail

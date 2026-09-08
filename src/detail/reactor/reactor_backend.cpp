@@ -15,7 +15,7 @@
 
 #include "detail/reactor/reactor_socket.hpp"
 #include "detail/reactor/reactor_file.hpp"
-#include "detail/reactor/reactor_timer.hpp"
+#include "detail/heap_timer.hpp"
 
 namespace net {
 namespace detail {
@@ -51,9 +51,7 @@ void reactor_backend::shutdown() {
         demux_->remove(*state);
     }
     registered_.clear();
-    for (auto* const timer : timers_)
-        timer->heap_index = timer_op::not_queued;
-    timers_.clear();
+    timers_.clear(); // 关闭时堆里不该还有定时器（销毁契约）；清掉 heap_index 让迟到的 cancel 成为空操作
     demux_->remove(timer_state_);
 }
 
@@ -64,7 +62,7 @@ std::unique_ptr<socket_impl> reactor_backend::create_socket(io_context& context)
 }
 
 std::unique_ptr<timer_impl> reactor_backend::create_timer(io_context& context) {
-    return std::unique_ptr<timer_impl>{new reactor_timer{context, *this}};
+    return std::unique_ptr<timer_impl>{new heap_timer{context, *this}};
 }
 
 std::unique_ptr<file_impl> reactor_backend::create_file(io_context& context) {
@@ -274,7 +272,7 @@ bool reactor_backend::add_timer(timer_op& op) noexcept {
             return true;
         }
         context_->get_executor().on_work_started(); // 发布之前（见 start_op）
-        heap_push(op);
+        timers_.push(op);
         // 成为最早到期且有线程正阻塞在解复用器里：重新武装 timerfd，它会在新到期时刻叫醒那个
         // 线程（timerfd 在解复用器的集合里，跨线程 settime 立即生效）。没有线程在等时留给 run()
         // 进入等待前统一武装，省一次系统调用。
@@ -293,7 +291,7 @@ bool reactor_backend::cancel_timer(timer_op& op, bool const from_stop_token) noe
             if (from_stop_token) op.cancel_requested = true;
             return false;
         }
-        heap_remove(op.heap_index);
+        timers_.remove(op.heap_index);
         op.ec = make_error_code(error::operation_aborted);
     }
     op.complete();
@@ -331,71 +329,6 @@ void reactor_backend::arm_timer_fd_locked() noexcept {
     armed_expiry_ = expiry;
 }
 
-void reactor_backend::pop_expired_timers(std::vector<timer_op*>& expired) noexcept {
-    // 锁内。
-    if (timers_.empty()) return;
-    auto const now = std::chrono::steady_clock::now();
-    while (not timers_.empty() && timers_.front()->expiry <= now) {
-        auto* const op = timers_.front();
-        heap_remove(0U);
-        op->ec = std::error_code{};
-        expired.push_back(op);
-    }
-}
-
-void reactor_backend::heap_push(timer_op& op) noexcept {
-    op.heap_index = timers_.size();
-    timers_.push_back(&op);
-    heap_up(op.heap_index);
-}
-
-void reactor_backend::heap_remove(std::size_t const index) noexcept {
-    auto* const removed = timers_[index];
-    auto const last = timers_.size() - 1U;
-    if (index != last) {
-        heap_swap(index, last);
-        timers_.pop_back();
-        if (index > 0U && timers_[index]->expiry < timers_[(index - 1U) / 2U]->expiry)
-            heap_up(index);
-        else
-            heap_down(index);
-    } else {
-        timers_.pop_back();
-    }
-    removed->heap_index = timer_op::not_queued;
-}
-
-void reactor_backend::heap_up(std::size_t index) noexcept {
-    while (index > 0U) {
-        auto const parent = (index - 1U) / 2U;
-        if (not(timers_[index]->expiry < timers_[parent]->expiry)) break;
-        heap_swap(index, parent);
-        index = parent;
-    }
-}
-
-void reactor_backend::heap_down(std::size_t index) noexcept {
-    auto const count = timers_.size();
-    for (;;) {
-        auto const left = 2U * index + 1U;
-        auto const right = left + 1U;
-        auto smallest = index;
-        if (left < count && timers_[left]->expiry < timers_[smallest]->expiry) smallest = left;
-        if (right < count && timers_[right]->expiry < timers_[smallest]->expiry) smallest = right;
-        if (smallest == index) break;
-        heap_swap(index, smallest);
-        index = smallest;
-    }
-}
-
-void reactor_backend::heap_swap(std::size_t const a, std::size_t const b) noexcept {
-    std::swap(timers_[a], timers_[b]);
-    timers_[a]->heap_index = a;
-    timers_[b]->heap_index = b;
-}
-
-// ---- 事件循环 ----
-
 void reactor_backend::interrupt() noexcept { demux_->interrupt(); }
 
 void reactor_backend::run(long const timeout_ms) {
@@ -428,7 +361,7 @@ void reactor_backend::run(long const timeout_ms) {
             if (registered_.count(event.state) == 0U) continue; // 已注销：迟到的事件
             process_event(*event.state, event.bits, completed_);
         }
-        pop_expired_timers(expired_);
+        timers_.pop_expired(std::chrono::steady_clock::now(), expired_);
     }
     events_.clear();
 

@@ -2,8 +2,10 @@
 
 #include <cerrno>
 
+#if !NET_PLATFORM_WINDOWS
 #include <sys/ioctl.h>
 #include <unistd.h>
+#endif
 
 #include "co2/contract.hpp"
 
@@ -11,6 +13,9 @@
 #include "net/io_context.hpp"
 
 #include "detail/backend.hpp"
+#if NET_PLATFORM_WINDOWS
+#include "detail/iocp/iocp_op.hpp"
+#endif
 
 // 具体层：套接字的同步操作直接对描述符做系统调用；异步操作经抽象的 socket_impl 交给后端。
 
@@ -18,9 +23,41 @@ namespace net {
 
 namespace {
 
-std::error_code last_error() noexcept { return std::error_code{errno, std::system_category()}; }
+std::error_code last_error() noexcept {
+#if NET_PLATFORM_WINDOWS
+    return detail::iocp_error(static_cast<DWORD>(::WSAGetLastError()));
+#else
+    return std::error_code{errno, std::system_category()};
+#endif
+}
 
 } // namespace
+
+namespace detail {
+
+void close_native_socket(native_socket_type const s) noexcept {
+#if NET_PLATFORM_WINDOWS
+    ::closesocket(s);
+#else
+    ::close(s);
+#endif
+}
+
+std::error_code last_socket_error() noexcept { return last_error(); }
+
+void ensure_networking_initialized() noexcept {
+#if NET_PLATFORM_WINDOWS
+    struct winsock_session {
+        winsock_session() noexcept {
+            WSADATA data{};
+            ::WSAStartup(MAKEWORD(2, 2), &data);
+        }
+    };
+    static winsock_session const session;
+#endif
+}
+
+} // namespace detail
 
 // ---- awaiter：一个指针宽，定义在库内 ----
 
@@ -76,7 +113,7 @@ io_context& socket_base::context() const noexcept {
     return impl_->context();
 }
 
-bool socket_base::is_open() const noexcept { return impl_ != nullptr && impl_->native_handle() >= 0; }
+bool socket_base::is_open() const noexcept { return impl_ != nullptr && socket_is_valid(impl_->native_handle()); }
 
 std::error_code socket_base::close() noexcept {
     if (impl_ == nullptr) return {};
@@ -88,11 +125,11 @@ void socket_base::cancel() noexcept {
 }
 
 socket_base::native_handle_type socket_base::native_handle() const noexcept {
-    return impl_ != nullptr ? impl_->native_handle() : -1;
+    return impl_ != nullptr ? impl_->native_handle() : invalid_socket;
 }
 
 socket_base::native_handle_type socket_base::release() noexcept {
-    return impl_ != nullptr ? impl_->release() : -1;
+    return impl_ != nullptr ? impl_->release() : invalid_socket;
 }
 
 std::size_t socket_base::available(std::error_code& ec) const noexcept {
@@ -100,11 +137,19 @@ std::size_t socket_base::available(std::error_code& ec) const noexcept {
         ec = make_error_code(error::not_open);
         return 0U;
     }
+#if NET_PLATFORM_WINDOWS
+    u_long count = 0;
+    if (::ioctlsocket(impl_->native_handle(), FIONREAD, &count) != 0) {
+        ec = last_error();
+        return 0U;
+    }
+#else
     auto count = 0;
     if (::ioctl(impl_->native_handle(), FIONREAD, &count) != 0) {
         ec = last_error();
         return 0U;
     }
+#endif
     ec.clear();
     return static_cast<std::size_t>(count);
 }
@@ -159,7 +204,8 @@ std::error_code socket_base::remote_endpoint_raw(sockaddr* const address,
 std::error_code socket_base::set_option_raw(int const level, int const name, void const* const data,
                                             std::size_t const size) noexcept {
     if (not is_open()) return make_error_code(error::not_open);
-    if (::setsockopt(impl_->native_handle(), level, name, data, static_cast<socklen_t>(size)) != 0)
+    if (::setsockopt(impl_->native_handle(), level, name, static_cast<detail::sockopt_pointer>(data),
+                     static_cast<socklen_t>(size)) != 0)
         return last_error();
     return {};
 }
@@ -167,7 +213,8 @@ std::error_code socket_base::set_option_raw(int const level, int const name, voi
 std::error_code socket_base::get_option_raw(int const level, int const name, void* const data,
                                             socklen_t* const size) const noexcept {
     if (not is_open()) return make_error_code(error::not_open);
-    if (::getsockopt(impl_->native_handle(), level, name, data, size) != 0) return last_error();
+    if (::getsockopt(impl_->native_handle(), level, name, static_cast<detail::sockopt_mutable_pointer>(data), size) != 0)
+        return last_error();
     return {};
 }
 
@@ -175,7 +222,9 @@ std::error_code socket_base::connect_raw(sockaddr const* const address, socklen_
     if (not is_open()) return make_error_code(error::not_open);
     for (;;) {
         if (::connect(impl_->native_handle(), address, length) == 0) return {};
+#if !NET_PLATFORM_WINDOWS
         if (errno == EINTR) continue;
+#endif
         return last_error();
     }
 }

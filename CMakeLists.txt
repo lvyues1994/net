@@ -42,8 +42,9 @@ endif()
 #   - 具体层：io_context / 套接字 / 定时器 / DNS / 信号，只依赖 src/detail/backend.hpp 的抽象接口；
 #   - 就绪型后端族（src/detail/reactor）：共享的反应器 + epoll / poll / select 解复用器；
 #   - POSIX 公共部分（src/detail/posix）：系统调用封装。
-#   - 完成型后端 io_uring（src/detail/io_uring）：裸系统调用实现的环，不依赖 liburing。
-# IOCP 接入时成为第四部分（src/detail/iocp）。
+#   - 完成型后端 io_uring（src/detail/io_uring）：裸系统调用实现的环，不依赖 liburing；
+#   - 完成型后端 IOCP（src/detail/iocp）：Windows 完成端口，WSARecv / WSASend / AcceptEx / ConnectEx /
+#     ReadFile / WriteFile 重叠 I/O。Windows 上只编译具体层 + iocp；Linux 上编译 posix + reactor + io_uring。
 set(net_concrete_sources
     src/error.cpp
     src/execution_context.cpp
@@ -56,18 +57,25 @@ set(net_concrete_sources
     src/udp.cpp
     src/timer.cpp
     src/file.cpp
-    src/local.cpp
     src/resolver.cpp
-    src/signal_set.cpp)
+    src/signal_set.cpp
+    src/detail/timer_heap.cpp
+    src/detail/heap_timer.cpp)
 
 set(net_posix_sources
+    src/local.cpp
     src/detail/posix/socket_ops.cpp
     src/detail/posix/file_ops.cpp)
+
+set(net_iocp_sources
+    src/detail/iocp/iocp_backend.cpp
+    src/detail/iocp/iocp_socket.cpp
+    src/detail/iocp/iocp_file.cpp
+    src/detail/iocp/win_file_ops.cpp)
 
 set(net_reactor_sources
     src/detail/reactor/reactor_backend.cpp
     src/detail/reactor/reactor_socket.cpp
-    src/detail/reactor/reactor_timer.cpp
     src/detail/reactor/reactor_file.cpp
     src/detail/reactor/epoll_demultiplexer.cpp
     src/detail/reactor/poll_demultiplexer.cpp
@@ -131,13 +139,22 @@ if(net_has_tls)
         src/tls/openssl_stream.cpp)
 endif()
 
+if(WIN32)
+    set(net_platform_sources ${net_iocp_sources})
+else()
+    set(net_platform_sources ${net_posix_sources} ${net_reactor_sources} ${net_io_uring_sources})
+endif()
+
 add_library(net STATIC
     ${net_concrete_sources}
-    ${net_posix_sources}
-    ${net_reactor_sources}
-    ${net_io_uring_sources}
+    ${net_platform_sources}
     ${net_tls_sources})
 add_library(net::net ALIAS net)
+
+if(WIN32)
+    target_link_libraries(net PUBLIC ws2_32 mswsock)
+    target_compile_definitions(net PUBLIC _WIN32_WINNT=0x0A00 WIN32_LEAN_AND_MEAN NOMINMAX)
+endif()
 
 if(net_has_tls)
     target_link_libraries(net PUBLIC ${net_tls_libraries})
@@ -158,7 +175,13 @@ target_include_directories(
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
-if(NOT MSVC)
+# MSVC：/permissive- 让 not / and / or 成为关键字并开启两阶段查找；/Zc:preprocessor 是 co2 协程 DSL
+# 需要的标准预处理器；/utf-8 因为源码里有 UTF-8 注释；/bigobj 因为宏展开的协程状态机让目标文件很大。
+# 这些是 PUBLIC 的：消费方的翻译单元包含本库的头时同样需要。
+if(MSVC)
+    target_compile_options(net PUBLIC /permissive- /Zc:__cplusplus /Zc:preprocessor /EHsc /utf-8 /bigobj)
+    target_compile_options(net PRIVATE /W4)
+else()
     target_compile_options(
         net
         PRIVATE

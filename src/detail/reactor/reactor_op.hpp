@@ -5,6 +5,7 @@
 #include <system_error>
 
 #include "detail/backend.hpp"
+#include "detail/timer_heap.hpp"
 
 // 就绪型后端族（epoll / poll / select）共享的操作与描述符状态。
 //
@@ -59,21 +60,6 @@ struct descriptor_state {
     }
 };
 
-struct timer_op {
-    static constexpr std::size_t not_queued = static_cast<std::size_t>(-1);
-
-    timer_op() = default;
-    timer_op(timer_op const&) = delete;
-    timer_op& operator=(timer_op const&) = delete;
-    virtual ~timer_op() = default;
-
-    virtual void complete() noexcept = 0;
-
-    std::chrono::steady_clock::time_point expiry{};
-    std::size_t heap_index = not_queued;
-    std::error_code ec;
-    bool cancel_requested = false; // 同 reactor_op::cancel_requested
-};
 
 } // namespace detail
 } // namespace net

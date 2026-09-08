@@ -7,6 +7,7 @@
 
 #include "net/buffers.hpp"
 #include "net/coroutine.hpp"
+#include "net/detail/socket_types.hpp"
 #include "net/io_env.hpp"
 #include "net/io_result.hpp"
 #include "net/source_sink.hpp"
@@ -82,7 +83,7 @@ struct file_write_awaitable {
 
 // 两种文件的公共部分：打开 / 关闭 / 同步操作。
 struct basic_file : file_base {
-    using native_handle_type = int;
+    using native_handle_type = native_file_type;
 
     basic_file() noexcept;
     explicit basic_file(io_context& context);

@@ -4,9 +4,7 @@
 #include <memory>
 #include <system_error>
 
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/socket.h>
+#include "net/detail/socket_types.hpp"
 
 #include "net/buffers.hpp"
 #include "net/coroutine.hpp"
@@ -37,7 +35,7 @@ namespace detail {
 struct socket_impl;
 }
 
-enum class shutdown_type : int { receive = SHUT_RD, send = SHUT_WR, both = SHUT_RDWR };
+enum class shutdown_type : int { receive = shutdown_receive, send = shutdown_send, both = shutdown_both };
 
 // ---- 套接字选项（Networking TS 形态：level / name / data / size） ----
 
@@ -117,7 +115,7 @@ struct socket_connect_awaitable {
 // ---- 基类 ----
 
 struct socket_base {
-    using native_handle_type = int;
+    using native_handle_type = native_socket_type;
 
     socket_base() noexcept;
     explicit socket_base(io_context& context);
@@ -147,7 +145,7 @@ struct socket_base {
     template <class Option> std::error_code get_option(Option& option) const noexcept {
         auto length = static_cast<socklen_t>(option.size());
         auto const ec = get_option_raw(option.level(), option.name(), option.data(), &length);
-        if (not ec) option.resize(length);
+        if (not ec) option.resize(static_cast<std::size_t>(length));
         return ec;
     }
 

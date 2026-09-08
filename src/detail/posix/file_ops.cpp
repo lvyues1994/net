@@ -13,9 +13,9 @@ namespace net {
 namespace detail {
 namespace posix {
 
-namespace {
+inline std::error_code errno_code() noexcept { return std::error_code{errno, std::system_category()}; }
 
-std::error_code errno_code() noexcept { return std::error_code{errno, std::system_category()}; }
+namespace {
 
 template <class Buffer> std::size_t fill_iovec(iovec (&vectors)[max_iovec], span<Buffer const> const buffers) noexcept {
     auto count = std::size_t{};
@@ -30,7 +30,11 @@ template <class Buffer> std::size_t fill_iovec(iovec (&vectors)[max_iovec], span
 
 } // namespace
 
-int open_file(std::string const& path, file_base::flags const mode) noexcept {
+} // namespace posix
+
+namespace fileops {
+
+native_file_type open_file(std::string const& path, file_base::flags const mode, std::error_code& ec) noexcept {
     auto oflags = O_CLOEXEC;
     auto const access = mode & file_base::read_write;
     if (access == file_base::read_write)
@@ -46,9 +50,22 @@ int open_file(std::string const& path, file_base::flags const mode) noexcept {
     if (mode & file_base::sync_all_on_write) oflags |= O_SYNC;
     for (;;) {
         auto const fd = ::open(path.c_str(), oflags, 0666);
-        if (fd >= 0 || errno != EINTR) return fd;
+        if (fd >= 0) {
+            ec.clear();
+            return fd;
+        }
+        if (errno != EINTR) {
+            ec = posix::errno_code();
+            return -1;
+        }
     }
 }
+
+void close_file(native_file_type const file) noexcept { ::close(file); }
+
+} // namespace fileops
+
+namespace posix {
 
 file_transfer preadv_at(int const fd, std::uint64_t const offset, span<mutable_buffer const> const buffers) noexcept {
     iovec vectors[max_iovec];
@@ -75,10 +92,14 @@ file_transfer pwritev_at(int const fd, std::uint64_t const offset, span<const_bu
     }
 }
 
+} // namespace posix
+
+namespace fileops {
+
 std::uint64_t file_size(int const fd, std::error_code& ec) noexcept {
     struct stat st{};
     if (::fstat(fd, &st) != 0) {
-        ec = errno_code();
+        ec = posix::errno_code();
         return 0U;
     }
     ec.clear();
@@ -86,20 +107,20 @@ std::uint64_t file_size(int const fd, std::error_code& ec) noexcept {
 }
 
 std::error_code file_resize(int const fd, std::uint64_t const size) noexcept {
-    if (::ftruncate(fd, static_cast<off_t>(size)) != 0) return errno_code();
+    if (::ftruncate(fd, static_cast<off_t>(size)) != 0) return posix::errno_code();
     return {};
 }
 
 std::error_code file_sync_data(int const fd) noexcept {
-    if (::fdatasync(fd) != 0) return errno_code();
+    if (::fdatasync(fd) != 0) return posix::errno_code();
     return {};
 }
 
 std::error_code file_sync_all(int const fd) noexcept {
-    if (::fsync(fd) != 0) return errno_code();
+    if (::fsync(fd) != 0) return posix::errno_code();
     return {};
 }
 
-} // namespace posix
+} // namespace fileops
 } // namespace detail
 } // namespace net

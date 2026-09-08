@@ -1,8 +1,12 @@
 #include "net/ip.hpp"
 
+#if !NET_PLATFORM_WINDOWS
 #include <arpa/inet.h>
+#endif
 
 #include "net/error.hpp"
+
+#include "detail/backend.hpp"
 
 namespace net {
 namespace ip {
@@ -25,6 +29,7 @@ std::string address_v4::to_string() const {
     char text[INET_ADDRSTRLEN];
     in_addr addr{};
     std::memcpy(&addr, bytes_.data(), 4U);
+    detail::ensure_networking_initialized();
     if (::inet_ntop(AF_INET, &addr, text, sizeof(text)) == nullptr) return {};
     return text;
 }
@@ -53,6 +58,7 @@ std::string address_v6::to_string() const {
     char text[INET6_ADDRSTRLEN];
     in6_addr addr{};
     std::memcpy(&addr, bytes_.data(), 16U);
+    detail::ensure_networking_initialized();
     if (::inet_ntop(AF_INET6, &addr, text, sizeof(text)) == nullptr) return {};
     auto result = std::string{text};
     if (scope_id_ != 0U) result += "%" + std::to_string(scope_id_);
@@ -69,6 +75,7 @@ address_v6 address_v6::loopback() noexcept {
 
 address_v4 make_address_v4(char const* const text, std::error_code& ec) noexcept {
     in_addr addr{};
+    detail::ensure_networking_initialized();
     if (::inet_pton(AF_INET, text, &addr) != 1) {
         ec = make_error_code(error::invalid_address);
         return {};
@@ -98,6 +105,7 @@ address_v6 make_address_v6(char const* const text, std::error_code& ec) noexcept
         scope = static_cast<scope_id_type>(std::strtoul(percent + 1, nullptr, 10));
     }
     in6_addr addr{};
+    detail::ensure_networking_initialized();
     if (::inet_pton(AF_INET6, numeric, &addr) != 1) {
         ec = make_error_code(error::invalid_address);
         return {};

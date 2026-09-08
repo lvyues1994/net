@@ -9,8 +9,15 @@
 #error "net requires C++14 or newer"
 #endif
 
-#if !defined(__linux__)
-#error "net's platform layer currently targets Linux (epoll)"
+// 平台：Linux（epoll / poll / select / io_uring）或 Windows（IOCP）。
+#if defined(_WIN32)
+#define NET_PLATFORM_WINDOWS 1
+#define NET_PLATFORM_LINUX 0
+#elif defined(__linux__)
+#define NET_PLATFORM_WINDOWS 0
+#define NET_PLATFORM_LINUX 1
+#else
+#error "net's platform layer targets Linux (epoll / poll / select / io_uring) and Windows (IOCP)"
 #endif
 
 // 单次 scatter/gather 操作最多展开的缓冲区数量（POSIX readv/writev 的 iovec 上限的

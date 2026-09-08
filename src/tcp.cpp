@@ -2,8 +2,6 @@
 
 #include <cstring>
 
-#include <unistd.h>
-
 #include "co2/contract.hpp"
 
 #include "net/error.hpp"
@@ -18,7 +16,7 @@ namespace {
 template <class Endpoint>
 Endpoint endpoint_from(sockaddr_storage const& storage, socklen_t const length) noexcept {
     auto endpoint = Endpoint{};
-    if (length <= endpoint.capacity()) std::memcpy(endpoint.data(), &storage, length);
+    if (static_cast<std::size_t>(length) <= endpoint.capacity()) std::memcpy(endpoint.data(), &storage, static_cast<std::size_t>(length));
     return endpoint;
 }
 
@@ -88,15 +86,15 @@ coroutine_handle<> tcp_accept_awaitable::await_suspend(coroutine_handle<> const 
 
 io_result<tcp_socket> tcp_accept_awaitable::await_resume() noexcept {
     auto* const impl = acceptor->impl();
-    auto fd = -1;
+    auto fd = invalid_socket;
     auto family = 0;
     auto result = io_result<tcp_socket>{impl->finish_accept(fd, family), tcp_socket{}};
-    if (result.ec || fd < 0) return result;
+    if (result.ec || not socket_is_valid(fd)) return result;
     auto const protocol = family == AF_INET6 ? ip::tcp::v6() : ip::tcp::v4();
     auto peer = tcp_socket{impl->context()};
     result.ec = peer.adopt_accepted(protocol, fd); // accept4(SOCK_NONBLOCK | SOCK_CLOEXEC) 出来的
     if (result.ec) {
-        ::close(fd);
+        detail::close_native_socket(fd);
         return result;
     }
     result.value = std::move(peer);

@@ -72,6 +72,47 @@ jobs:
         # io_uring 变体在内核 / 沙箱不允许时以 77 退出，CTest 记为 skipped。
         run: ctest --test-dir build --output-on-failure --timeout 120
 
+  msvc:
+    name: MSVC ${{ matrix.build_type }} (IOCP)
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out co2
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CO2_REPOSITORY }}
+          ref: ${{ env.CO2_REF }}
+          path: co2
+
+      # cl 的 error / warning 行变成注解：没有日志权限也能从 check-runs API 读到。
+      - name: Register MSVC problem matcher
+        run: echo "::add-matcher::.github/matchers/msvc.json"
+
+      # Visual Studio 生成器是多配置的：配置阶段不指定类型，构建与测试时用 --config / -C。
+      # TLS 关掉（runner 上没有 OpenSSL），基准也关掉（需要 Boost.Asio）。
+      - name: Configure
+        run: >
+          cmake -S . -B build -A x64
+          -DNET_CO2_DIR="${{ github.workspace }}/co2"
+          -DNET_TLS_PROVIDER=OFF
+          -DNET_BUILD_BENCHMARKS=OFF
+
+      - name: Build
+        run: cmake --build build --config ${{ matrix.build_type }} --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure --timeout 120
+
+      - name: Report failed tests as annotations
+        if: failure()
+        shell: bash
+        run: python .github/scripts/annotate_ctest.py build/Testing/Temporary/LastTest.log
+
   sanitizers:
     name: ${{ matrix.name }}
     runs-on: ubuntu-latest

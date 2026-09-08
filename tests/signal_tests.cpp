@@ -11,6 +11,7 @@
 #include "net/timer.hpp"
 
 #include "check.hpp"
+#include "platform.hpp"
 
 namespace {
 
@@ -37,26 +38,26 @@ net::io_result<int> wait_for(net::io_context& ctx, net::signal_set& signals) {
 
 void raised_signal_completes_the_wait() {
     test_context ctx;
-    net::signal_set signals{ctx, SIGUSR1};
-    net::run_async(ctx.get_executor())(raise_later(&ctx, SIGUSR1));
+    net::signal_set signals{ctx, net_test::test_signal_a};
+    net::run_async(ctx.get_executor())(raise_later(&ctx, net_test::test_signal_a));
     auto const r = wait_for(ctx, signals);
     CHECK(not r.ec);
-    CHECK_EQ(r.value, SIGUSR1);
+    CHECK_EQ(r.value, net_test::test_signal_a);
 }
 
 void early_signal_is_queued() {
     test_context ctx;
-    net::signal_set signals{ctx, SIGUSR2};
-    CHECK_EQ(std::raise(SIGUSR2), 0);
+    net::signal_set signals{ctx, net_test::test_signal_b};
+    CHECK_EQ(std::raise(net_test::test_signal_b), 0);
     // 信号处理函数已把信号号写进管道；反应器读到后排队；wait 立即完成。
     auto const r = wait_for(ctx, signals);
     CHECK(not r.ec);
-    CHECK_EQ(r.value, SIGUSR2);
+    CHECK_EQ(r.value, net_test::test_signal_b);
 }
 
 void cancel_aborts_the_wait() {
     test_context ctx;
-    net::signal_set signals{ctx, SIGUSR1};
+    net::signal_set signals{ctx, net_test::test_signal_a};
     net::io_result<int> result{};
     net::run_async(ctx.get_executor(), [&](net::io_result<int> v) { result = v; }, [](std::exception_ptr) { CHECK(false); })(wait_signal(&signals));
     CHECK_EQ(ctx.poll(), 1U);
@@ -68,19 +69,19 @@ void cancel_aborts_the_wait() {
 // 没在等时 cancel() 返回 0，且不能给下一次 wait() 留下"已取消"标记。
 void cancel_without_a_pending_wait_is_a_no_op() {
     test_context ctx;
-    net::signal_set signals{ctx, SIGUSR1};
+    net::signal_set signals{ctx, net_test::test_signal_a};
     CHECK_EQ(signals.cancel(), 0U);
     net::io_result<int> result{};
     net::run_async(ctx.get_executor(), [&](net::io_result<int> v) { result = v; }, [](std::exception_ptr) { CHECK(false); })(wait_signal(&signals));
-    net::run_async(ctx.get_executor())(raise_later(&ctx, SIGUSR1));
+    net::run_async(ctx.get_executor())(raise_later(&ctx, net_test::test_signal_a));
     ctx.run();
     CHECK(not result.ec);
-    CHECK_EQ(result.value, SIGUSR1);
+    CHECK_EQ(result.value, net_test::test_signal_a);
 }
 
 void stop_token_aborts_the_wait() {
     test_context ctx;
-    net::signal_set signals{ctx, SIGUSR1};
+    net::signal_set signals{ctx, net_test::test_signal_a};
     net::stop_source source;
     net::io_result<int> result{};
     net::run_async(ctx.get_executor(), source.get_token(), nullptr, [&](net::io_result<int> v) { result = v; },
@@ -93,30 +94,28 @@ void stop_token_aborts_the_wait() {
 
 void every_registered_set_receives_the_signal() {
     test_context ctx;
-    net::signal_set a{ctx, SIGUSR1};
-    net::signal_set b{ctx, SIGUSR1, SIGUSR2};
+    net::signal_set a{ctx, net_test::test_signal_a};
+    net::signal_set b{ctx, net_test::test_signal_a, net_test::test_signal_b};
     net::io_result<int> ra{};
     net::io_result<int> rb{};
     net::run_async(ctx.get_executor(), [&](net::io_result<int> v) { ra = v; }, [](std::exception_ptr) { CHECK(false); })(wait_signal(&a));
     net::run_async(ctx.get_executor(), [&](net::io_result<int> v) { rb = v; }, [](std::exception_ptr) { CHECK(false); })(wait_signal(&b));
-    net::run_async(ctx.get_executor())(raise_later(&ctx, SIGUSR1));
+    net::run_async(ctx.get_executor())(raise_later(&ctx, net_test::test_signal_a));
     ctx.run();
-    CHECK_EQ(ra.value, SIGUSR1);
-    CHECK_EQ(rb.value, SIGUSR1);
+    CHECK_EQ(ra.value, net_test::test_signal_a);
+    CHECK_EQ(rb.value, net_test::test_signal_a);
 }
 
 void removed_signal_is_not_delivered() {
     test_context ctx;
-    net::signal_set signals{ctx, SIGUSR1, SIGUSR2};
-    CHECK(not signals.remove(SIGUSR2));
-    // SIGUSR2 现在恢复默认处置——默认会终止进程，所以这里只验证它不再在集合里（用忽略处置）。
-    struct sigaction ignore{};
-    ignore.sa_handler = SIG_IGN;
-    CHECK_EQ(::sigaction(SIGUSR2, &ignore, nullptr), 0);
-    CHECK_EQ(std::raise(SIGUSR2), 0);
-    net::run_async(ctx.get_executor())(raise_later(&ctx, SIGUSR1));
+    net::signal_set signals{ctx, net_test::test_signal_a, net_test::test_signal_b};
+    CHECK(not signals.remove(net_test::test_signal_b));
+    // net_test::test_signal_b 现在恢复默认处置——默认会终止进程，所以这里只验证它不再在集合里（用忽略处置）。
+    CHECK(net_test::ignore_signal(net_test::test_signal_b));
+    CHECK_EQ(std::raise(net_test::test_signal_b), 0);
+    net::run_async(ctx.get_executor())(raise_later(&ctx, net_test::test_signal_a));
     auto const r = wait_for(ctx, signals);
-    CHECK_EQ(r.value, SIGUSR1);
+    CHECK_EQ(r.value, net_test::test_signal_a);
 }
 
 } // namespace

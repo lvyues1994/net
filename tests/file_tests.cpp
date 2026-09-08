@@ -7,8 +7,6 @@
 #include <string>
 #include <vector>
 
-#include <fcntl.h>
-#include <unistd.h>
 
 #include "net/any_stream.hpp"
 #include "net/buffers.hpp"
@@ -24,6 +22,7 @@
 #include "net/when_all.hpp"
 
 #include "check.hpp"
+#include "platform.hpp"
 
 namespace {
 
@@ -35,13 +34,7 @@ static_assert(not net::is_read_stream<net::random_access_file>::value, ""); // �
 // 临时文件：构造时创建、析构时删除。
 struct temp_path {
     std::string path;
-    temp_path() {
-        char name[] = "/tmp/net_file_test_XXXXXX";
-        auto const fd = ::mkstemp(name);
-        CHECK(fd >= 0);
-        ::close(fd);
-        path = name;
-    }
+    temp_path() : path{net_test::make_temp_file()} { CHECK(not path.empty()); }
     ~temp_path() { std::remove(path.c_str()); }
 };
 
@@ -349,7 +342,7 @@ void open_flags_and_errors() {
         net::stream_file r{ctx, tmp.path, net::file_base::read_only};
         std::string const x = "x";
         auto const w = run_task(ctx, write_all(&r, &x));
-        CHECK(w.ec == std::errc::bad_file_descriptor);
+        CHECK(w.ec == std::errc::bad_file_descriptor || w.ec == std::errc::permission_denied); // Windows：ERROR_ACCESS_DENIED
     }
     // 未打开的文件：not_open
     {
@@ -363,8 +356,8 @@ void open_flags_and_errors() {
     }
     // 接管 / 释放描述符
     {
-        auto const fd = ::open(tmp.path.c_str(), O_RDONLY);
-        CHECK(fd >= 0);
+        auto const fd = net_test::open_readonly_raw(tmp.path);
+        CHECK(net::file_is_valid(fd));
         net::stream_file adopted{ctx};
         CHECK(not adopted.assign(fd));
         CHECK_EQ(adopted.native_handle(), fd);
@@ -374,7 +367,7 @@ void open_flags_and_errors() {
         auto const released = adopted.release();
         CHECK_EQ(released, fd);
         CHECK(not adopted.is_open());
-        ::close(fd);
+        net_test::close_raw_file(fd);
     }
     // 构造函数形态在打开失败时抛
     auto threw = false;

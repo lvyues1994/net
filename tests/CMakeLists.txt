@@ -17,8 +17,10 @@ set(net_platform_test_sources
     resolver_tests.cpp
     signal_tests.cpp
     file_tests.cpp
-    local_tests.cpp
     stress_tests.cpp)
+if(NOT WIN32)
+    list(APPEND net_platform_test_sources local_tests.cpp)
+endif()
 if(net_has_tls)
     list(APPEND net_platform_test_sources tls_tests.cpp)
 endif()
@@ -31,7 +33,9 @@ function(net_configure_test_target target)
             CXX_STANDARD 14
             CXX_STANDARD_REQUIRED YES
             CXX_EXTENSIONS NO)
-    if(NOT MSVC)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4)
+    else()
         target_compile_options(
             ${target}
             PRIVATE
@@ -60,10 +64,17 @@ if(NET_COMPILER_HAS_WMISMATCHED_NEW_DELETE)
     target_compile_options(source_sink_tests PRIVATE -Wno-mismatched-new-delete)
 endif()
 
+# Windows 只有 IOCP 一个后端：每个平台测试只编一个变体（<name>，NET_TEST_BACKEND=iocp）。
+if(WIN32)
+    set(net_test_backends iocp)
+else()
+    set(net_test_backends epoll poll select io_uring)
+endif()
+
 foreach(source IN LISTS net_platform_test_sources)
     get_filename_component(name "${source}" NAME_WE)
-    foreach(backend IN ITEMS epoll poll select io_uring)
-        if(backend STREQUAL "epoll")
+    foreach(backend IN LISTS net_test_backends)
+        if(backend STREQUAL "epoll" OR backend STREQUAL "iocp")
             set(target ${name})
         else()
             set(target ${name}_${backend})

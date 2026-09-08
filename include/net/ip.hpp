@@ -7,8 +7,7 @@
 #include <system_error>
 #include <typeinfo>
 
-#include <netinet/in.h>
-#include <sys/socket.h>
+#include "net/detail/socket_types.hpp"
 
 // IP 地址与端点（P4100R1 §8.8 Paper 11：套接字、接受器、端点、IP 地址），形态取自
 // Networking TS 的 ip::address_v4 / address_v6 / address / basic_endpoint / tcp / udp。

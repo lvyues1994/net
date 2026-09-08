@@ -3,8 +3,7 @@
 #include <cstddef>
 #include <cstring>
 
-#include <netinet/in.h>
-#include <sys/socket.h>
+#include "net/detail/socket_types.hpp"
 
 #include "net/ip.hpp"
 

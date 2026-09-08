@@ -17,9 +17,9 @@ namespace {
 
 template <class Endpoint> Endpoint endpoint_from(sockaddr_storage const& storage, socklen_t const length) noexcept {
     auto endpoint = Endpoint{};
-    if (length <= endpoint.capacity()) {
-        std::memcpy(endpoint.data(), &storage, length);
-        endpoint.resize(length);
+    if (static_cast<std::size_t>(length) <= endpoint.capacity()) {
+        std::memcpy(endpoint.data(), &storage, static_cast<std::size_t>(length));
+        endpoint.resize(static_cast<std::size_t>(length));
     }
     return endpoint;
 }
@@ -95,10 +95,10 @@ coroutine_handle<> local_accept_awaitable::await_suspend(coroutine_handle<> cons
 
 io_result<local_stream_socket> local_accept_awaitable::await_resume() noexcept {
     auto* const impl = acceptor->impl();
-    auto fd = -1;
+    auto fd = invalid_socket;
     auto family = 0;
     auto result = io_result<local_stream_socket>{impl->finish_accept(fd, family), local_stream_socket{}};
-    if (result.ec || fd < 0) return result;
+    if (result.ec || not socket_is_valid(fd)) return result;
     auto peer = local_stream_socket{impl->context()};
     result.ec = peer.adopt_accepted(local::stream_protocol{}, fd);
     if (result.ec) {

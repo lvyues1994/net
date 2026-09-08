@@ -7,8 +7,7 @@
 #include <system_error>
 #include <vector>
 
-#include <netdb.h>
-#include <sys/socket.h>
+#include "net/detail/socket_types.hpp"
 
 #include "net/coroutine.hpp"
 #include "net/io_env.hpp"
@@ -126,8 +125,8 @@ template <class Protocol> struct basic_resolver_awaitable {
         entries.reserve(raw.size());
         for (auto& entry : raw) {
             auto endpoint = endpoint_type{};
-            if (entry.length <= endpoint.capacity()) {
-                std::memcpy(endpoint.data(), &entry.storage, entry.length);
+            if (static_cast<std::size_t>(entry.length) <= endpoint.capacity()) {
+                std::memcpy(endpoint.data(), &entry.storage, static_cast<std::size_t>(entry.length));
             }
             entries.push_back(basic_resolver_entry<Protocol>{endpoint, std::move(entry.host_name),
                                                              std::move(entry.service_name)});

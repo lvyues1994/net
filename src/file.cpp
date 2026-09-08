@@ -1,14 +1,12 @@
 #include "net/file.hpp"
 
-#include <unistd.h>
-
 #include "co2/contract.hpp"
 
 #include "net/error.hpp"
 #include "net/io_context.hpp"
 
 #include "detail/backend.hpp"
-#include "detail/posix/file_ops.hpp"
+#include "detail/file_ops.hpp"
 
 namespace net {
 
@@ -61,10 +59,11 @@ std::error_code basic_file::open(std::string const& path, flags const mode) noex
         auto const ec = close();
         if (ec) return ec;
     }
-    auto const fd = detail::posix::open_file(path, mode);
-    if (fd < 0) return std::error_code{errno, std::system_category()};
+    std::error_code open_ec;
+    auto const fd = detail::fileops::open_file(path, mode, open_ec);
+    if (open_ec) return open_ec;
     auto const ec = impl_->assign(fd);
-    if (ec) ::close(fd);
+    if (ec) detail::fileops::close_file(fd);
     return ec;
 }
 
@@ -78,11 +77,13 @@ std::error_code basic_file::close() noexcept {
     return impl_->close();
 }
 
-basic_file::native_handle_type basic_file::release() noexcept { return impl_ ? impl_->release() : -1; }
+basic_file::native_handle_type basic_file::release() noexcept { return impl_ ? impl_->release() : invalid_file_value(); }
 
-bool basic_file::is_open() const noexcept { return impl_ && impl_->native_handle() >= 0; }
+bool basic_file::is_open() const noexcept { return impl_ && file_is_valid(impl_->native_handle()); }
 
-basic_file::native_handle_type basic_file::native_handle() const noexcept { return impl_ ? impl_->native_handle() : -1; }
+basic_file::native_handle_type basic_file::native_handle() const noexcept {
+    return impl_ ? impl_->native_handle() : invalid_file_value();
+}
 
 void basic_file::cancel() noexcept {
     if (impl_) impl_->cancel();
@@ -93,22 +94,22 @@ std::uint64_t basic_file::size(std::error_code& ec) const noexcept {
         ec = make_error_code(error::not_open);
         return 0U;
     }
-    return detail::posix::file_size(native_handle(), ec);
+    return detail::fileops::file_size(native_handle(), ec);
 }
 
 std::error_code basic_file::resize(std::uint64_t const new_size) noexcept {
     if (not is_open()) return make_error_code(error::not_open);
-    return detail::posix::file_resize(native_handle(), new_size);
+    return detail::fileops::file_resize(native_handle(), new_size);
 }
 
 std::error_code basic_file::sync_data() noexcept {
     if (not is_open()) return make_error_code(error::not_open);
-    return detail::posix::file_sync_data(native_handle());
+    return detail::fileops::file_sync_data(native_handle());
 }
 
 std::error_code basic_file::sync_all() noexcept {
     if (not is_open()) return make_error_code(error::not_open);
-    return detail::posix::file_sync_all(native_handle());
+    return detail::fileops::file_sync_all(native_handle());
 }
 
 // ---- stream_file ----

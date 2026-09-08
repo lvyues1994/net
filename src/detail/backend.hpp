@@ -6,9 +6,8 @@
 #include <memory>
 #include <system_error>
 
-#include <sys/socket.h>
-
 #include "net/buffers.hpp"
+#include "net/detail/socket_types.hpp"
 #include "net/coroutine.hpp"
 #include "net/io_env.hpp"
 #include "net/io_result.hpp"
@@ -45,6 +44,14 @@ namespace detail {
 
 enum class op_direction : unsigned char { read = 0, write = 1 };
 
+// 关闭一个尚未交给任何实现对象的裸套接字（accept 出来但 adopt 失败的对端等）。
+void close_native_socket(native_socket_type s) noexcept;
+// 最近一次套接字系统调用的错误（errno / WSAGetLastError）。
+std::error_code last_socket_error() noexcept;
+// Windows：WSAStartup 一次（进程生存期内不 WSACleanup）；POSIX：无操作。任何调用套接字 API 的入口
+//（后端构造、解析器、地址解析）先调它。
+void ensure_networking_initialized() noexcept;
+
 struct socket_impl {
     socket_impl() = default;
     socket_impl(socket_impl const&) = delete;
@@ -55,18 +62,18 @@ struct socket_impl {
 
     // ---- 同步 ----
     virtual std::error_code open(int family, int type, int protocol) noexcept = 0;
-    virtual std::error_code assign(int family, int type, int protocol, int fd) noexcept = 0;
+    virtual std::error_code assign(int family, int type, int protocol, native_socket_type fd) noexcept = 0;
     // 同 assign，但描述符已是非阻塞 + CLOEXEC（本库自己 socket() / accept4() 出来的）：省掉
     // 四次 fcntl。外来描述符走 assign。
-    virtual std::error_code adopt(int family, int type, int protocol, int fd) noexcept = 0;
+    virtual std::error_code adopt(int family, int type, int protocol, native_socket_type fd) noexcept = 0;
     // ::listen；完成型后端借此武装多发 accept。
     virtual std::error_code listen(int backlog) noexcept = 0;
     // 取消两个方向的操作（以 operation_aborted 完成）并关闭描述符。
     virtual std::error_code close() noexcept = 0;
     virtual void cancel() noexcept = 0;
     // 注销并交出描述符所有权。
-    virtual int release() noexcept = 0;
-    virtual int native_handle() const noexcept = 0;
+    virtual native_socket_type release() noexcept = 0;
+    virtual native_socket_type native_handle() const noexcept = 0;
 
     // ---- 异步操作：记参数 ----
     // 前置条件：该方向没有未完成的操作。读方向：read / accept / receive_from；写方向：
@@ -91,7 +98,7 @@ struct socket_impl {
     virtual io_result<std::size_t> finish_transfer(op_direction direction) noexcept = 0;
     virtual io_result<> finish_connect() noexcept = 0;
     // accept 的结果：成功时 fd 已是非阻塞、CLOEXEC，family 是对端地址族。
-    virtual std::error_code finish_accept(int& fd, int& family) noexcept = 0;
+    virtual std::error_code finish_accept(native_socket_type& fd, int& family) noexcept = 0;
 
     // 是否有未完成的操作（销毁契约用）。
     virtual bool has_pending() const noexcept = 0;
@@ -109,11 +116,11 @@ struct file_impl {
     virtual io_context& context() const noexcept = 0;
 
     // ---- 同步 ----
-    virtual std::error_code assign(int fd) noexcept = 0; // 接管已打开的描述符
+    virtual std::error_code assign(native_file_type fd) noexcept = 0; // 接管已打开的描述符
     virtual std::error_code close() noexcept = 0;
     virtual void cancel() noexcept = 0;
-    virtual int release() noexcept = 0;
-    virtual int native_handle() const noexcept = 0;
+    virtual native_file_type release() noexcept = 0;
+    virtual native_file_type native_handle() const noexcept = 0;
 
     // ---- 异步（三步协议，每个方向一个操作） ----
     virtual void begin_read(std::uint64_t offset, span<mutable_buffer const> buffers) noexcept = 0;
@@ -164,9 +171,9 @@ struct io_backend {
     virtual std::unique_ptr<timer_impl> create_timer(io_context& context) = 0;
     virtual std::unique_ptr<file_impl> create_file(io_context& context) = 0;
 
-    // 监视信号自管道的读端：可读时排空它，并对每个信号号调用 deliver。POSIX 后端实现；
-    // 完成型后端可以用 poll-add / 等待对象实现同一语义。
-    virtual std::error_code register_signal_reader(int read_fd,
+    // 监视信号自管道的读端（POSIX：管道 fd；Windows：回环套接字对的一端）：可读时排空它，并对
+    // 每个信号号调用 deliver。
+    virtual std::error_code register_signal_reader(native_socket_type read_end,
                                                    void (*deliver)(int signal_number)) noexcept = 0;
 
     virtual char const* name() const noexcept = 0;
