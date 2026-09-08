@@ -295,7 +295,8 @@ struct any_read_source : detail::erased_object_base<detail::any_read_source_vtab
 
     // 读满整个序列：按窗口穿过类型擦除边界。
     template <class MutableBufferSequence> task<io_result<std::size_t>> read(MutableBufferSequence buffers) {
-        return read_windows(this, std::move(buffers), buffer_size(buffers));
+        auto const goal = buffer_size(buffers); // 先算：实参求值顺序未定，不能与 std::move 同列
+        return read_windows(this, std::move(buffers), goal);
     }
 
   private:
@@ -364,11 +365,19 @@ struct any_write_sink : detail::erased_object_base<detail::any_write_sink_vtable
     }
 
     template <class ConstBufferSequence> task<io_result<std::size_t>> write(ConstBufferSequence buffers) {
-        return write_windows(this, std::move(buffers), buffer_size(buffers), false);
+
+        auto const goal = buffer_size(buffers); // 先算：实参求值顺序未定，不能与 std::move 同列
+
+        return write_windows(this, std::move(buffers), goal, false);
+
     }
 
     template <class ConstBufferSequence> task<io_result<std::size_t>> write_eof(ConstBufferSequence buffers) {
-        return write_windows(this, std::move(buffers), buffer_size(buffers), true);
+
+        auto const goal = buffer_size(buffers); // 先算：实参求值顺序未定，不能与 std::move 同列
+
+        return write_windows(this, std::move(buffers), goal, true);
+
     }
 
     detail::erased_awaitable<io_result<>> write_eof() noexcept { return make<io_result<>>(vt_->write_eof, &pending_eof_); }
@@ -458,7 +467,11 @@ struct any_buffer_source : detail::erased_object_base<detail::any_buffer_source_
     }
 
     template <class MutableBufferSequence> task<io_result<std::size_t>> read(MutableBufferSequence buffers) {
-        return read_impl(this, std::move(buffers), buffer_size(buffers));
+
+        auto const goal = buffer_size(buffers); // 先算：实参求值顺序未定，不能与 std::move 同列
+
+        return read_impl(this, std::move(buffers), goal);
+
     }
 
   private:
@@ -566,11 +579,19 @@ struct any_buffer_sink : detail::erased_object_base<detail::any_buffer_sink_vtab
     }
 
     template <class ConstBufferSequence> task<io_result<std::size_t>> write(ConstBufferSequence buffers) {
-        return write_impl(this, std::move(buffers), buffer_size(buffers), false);
+
+        auto const goal = buffer_size(buffers); // 先算：实参求值顺序未定，不能与 std::move 同列
+
+        return write_impl(this, std::move(buffers), goal, false);
+
     }
 
     template <class ConstBufferSequence> task<io_result<std::size_t>> write_eof(ConstBufferSequence buffers) {
-        return write_impl(this, std::move(buffers), buffer_size(buffers), true);
+
+        auto const goal = buffer_size(buffers); // 先算：实参求值顺序未定，不能与 std::move 同列
+
+        return write_impl(this, std::move(buffers), goal, true);
+
     }
 
     task<io_result<>> write_eof() { return write_eof_impl(this); }
