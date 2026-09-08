@@ -244,26 +244,56 @@ io_uring 378k → 92k。多发 accept：`tcp_tests_io_uring` 的 42 次成功 ac
   `begin_receive_from` 的 `socklen_t* sender_length`：Unix 域端点的长度由路径决定，`recvmsg` /
   RECVMSG 完成后把 `msg_namelen` 写回端点，UDP 一侧传空。
 
-## 5. 接入 IOCP
+## 5. IOCP 后端（Windows）
 
-Windows 完成端口同样是完成型，且没有 fd：
+Windows 完成端口同样是完成型，且没有 fd。实现在 `src/detail/iocp/`，形状取自 Corosio 的
+`win_scheduler` / `win_tcp_service` / `win_file_service`：
 
 ```
 src/detail/iocp/
-    iocp_backend.hpp/.cpp       io_backend：CreateIoCompletionPort、GetQueuedCompletionStatusEx、PostQueuedCompletionStatus 唤醒
-    overlapped_op.hpp           op 基类：OVERLAPPED 首成员 + cont/env/pending/stop_cb；完成包的 key 是 op 指针
-    iocp_socket.hpp/.cpp        socket_impl：WSARecv / WSASend / ConnectEx / AcceptEx（预创建接受套接字）/ WSARecvFrom / WSASendTo
-    iocp_timer.hpp/.cpp         timer_impl：定时器线程 + PostQueuedCompletionStatus，或 CreateWaitableTimerEx（Corosio: win_timers_thread / win_timers_none）
+    iocp_op.hpp                 操作基类：标准布局的 overlapped_block{OVERLAPPED, op*} 首成员，事件循环从 LPOVERLAPPED 反查操作；
+                                iocp_error 把 Win32 / WSA 两段错误码映射到 std::errc
+    iocp_backend.hpp/.cpp       io_backend + timer_scheduler：一个端口；run() 阻塞在 GetQueuedCompletionStatus（超时 = 定时器堆顶），
+                                之后零超时排空一轮；interrupt() 投空包；定时器复用 detail/timer_heap + heap_timer（与 reactor 共用）；
+                                信号自管道读端做常驻重叠 WSARecv（每个 io_context 一对回环套接字）
+    iocp_socket.hpp/.cpp        socket_impl：WSARecv / WSASend / WSARecvFrom / WSASendTo / ConnectEx / AcceptEx
+    iocp_file.hpp/.cpp          file_impl：FILE_FLAG_OVERLAPPED 句柄上 ReadFile / WriteFile，偏移在 OVERLAPPED 里
+    win_file_ops.cpp            文件同步操作：CreateFileW（标志映射）、GetFileSizeEx、SetEndOfFile、FlushFileBuffers
 ```
 
-差异点（与 io_uring 后端相同的部分——环锁 / 完成收割 / 异步取消 / `complete()` 后不触碰
-操作——可以直接照搬 `uring_backend` 的骨架）：`native_handle_type` 是 `SOCKET`；`accept` 必须先 `WSASocket` 出接受套接字再
-`AcceptEx`，完成后 `SO_UPDATE_ACCEPT_CONTEXT`；`connect` 需先 `bind`；取消用
-`CancelIoEx(handle, &overlapped)` 并等完成包（`ERROR_OPERATION_ABORTED`）；信号没有管道，
-`register_signal_reader` 改为 CRT `signal()` + `PostQueuedCompletionStatus`（Corosio:
-`win_signals`）；`socket_base.cpp` 里 `::bind / ::listen / setsockopt` 的 POSIX 调用要
-经 `posix::` 同名封装换成 Winsock 版本。公共头里 `native_handle_type = int` 需要改成平台
-类型别名。
+与 io_uring 后端的差异：
+
+- **没有提交环**：发起就是系统调用，完成一定经端口到达——包括 `closesocket` / `CancelIoEx` 之后的
+  `ERROR_OPERATION_ABORTED`（995）。所以没有"提交前取消"的窗口要关；`suspend()` 在 WSA 调用返回
+  成功或 `WSA_IO_PENDING` 之后不再碰 op / env / this。同步完成的调用也会投完成包（没开
+  `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`），路径统一。发起立刻失败（其它错误码）时同步以错误恢复，
+  工作计数先加后减。
+- **不做投机**：`ready()` 只处理已记录的同步失败（未打开、`open` 失败、`ConnectEx` 前的 `bind`
+  失败、空序列）。Corosio 用跳过完成包的模式做投机，可以之后再加。
+- **connect**：`ConnectEx` 经 `WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER)` 取一次；要求套接字已绑定，
+  未绑定就先绑到本族的通配地址；完成后 `SO_UPDATE_CONNECT_CONTEXT`。失败以 NTSTATUS 转出的 Win32 码
+  到达（`ERROR_CONNECTION_REFUSED` 1225），`iocp_error` 与 `WSAECONNREFUSED` 一并映射到
+  `std::errc::connection_refused`——MSVC 的 `system_category` 只映射 WSA 段，libstdc++（MinGW）只映射
+  Win32 段，用 `generic_category` 的 `std::errc` 两边都能比较。
+- **accept**：`begin_accept` 预建对端套接字（`WSASocketW(..., WSA_FLAG_OVERLAPPED)`），`AcceptEx` 带
+  `sizeof(sockaddr_storage) + 16` 的地址缓冲，完成后 `SO_UPDATE_ACCEPT_CONTEXT`；对端在 `adopt` 时才挂到
+  端口。没有多发 accept。
+- **取消**：`CancelIoEx(handle, &overlapped)`（stop_token）或 `CancelIoEx(handle, nullptr)`（`cancel()`）；
+  `release()` 后句柄仍挂在端口上（Windows 不允许解除关联）。
+- **文件**：`ReadFile` 一次只有一个缓冲区，取序列里第一个非空的；越过文件尾的读同步返回
+  `ERROR_HANDLE_EOF` → `eof`；`append` 用"只有 `FILE_APPEND_DATA` 没有 `FILE_WRITE_DATA`"的访问权限，
+  内核忽略写偏移总是追加。
+- **信号**：没有管道，也没有 SIGUSR*。`signal()` 装处理函数（CRT 投递后复位为 SIG_DFL，处理函数
+  自己重装），处理函数向每个 io_context 的回环套接字对写端 `send`，读端由 `iocp_backend` 挂在端口上
+  常驻接收。
+- 上层未改：`tcp_socket` / `udp_socket` / `steady_timer` / `signal_set` / `resolver` / `stream_file` /
+  `random_access_file` 同一份源码；`local_stream_socket` 暂不在 Windows 上提供（afunix.h 的 AF_UNIX 流
+  套接字是后续项）。
+
+可移植层（`include/net/detail/socket_types.hpp`）给出 `native_socket_type` / `native_file_type`
+（`SOCKET` / `HANDLE` 或 `int`）、`invalid_socket`、`shutdown_*`，并负责 Windows 头的顺序与宏
+（`winsock2.h` 先于 `windows.h`，`WIN32_LEAN_AND_MEAN`、`NOMINMAX`）。接缝 `socket_impl` / `file_impl` /
+`register_signal_reader` 用这些类型。
 
 ## 6. 为什么这样切
 

@@ -24,6 +24,7 @@ net 用 C++14 与 co2 实现这套协议：语言里没有 `co_await`，但 co2 
 │                 ↓ 抽象接缝 src/detail/backend.hpp                    │
 │ 后端            reactor_backend + demultiplexer{epoll, poll, select} │
 │                 uring_backend（io_uring，完成型）                     │
+│                 iocp_backend（Windows 完成端口，完成型）              │
 ├──────────────────────────────────────────────────────────────────────┤
 │ 组合子        when_all  when_any          detail/combinator          │
 │ 流            stream (read/write/read_until)  any_stream             │
@@ -43,8 +44,9 @@ net 用 C++14 与 co2 实现这套协议：语言里没有 `co_await`，但 co2 
 
 依赖只向下。协议核心到组合子仅含头文件、与平台无关；平台层编译进 `libnet.a`：具体层
 只依赖 `src/detail/backend.hpp` 的抽象接口（`io_backend` / `socket_impl` / `file_impl` / `timer_impl`），
-后端实现在 `src/detail/reactor/`（就绪型族）、`src/detail/io_uring/` 与 `src/detail/posix/`，
-全部只在 `src/` 内可见。后端的选择、与 Corosio 的对照、io_uring / IOCP 的接入方案见
+后端实现在 `src/detail/reactor/`（就绪型族）、`src/detail/io_uring/`、`src/detail/iocp/`（Windows）
+与 `src/detail/posix/`，全部只在 `src/` 内可见；`include/net/detail/socket_types.hpp` 是公共头里唯一
+包含操作系统套接字头的地方，给出 `native_socket_type` / `native_file_type` 等平台类型。后端的选择、与 Corosio 的对照、io_uring / IOCP 的接入方案见
 `docs/backends.md`。
 
 TLS 层位于具体层之上、应用之下，但它只依赖 `Stream` 概念（经 `any_stream` 类型擦除）而不

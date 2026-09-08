@@ -72,7 +72,7 @@ coroutine_handle<> await_suspend(coroutine_handle<> h, io_env const* env);
 | `when_all`, `when_any` | 同名，I/O 感知（P4124R0 §2 的表） | `when_all.hpp`, `when_any.hpp` |
 | `thread_pool`, `strand`, `any_executor` | 同名 | `thread_pool.hpp`, `strand.hpp`, `any_executor.hpp` |
 | `io_context`, `steady_timer`, `signal_set`, `tcp_socket`, `tcp_acceptor`, `udp_socket`, `resolver`, `ip::*` | 同名（Networking TS 形态去掉 `async_` 与完成令牌） | `io_context.hpp`, `timer.hpp`, `signal_set.hpp`, `tcp.hpp`, `udp.hpp`, `resolver.hpp`, `ip.hpp` |
-| `corosio::epoll` / `select` / `io_uring` … 后端标签，`io_context(backend)` | `net::epoll` / `net::poll` / `net::select` / `net::io_uring`，`io_context{net::io_uring}`，`backend_available()` | `backend.hpp` |
+| `corosio::epoll` / `select` / `io_uring` / `iocp` 后端标签，`io_context(backend)` | `net::epoll` / `net::poll` / `net::select` / `net::io_uring` / `net::iocp`（Windows 默认），`io_context{net::io_uring}`，`backend_available()` | `backend.hpp` |
 | `tls_context`, `tls_stream`, `openssl_stream`（Paper 14） | `net::tls::context`, `net::tls::stream`, `net::tls::openssl_stream`（同一份实现覆盖 OpenSSL 与 BoringSSL） | `tls/context.hpp`, `tls/stream.hpp`, `tls/error.hpp` |
 
 ## 用法要点
@@ -140,6 +140,19 @@ ctest --test-dir build --output-on-failure
 | `NET_DEFAULT_FRAME_ALLOCATOR` | `new_delete` | 上下文默认帧分配器：`new_delete` 或 `recycling`（见下文"性能"） |
 | `NET_BUILD_TESTS` / `NET_BUILD_EXAMPLES` / `NET_BUILD_BENCHMARKS` | ON / ON / OFF | 作为子项目时测试与示例默认关闭 |
 
+Windows（MSVC，Visual Studio 生成器是多配置的）：
+
+```bat
+cmake -S . -B build -A x64 -DNET_TLS_PROVIDER=OFF -DNET_CO2_DIR=path\to\coro
+cmake --build build --config Debug --parallel
+ctest --test-dir build -C Debug --output-on-failure
+```
+
+MSVC 需要 `/permissive-`（`not` / `and` 作为关键字）与 `/Zc:preprocessor`（co2 协程 DSL 的标准
+`__VA_ARGS__` 展开），`net::net` 目标以 PUBLIC 编译选项带出去。Windows 上只有 IOCP 一个后端，
+`local.hpp` 暂不可用；在没有 Windows 机器时可以用 llvm-mingw（clang + mingw-w64 头）交叉编译做编译期
+检查：`-DCMAKE_SYSTEM_NAME=Windows -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-clang++`。
+
 抽象层仅含头文件；平台层与 TLS 编译进 `libnet.a`。作为子项目：
 
 ```cmake
@@ -169,7 +182,9 @@ OpenSSL 与 BoringSSL 两个提供者下通过。TSan 只抑制未插桩的 libc
 
 CI（`.github/workflows/ci.yml`）：GCC / Clang × Debug / Release × 两种默认帧分配器的构建与
 测试、ASan+UBSan 与 TSan 全量运行、BoringSSL 提供者作业（FetchContent 构建并缓存）、quick 模式
-基准（结果写入 step summary 并上传 artifact）。
+基准（结果写入 step summary 并上传 artifact），以及 MSVC × Debug / Release 的 IOCP 作业
+（windows-latest，TLS 关；cl 的诊断经 `.github/matchers/msvc.json`、ctest 失败经
+`.github/scripts/annotate_ctest.py` 变成注解，公开仓库匿名可读）。
 
 `examples/`：`echo_server`（accept 循环 + `any_stream` 会话 + SIGINT 优雅退出，
 `./echo_server 7777 io_uring` 选后端）、
@@ -233,10 +248,11 @@ recv、注册缓冲区、零拷贝发送。TLS 的数字（OpenSSL 与 BoringSSL
 include/net/            公共头：协议核心、执行器、缓冲区、流 / 源 / 汇与类型擦除、组合子（仅头文件）；平台层的具体层接口（套接字、文件、Unix 域、组播选项）
 include/net/tls/        TLS：context / stream / error（公共头不含 OpenSSL 头）
 src/                    具体层：io_context 调度器、套接字/文件/定时器/DNS/信号/Unix 域（只依赖 detail/backend.hpp）
-src/detail/backend.hpp  后端接缝：io_backend / socket_impl / file_impl / timer_impl（抽象）
+src/detail/backend.hpp  后端接缝：io_backend / socket_impl / file_impl / timer_impl（抽象）；timer_heap / heap_timer 是 reactor 与 iocp 共用的定时器堆
 src/detail/posix/       POSIX 系统调用封装（套接字与文件）
 src/detail/reactor/     就绪型后端族：reactor_backend + epoll / poll / select 解复用器；文件同步回退
 src/detail/io_uring/    完成型后端：裸系统调用的 io_uring 环、提交/取消/收割、套接字 / 文件 / 定时器实现
+src/detail/iocp/        完成型后端（Windows）：完成端口、WSARecv / WSASend / AcceptEx / ConnectEx、ReadFile / WriteFile 重叠 I/O
 src/tls/                TLS 引擎（OpenSSL API 子集，OpenSSL / BoringSSL 共用）与驱动协程
 benchmarks/             bench_core / bench_net / bench_tls / bench_asio（Boost.Asio 对照）与 harness
 docs/                   architecture.md（分层、决策、审查记录）、backends.md（后端设计与 io_uring / IOCP 接入）、tls.md、benchmarks.md（与 Asio 对照）
@@ -245,7 +261,7 @@ tests/  examples/  .github/workflows/ci.yml
 
 ## 尚未提供
 
-`system_context`、与 `std::execution` 的桥（P4092/P4093）、IOCP / kqueue 后端（接缝已就位，
-方案见 `docs/backends.md`）、wolfSSL 提供者与 TLS 的 PKCS#12 / CRL / SNI 服务端回调 / 会话
-复用（见 `docs/tls.md`）、文件操作的取消在就绪型后端上不可用（同步完成）、io_uring 文件读写
-不使用固定缓冲区 / 注册文件。
+`system_context`、与 `std::execution` 的桥（P4092/P4093）、kqueue 后端（接缝已就位）、Windows 上的
+Unix 域套接字（afunix.h）与 IOCP 的投机路径（`FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`）、wolfSSL 提供者与
+TLS 的 PKCS#12 / CRL / SNI 服务端回调 / 会话复用（见 `docs/tls.md`）、文件操作的取消在就绪型后端上
+不可用（同步完成）、io_uring 文件读写不使用固定缓冲区 / 注册文件。
