@@ -268,8 +268,15 @@ src/detail/iocp/
   成功或 `WSA_IO_PENDING` 之后不再碰 op / env / this。同步完成的调用也会投完成包（没开
   `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`），路径统一。发起立刻失败（其它错误码）时同步以错误恢复，
   工作计数先加后减。
-- **不做投机**：`ready()` 只处理已记录的同步失败（未打开、`open` 失败、`ConnectEx` 前的 `bind`
-  失败、空序列）。Corosio 用跳过完成包的模式做投机，可以之后再加。
+- **只有 accept 做投机**：监听套接字在第一次 `accept()` 时设为非阻塞（不影响重叠调用），`ready()` 里
+  同步 `accept()`，队列里已有连接就不经过端口——与就绪型后端的 `accept4` 投机对齐，否则多个协程在
+  同一接受器上"connect 完就 accept"会让第二个 `begin_accept` 撞上 one-op-per-direction 契约（Linux 上
+  正是靠投机从不挂起）。读写不投机：`ready()` 只处理已记录的同步失败（未打开、`open` 失败、
+  `ConnectEx` 前的 `bind` 失败、空序列）。Corosio 用跳过完成包的模式给读写做投机，可以之后再加。
+- **本地取消的错误码**：`closesocket` 让在飞的操作以 `ERROR_NETNAME_DELETED` 完成——与对端 RST 同码。
+  所以 `cancel` / `close` / `release` / stop_token 都先给操作打 `cancelled` 标记，完成包无论带什么错误码
+  统一报 `operation_aborted`（Asio 的 cancel_token 做法）；没有标记的 `NETNAME_DELETED` 才是真正的
+  `connection_reset`。
 - **connect**：`ConnectEx` 经 `WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER)` 取一次；要求套接字已绑定，
   未绑定就先绑到本族的通配地址；完成后 `SO_UPDATE_CONNECT_CONTEXT`。失败以 NTSTATUS 转出的 Win32 码
   到达（`ERROR_CONNECTION_REFUSED` 1225），`iocp_error` 与 `WSAECONNREFUSED` 一并映射到
