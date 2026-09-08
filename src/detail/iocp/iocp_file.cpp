@@ -55,6 +55,7 @@ std::error_code iocp_file::close() noexcept {
     if (read_.pending) read_.cancelled.store(true, std::memory_order_release);
     if (write_.pending) write_.cancelled.store(true, std::memory_order_release);
     handle_ = INVALID_HANDLE_VALUE;
+    skip_on_success_ = false;
     if (not ::CloseHandle(h)) return std::error_code{static_cast<int>(::GetLastError()), std::system_category()};
     return {};
 }
@@ -70,6 +71,7 @@ native_file_type iocp_file::release() noexcept {
     cancel();
     auto const h = handle_;
     handle_ = INVALID_HANDLE_VALUE;
+    skip_on_success_ = false;
     return h;
 }
 
@@ -119,20 +121,25 @@ bool iocp_file::ready(op_direction const direction) noexcept {
     return false;
 }
 
-bool iocp_file::issue(iocp_file_op& op) noexcept {
+iocp_file::issue_result iocp_file::issue(iocp_file_op& op) noexcept {
     op.reset_overlapped();
     op.overlapped()->Offset = static_cast<DWORD>(op.offset & 0xFFFFFFFFULL);
     op.overlapped()->OffsetHigh = static_cast<DWORD>(op.offset >> 32);
+    DWORD transferred = 0; // 只在同步完成时有效
     BOOL ok = FALSE;
     if (op.direction_ == op_direction::read)
-        ok = ::ReadFile(handle_, op.data, op.length, nullptr, op.overlapped());
+        ok = ::ReadFile(handle_, op.data, op.length, &transferred, op.overlapped());
     else
-        ok = ::WriteFile(handle_, op.data, op.length, nullptr, op.overlapped());
-    if (ok) return true; // 同步完成：完成包仍会到
+        ok = ::WriteFile(handle_, op.data, op.length, &transferred, op.overlapped());
+    if (ok) {
+        if (not skip_on_success_) return issue_result::pending; // 完成包仍会到
+        op.on_complete(0, transferred);                          // 页缓存命中：不绕端口
+        return issue_result::completed;
+    }
     auto const error = ::GetLastError();
-    if (error == ERROR_IO_PENDING) return true;
+    if (error == ERROR_IO_PENDING) return issue_result::pending;
     op.on_complete(error, 0); // 例如越过文件尾的读立刻 ERROR_HANDLE_EOF，没有完成包
-    return false;
+    return issue_result::failed;
 }
 
 coroutine_handle<> iocp_file::suspend(op_direction const direction, coroutine_handle<> const h, io_env const* const env) noexcept {
@@ -147,7 +154,7 @@ coroutine_handle<> iocp_file::suspend(op_direction const direction, coroutine_ha
     }
     if (env->stop_token.stop_possible()) op.stop_cb.emplace(env->stop_token, cancel_iocp_file_op{&op});
     context_->get_executor().on_work_started();
-    if (not issue(op)) {
+    if (issue(op) != issue_result::pending) { // 同步完成 / 失败：没有完成包，直接恢复
         context_->get_executor().on_work_finished();
         op.stop_cb.reset();
         return h;

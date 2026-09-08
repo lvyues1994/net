@@ -152,6 +152,7 @@ std::error_code iocp_socket::open(int const family, int const type, int const pr
     family_ = family;
     type_ = type;
     protocol_ = protocol;
+    enable_skip_on_success();
     return {};
 }
 
@@ -163,7 +164,22 @@ std::error_code iocp_socket::assign(int const family, int const type, int const 
     family_ = family;
     type_ = type;
     protocol_ = protocol;
+    enable_skip_on_success();
     return {};
+}
+
+// 同步成功的重叠调用默认也投一个完成包，协程要多绕端口一圈才能拿到本来已在手里的结果。
+// FILE_SKIP_COMPLETION_PORT_ON_SUCCESS 关掉这一圈（libuv 的做法）；只对 IFS 提供者开——非 IFS 的 LSP
+// 会在这个模式下丢完成（XP1_IFS_HANDLES 检查同 libuv / Asio 的判据）。
+void iocp_socket::enable_skip_on_success() noexcept {
+    skip_on_success_ = false;
+    WSAPROTOCOL_INFOW info{};
+    auto length = static_cast<int>(sizeof(info));
+    if (::getsockopt(fd_, SOL_SOCKET, SO_PROTOCOL_INFOW, reinterpret_cast<char*>(&info), &length) != 0) return;
+    if ((info.dwServiceFlags1 & XP1_IFS_HANDLES) == 0) return;
+    if (::SetFileCompletionNotificationModes(reinterpret_cast<HANDLE>(fd_),
+                                             FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | FILE_SKIP_SET_EVENT_ON_HANDLE))
+        skip_on_success_ = true;
 }
 
 std::error_code iocp_socket::adopt(int const family, int const type, int const protocol, native_socket_type const fd) noexcept {
@@ -189,7 +205,7 @@ std::error_code iocp_socket::close() noexcept {
     if (read_op_.pending) read_op_.cancelled.store(true, std::memory_order_release);
     if (write_op_.pending) write_op_.cancelled.store(true, std::memory_order_release);
     fd_ = invalid_socket; // 在飞的操作随 closesocket 以取消完成（错误码可能是 995 或 64，统一报 aborted）
-    listener_nonblocking_ = false;
+    skip_on_success_ = false;
     if (::closesocket(s) != 0) return wsa_error();
     return {};
 }
@@ -200,7 +216,7 @@ native_socket_type iocp_socket::release() noexcept {
     cancel_pending();
     auto const s = fd_;
     fd_ = invalid_socket;
-    listener_nonblocking_ = false;
+    skip_on_success_ = false;
     return s; // 仍挂在端口上（Windows 不允许解除关联）
 }
 
@@ -298,7 +314,6 @@ bool iocp_socket::ready(op_direction const direction) noexcept {
         op.sync_failed = true;
         return true;
     }
-    if (op.op_kind == iocp_socket_op::kind::accept) return speculate_accept(op);
     if (op.op_kind != iocp_socket_op::kind::connect && op.buffer_count == 0U) {
         op.ec.clear(); // 空序列：不发起
         op.bytes_transferred = 0U;
@@ -308,77 +323,58 @@ bool iocp_socket::ready(op_direction const direction) noexcept {
     return false;
 }
 
-bool iocp_socket::speculate_accept(iocp_socket_op& op) noexcept {
-    // 就绪型后端的 accept 在 ready() 里用非阻塞 accept4 投机，连接已排队时同步完成；多个协程在一个
-    // 接受器上"connect 完就 accept"因此从不重叠。这里对齐：监听套接字设为非阻塞（不影响重叠调用），
-    // 同步 accept() 成功就不经过端口。
-    if (not listener_nonblocking_) {
-        u_long nonblocking = 1;
-        if (::ioctlsocket(fd_, static_cast<long>(FIONBIO), &nonblocking) != 0) return false; // 投机不了：走 AcceptEx
-        listener_nonblocking_ = true;
-    }
-    auto const s = ::accept(fd_, nullptr, nullptr); // 继承监听套接字的重叠属性
-    if (socket_is_valid(s)) {
-        op.accepted_fd = s;
-        op.accepted_family = family_;
-        op.ec.clear();
-        op.sync_failed = true;
-        return true;
-    }
-    auto const error = ::WSAGetLastError();
-    if (error == WSAEWOULDBLOCK) return false;
-    op.ec = iocp_error(static_cast<DWORD>(error), true);
-    op.sync_failed = true;
-    return true;
-}
-
-bool iocp_socket::issue(iocp_socket_op& op) noexcept {
+iocp_socket::issue_result iocp_socket::issue(iocp_socket_op& op) noexcept {
     using k = iocp_socket_op::kind;
     op.reset_overlapped();
     op.flags = 0;
     auto const handle = fd_;
     int result = 0;
+    DWORD transferred = 0; // 只在同步完成时有效
     switch (op.op_kind) {
     case k::read:
-        result = ::WSARecv(handle, op.buffers, op.buffer_count, nullptr, &op.flags, op.overlapped(), nullptr);
+        result = ::WSARecv(handle, op.buffers, op.buffer_count, &transferred, &op.flags, op.overlapped(), nullptr);
         break;
     case k::write:
-        result = ::WSASend(handle, op.buffers, op.buffer_count, nullptr, 0, op.overlapped(), nullptr);
+        result = ::WSASend(handle, op.buffers, op.buffer_count, &transferred, 0, op.overlapped(), nullptr);
         break;
     case k::receive_from:
-        result = ::WSARecvFrom(handle, op.buffers, op.buffer_count, nullptr, &op.flags, op.address_out, &op.from_length,
+        result = ::WSARecvFrom(handle, op.buffers, op.buffer_count, &transferred, &op.flags, op.address_out, &op.from_length,
                                op.overlapped(), nullptr);
         break;
     case k::send_to:
-        result = ::WSASendTo(handle, op.buffers, op.buffer_count, nullptr, 0, reinterpret_cast<sockaddr const*>(&op.address),
+        result = ::WSASendTo(handle, op.buffers, op.buffer_count, &transferred, 0, reinterpret_cast<sockaddr const*>(&op.address),
                              op.address_length, op.overlapped(), nullptr);
         break;
     case k::connect: {
         auto const connect_ex = load_connect_ex(handle);
         if (connect_ex == nullptr) {
             op.ec = wsa_error();
-            return false;
+            op.bytes_transferred = 0U;
+            return issue_result::failed;
         }
-        DWORD sent = 0;
-        auto const ok = connect_ex(handle, reinterpret_cast<sockaddr const*>(&op.address), op.address_length, nullptr, 0, &sent,
-                                   op.overlapped());
+        auto const ok = connect_ex(handle, reinterpret_cast<sockaddr const*>(&op.address), op.address_length, nullptr, 0,
+                                   &transferred, op.overlapped());
         result = ok ? 0 : SOCKET_ERROR;
         break;
     }
     case k::accept: {
         auto const address_size = static_cast<DWORD>(sizeof(sockaddr_storage) + 16U);
-        DWORD received = 0;
-        auto const ok = ::AcceptEx(handle, op.accept_socket, op.accept_buffer, 0, address_size, address_size, &received, op.overlapped());
+        auto const ok = ::AcceptEx(handle, op.accept_socket, op.accept_buffer, 0, address_size, address_size, &transferred,
+                                   op.overlapped());
         result = ok ? 0 : SOCKET_ERROR;
         break;
     }
     }
-    if (result == 0) return true; // 同步完成：完成包仍会到
+    if (result == 0) {
+        if (not skip_on_success_) return issue_result::pending; // 完成包仍会到
+        op.on_complete(0, transferred);                          // 结果已在手里：不绕端口
+        return issue_result::completed;
+    }
     auto const error = ::WSAGetLastError();
-    if (error == WSA_IO_PENDING) return true;
+    if (error == WSA_IO_PENDING) return issue_result::pending;
     op.ec = iocp_error(static_cast<DWORD>(error), op.op_kind == k::accept);
-    op.bytes_transferred = 0U;
-    return false;
+    op.bytes_transferred = 0U; // accept 同步失败时预建的对端留给下一次
+    return issue_result::failed;
 }
 
 coroutine_handle<> iocp_socket::suspend(op_direction const direction, coroutine_handle<> const h, io_env const* const env) noexcept {
@@ -393,7 +389,7 @@ coroutine_handle<> iocp_socket::suspend(op_direction const direction, coroutine_
     }
     if (env->stop_token.stop_possible()) op.stop_cb.emplace(env->stop_token, cancel_iocp_socket_op{&op});
     context_->get_executor().on_work_started(); // 发布之前
-    if (not issue(op)) {                        // 同步失败：没有完成包会来
+    if (issue(op) != issue_result::pending) {   // 同步完成或同步失败：没有完成包会来，直接恢复
         context_->get_executor().on_work_finished();
         op.stop_cb.reset();
         return h;

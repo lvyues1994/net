@@ -59,10 +59,9 @@ std::error_code iocp_error(DWORD const error, bool const accept_path) noexcept {
 
 iocp_backend::iocp_backend(execution_context& context) : context_{static_cast<io_context*>(&context)} {
     ensure_networking_initialized();
+    // NumberOfConcurrentThreads = 0：允许与处理器数相同的线程同时活跃；io_context 让所有 run() 线程进来。
     port_ = ::CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 0);
     if (port_ == nullptr) throw std::system_error{last_win32_error(), "CreateIoCompletionPort"};
-    expired_.reserve(32U);
-    completed_.reserve(64U);
 }
 
 iocp_backend::~iocp_backend() {
@@ -153,7 +152,7 @@ bool iocp_backend::add_timer(timer_op& op) noexcept {
         }
         context_->get_executor().on_work_started(); // 发布之前
         timers_.push(op);
-        wake = waiting_ && timers_.front() == &op; // 最早到期变了：叫醒等待线程重算超时
+        wake = waiting_ != 0U && timers_.front() == &op; // 最早到期变了：叫醒一个等待线程重算超时
     }
     if (wake) interrupt();
     return false;
@@ -192,11 +191,14 @@ DWORD iocp_backend::wait_timeout_ms_locked(long const limit_ms) const noexcept {
 void iocp_backend::interrupt() noexcept { ::PostQueuedCompletionStatus(port_, 0, wake_key, nullptr); }
 
 void iocp_backend::run(long const timeout_ms) {
+    // 多个线程可能同时在这里：每个线程自己的一批完成与到期定时器放在线程局部的向量里。
+    static thread_local std::vector<completed> completed_;
+    static thread_local std::vector<timer_op*> expired_;
     DWORD timeout = 0;
     {
         std::lock_guard<std::mutex> lock{mutex_};
         timeout = wait_timeout_ms_locked(timeout_ms);
-        waiting_ = timeout != 0;
+        if (timeout != 0) ++waiting_;
     }
     completed_.clear();
     expired_.clear();
@@ -208,9 +210,9 @@ void iocp_backend::run(long const timeout_ms) {
         ::SetLastError(0);
         auto const ok = ::GetQueuedCompletionStatus(port_, &bytes, &key, &overlapped, round == 0 ? timeout : 0);
         auto const error = ok ? DWORD{} : ::GetLastError();
-        if (round == 0) {
+        if (round == 0 && timeout != 0) {
             std::lock_guard<std::mutex> lock{mutex_};
-            waiting_ = false;
+            --waiting_;
         }
         if (overlapped == nullptr) {
             if (ok) continue;               // wake_key：只是叫醒

@@ -31,6 +31,7 @@ struct iocp_backend final : execution_context::service, io_backend, timer_schedu
 
     void run(long timeout_ms) override;
     void interrupt() noexcept override;
+    bool concurrent_run() const noexcept override { return true; }
 
     std::unique_ptr<socket_impl> create_socket(io_context& context) override;
     std::unique_ptr<timer_impl> create_timer(io_context& context) override;
@@ -76,9 +77,7 @@ struct iocp_backend final : execution_context::service, io_backend, timer_schedu
     HANDLE port_ = nullptr;
     std::mutex mutex_;
     timer_heap timers_;
-    bool waiting_ = false; // 有线程阻塞在 GetQueuedCompletionStatus 里（锁内读写）
-    std::vector<timer_op*> expired_; // 只有运行 run 的线程触碰
-    std::vector<completed> completed_;
+    unsigned waiting_ = 0U; // 阻塞在 GetQueuedCompletionStatus 里的线程数（锁内读写；多线程并发 run）
     signal_pump signal_pump_;
 };
 

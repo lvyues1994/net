@@ -105,11 +105,13 @@ struct iocp_socket final : socket_impl {
 
   private:
     iocp_socket_op& op_for(op_direction const direction) noexcept { return direction == op_direction::read ? read_op_ : write_op_; }
-    // 发起系统调用；返回 true 表示已发布（完成包会到），false 表示同步失败（op.ec 已设）。
-    bool issue(iocp_socket_op& op) noexcept;
+    // 发起系统调用。pending：已发布，完成包会到；completed：已同步完成（跳过端口模式下，结果已在 op 里）；
+    // failed：同步失败（op.ec 已设，没有完成包）。
+    enum class issue_result : unsigned char { pending, completed, failed };
+    issue_result issue(iocp_socket_op& op) noexcept;
     void cancel_pending() noexcept;
-    // accept 的投机：监听套接字非阻塞后同步 accept()，队列里已有连接就不必经过端口。
-    bool speculate_accept(iocp_socket_op& op) noexcept;
+    // 关联端口后：IFS 提供者上开启"同步成功不投完成包"，让已就绪的读写 / 排队的连接不经过端口。
+    void enable_skip_on_success() noexcept;
 
     io_context* context_;
     iocp_backend* backend_;
@@ -117,7 +119,7 @@ struct iocp_socket final : socket_impl {
     int family_ = 0;
     int type_ = 0;
     int protocol_ = 0;
-    bool listener_nonblocking_ = false;
+    bool skip_on_success_ = false; // FILE_SKIP_COMPLETION_PORT_ON_SUCCESS 已开：同步返回 0 就没有完成包
     iocp_socket_op read_op_;
     iocp_socket_op write_op_;
 };

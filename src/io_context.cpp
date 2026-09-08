@@ -95,7 +95,13 @@ detail::io_backend& make_backend(io_context& owner, backend_kind const kind, int
 
 struct io_context::impl {
     impl(io_context& owner, backend_kind const kind_, int const concurrency_hint)
-        : kind{kind_}, backend{make_backend(owner, kind_, concurrency_hint)} {}
+        : kind{kind_}, backend{make_backend(owner, kind_, concurrency_hint)}, concurrent{backend.concurrent_run()} {}
+
+    // 并发模式：当前线程是否在本上下文的 backend.run() 里（后端在 run() 里 post 续体时不必叫醒自己）。
+    static impl*& backend_of_this_thread() noexcept {
+        static thread_local impl* current = nullptr;
+        return current;
+    }
 
     void push(continuation& c) noexcept {
         c.next = nullptr;
@@ -141,6 +147,11 @@ struct io_context::impl {
     // run() 里完成操作时 post 续体的情形）：它不在等待，回到循环就会看到队列，打断只是浪费
     // 一次 eventfd 写、两次读和一个多余的完成事件。
     void wake_one_locked() noexcept {
+        if (concurrent) {
+            // 后端里的线程都阻塞在完成端口上；除自己以外还有就叫醒一个。
+            if (threads_in_backend > (backend_of_this_thread() == this ? 1U : 0U)) backend.interrupt();
+            return;
+        }
         if (idle_threads > 0U)
             cv.notify_one();
         else if (reactor_busy && reactor_thread != std::this_thread::get_id())
@@ -148,6 +159,11 @@ struct io_context::impl {
     }
 
     void wake_all_locked() noexcept {
+        if (concurrent) {
+            auto const others = threads_in_backend - (backend_of_this_thread() == this ? 1U : 0U);
+            for (auto i = 0U; i != others; ++i) backend.interrupt(); // 一个包叫醒一个线程
+            return;
+        }
         cv.notify_all();
         if (reactor_busy && reactor_thread != std::this_thread::get_id()) backend.interrupt();
     }
@@ -172,6 +188,32 @@ struct io_context::impl {
                 return 1U;
             }
             if (outstanding_work <= 0) return 0U;
+
+            if (concurrent) {
+                // 所有线程都直接进后端等待；后端自己保证并发安全。
+                struct in_backend_guard {
+                    impl* self;
+                    std::unique_lock<std::mutex>* lock;
+                    ~in_backend_guard() {
+                        backend_of_this_thread() = nullptr;
+                        lock->lock();
+                        --self->threads_in_backend;
+                    }
+                };
+                ++threads_in_backend;
+                lock.unlock();
+                {
+                    in_backend_guard guard{this, &lock};
+                    backend_of_this_thread() = this;
+                    auto timeout = block ? -1L : 0L;
+                    if (block && deadline != nullptr) timeout = milliseconds_until(*deadline);
+                    backend.run(timeout);
+                }
+                if (head != nullptr) continue;
+                if (not block) return 0U;
+                if (deadline != nullptr && std::chrono::steady_clock::now() >= *deadline) return 0U;
+                continue;
+            }
 
             if (not reactor_busy) {
                 struct busy_guard {
@@ -223,6 +265,8 @@ struct io_context::impl {
     unsigned idle_threads = 0U;
     bool reactor_busy = false;
     std::thread::id reactor_thread; // reactor_busy 为真时：正在 backend.run() 里的线程
+    bool const concurrent;          // backend.concurrent_run()
+    unsigned threads_in_backend = 0U; // 并发模式：在 backend.run() 里的线程数
     bool stopped = false;
 };
 

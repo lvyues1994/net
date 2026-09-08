@@ -69,11 +69,13 @@ struct iocp_file final : file_impl {
 
   private:
     iocp_file_op& op_for(op_direction const direction) noexcept { return direction == op_direction::read ? read_ : write_; }
-    bool issue(iocp_file_op& op) noexcept;
+    enum class issue_result : unsigned char { pending, completed, failed };
+    issue_result issue(iocp_file_op& op) noexcept;
 
     io_context* context_;
     iocp_backend* backend_;
     native_file_type handle_ = INVALID_HANDLE_VALUE;
+    bool skip_on_success_ = false; // 见 iocp_socket：同步成功不投完成包
     iocp_file_op read_;
     iocp_file_op write_;
 };

@@ -158,13 +158,17 @@ struct io_backend {
     io_backend& operator=(io_backend const&) = delete;
     virtual ~io_backend() = default;
 
-    // ---- 事件循环钩子（io_context 的调度器调用；同一时刻只有一个线程在 run 里） ----
+    // ---- 事件循环钩子（io_context 的调度器调用；concurrent_run() 为假时同一时刻只有一个线程在 run 里） ----
 
     // 等待并处理一批事件；timeout_ms < 0 表示只受内部定时器限制。完成的操作在返回前经
     // 各自的执行器 post。
     virtual void run(long timeout_ms) = 0;
-    // 唤醒阻塞在 run 里的线程（任意线程可调）。
+    // 唤醒一个阻塞在 run 里的线程（任意线程可调）。
     virtual void interrupt() noexcept = 0;
+    // 为真：多个线程可以同时在 run() 里（IOCP 的完成端口原生支持多线程并发 GetQueuedCompletionStatus）；
+    // io_context 不再用"反应器忙"的门把其余线程挡在条件变量上，而是让它们都进后端等待。
+    // 为假（就绪型族、io_uring）：同一时刻只有一个线程在 run() 里。
+    virtual bool concurrent_run() const noexcept { return false; }
 
     // ---- 工厂 ----
     virtual std::unique_ptr<socket_impl> create_socket(io_context& context) = 0;
