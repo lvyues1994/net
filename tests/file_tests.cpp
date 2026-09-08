@@ -1,6 +1,7 @@
 // 异步文件（Paper 10）：stream_file（隐式位置、满足 Stream）与 random_access_file（显式偏移）。
 // 每个后端各编一份：io_uring 走 READV / WRITEV 带偏移的 SQE，就绪型后端走同步 preadv / pwritev。
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -307,6 +308,53 @@ void two_handles_read_concurrently() {
     CHECK(out_a + out_b == payload);
 }
 
+// ---- 注册缓冲区上的文件读写（io_uring：READ_FIXED / WRITE_FIXED；其它后端照常） ----
+
+auto write_region(net::stream_file* file, unsigned char const* data, std::size_t n)
+    CO2_BEG((net::task<net::io_result<std::size_t>>), (file, data, n), net::io_result<std::size_t> r;) {
+    CO2_AWAIT_SET(r, net::write(*file, net::buffer(data, n))); // 单缓冲、落在注册区域内
+    CO2_RETURN(r);
+}
+CO2_END
+
+auto read_region_at(net::random_access_file* file, std::uint64_t offset, unsigned char* data, std::size_t n)
+    CO2_BEG((net::task<net::io_result<std::size_t>>), (file, offset, data, n), net::io_result<std::size_t> r; std::size_t done{};) {
+    while (done < n) {
+        CO2_AWAIT_SET(r, file->read_some_at(offset + done, net::buffer(data + done, n - done)));
+        if (r.ec) CO2_RETURN((net::io_result<std::size_t>{r.ec, done}));
+        done += r.value;
+    }
+    CO2_RETURN((net::io_result<std::size_t>{std::error_code{}, done}));
+}
+CO2_END
+
+void registered_buffer_file_io() {
+    test_context ctx;
+    temp_path tmp;
+    constexpr auto half = std::size_t{64U * 1024U};
+    std::vector<unsigned char> region(2U * half);
+    auto const registered = ctx.register_buffer(net::buffer(region));
+    static_cast<void>(registered); // 不支持 / 内存锁定额度不够的后端照常用普通路径
+    for (auto i = std::size_t{}; i != half; ++i) region[i] = static_cast<unsigned char>(i % 251U);
+    {
+        net::stream_file out{ctx, tmp.path, net::file_base::write_only | net::file_base::truncate};
+        auto const w = run_task(ctx, write_region(&out, region.data(), half));
+        CHECK(not w.ec);
+        CHECK_EQ(w.value, half);
+    }
+    net::random_access_file in{ctx, tmp.path, net::file_base::read_only};
+    auto const r = run_task(ctx, read_region_at(&in, 0U, region.data() + half, half)); // 读进区域后半段
+    CHECK(not r.ec);
+    CHECK_EQ(r.value, half);
+    CHECK(std::equal(region.begin(), region.begin() + static_cast<std::ptrdiff_t>(half), region.begin() + static_cast<std::ptrdiff_t>(half)));
+    ctx.unregister_buffer(net::buffer(region));
+    // 注销后同一块缓冲照常
+    std::fill(region.begin() + static_cast<std::ptrdiff_t>(half), region.end(), 0);
+    auto const again = run_task(ctx, read_region_at(&in, 0U, region.data() + half, half));
+    CHECK(not again.ec);
+    CHECK(std::equal(region.begin(), region.begin() + static_cast<std::ptrdiff_t>(half), region.begin() + static_cast<std::ptrdiff_t>(half)));
+}
+
 // ---- 打开标志与错误 ----
 
 void open_flags_and_errors() {
@@ -392,6 +440,7 @@ int main() {
     file_as_buffer_source_feeds_a_socket();
     random_access_file_reads_and_writes_at_offsets();
     two_handles_read_concurrently();
+    registered_buffer_file_io();
     open_flags_and_errors();
     std::cout << "file tests passed\n";
     return 0;

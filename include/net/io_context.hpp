@@ -6,6 +6,7 @@
 #include <type_traits>
 
 #include "net/backend.hpp"
+#include "net/buffers.hpp"
 #include "net/continuation.hpp"
 #include "net/coroutine.hpp"
 #include "net/execution_context.hpp"
@@ -90,6 +91,12 @@ struct io_context : execution_context {
 
     backend_kind backend() const noexcept;
     char const* backend_name() const noexcept;
+
+    // 把一块缓冲区登记给后端（io_uring：固定缓冲表）。之后完全落在该区域内的单缓冲 read_some / write_some /
+    // 文件读写走 READ_FIXED / WRITE_FIXED，省掉每次操作的页钉扎。这是优化提示：不支持的后端返回
+    // not_supported，读写照常工作；区域必须在注销前保持有效。
+    std::error_code register_buffer(mutable_buffer region) noexcept;
+    void unregister_buffer(mutable_buffer region) noexcept;
 
     // 运行事件循环直到工作计数归零或 stop()。返回恢复的协程数。
     std::size_t run();

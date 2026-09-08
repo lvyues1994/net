@@ -88,6 +88,17 @@ uring_backend::uring_backend(execution_context& context, bool const single_issue
     signal_poller_.on_readable = &drain_signal_pipe;
     signal_poller_.persistent = true;
     signal_poller_.counts_as_work = false;
+    // 稀疏文件表 / 缓冲表：内核不支持（< 5.19 / 5.13）或资源限制时静默退回裸 fd / 普通缓冲。
+    if (ring_.register_sparse_files(file_table_size) == 0) {
+        file_table_ = true;
+        free_file_slots_.reserve(file_table_size);
+        for (auto slot = static_cast<int>(file_table_size); slot-- > 0;) free_file_slots_.push_back(slot);
+    }
+    if (ring_.register_sparse_buffers(buffer_table_size) == 0) {
+        buffer_table_ = true;
+        free_buffer_slots_.reserve(buffer_table_size);
+        for (auto slot = static_cast<int>(buffer_table_size); slot-- > 0;) free_buffer_slots_.push_back(slot);
+    }
     {
         std::lock_guard<std::mutex> lock{mutex_};
         if (not try_submit_locked(interrupt_poller_)) push_deferred_locked(interrupt_poller_);
@@ -107,6 +118,72 @@ void uring_backend::shutdown() {
     deferred_tail_ = nullptr;
     pending_cancels_.clear();
     retired_.clear();
+}
+
+// ---- 注册资源 ----
+
+int uring_backend::register_file(int const fd) noexcept {
+    std::lock_guard<std::mutex> lock{mutex_};
+    if (not file_table_ || free_file_slots_.empty() || shut_down_) return -1;
+    auto const slot = free_file_slots_.back();
+    if (ring_.update_file(static_cast<unsigned>(slot), fd) != 0) return -1;
+    free_file_slots_.pop_back();
+    return slot;
+}
+
+void uring_backend::unregister_file(int const slot) noexcept {
+    if (slot < 0) return;
+    std::lock_guard<std::mutex> lock{mutex_};
+    if (shut_down_) return;
+    ring_.update_file(static_cast<unsigned>(slot), -1); // 在飞的请求持有自己的文件引用，不受影响
+    free_file_slots_.push_back(slot);
+}
+
+std::error_code uring_backend::register_buffer(void* const data, std::size_t const size) noexcept {
+    if (data == nullptr || size == 0U) return std::make_error_code(std::errc::invalid_argument);
+    std::lock_guard<std::mutex> lock{mutex_};
+    if (not buffer_table_) return std::make_error_code(std::errc::not_supported);
+    if (free_buffer_slots_.empty()) return std::make_error_code(std::errc::no_buffer_space);
+    auto const slot = free_buffer_slots_.back();
+    auto const rc = ring_.update_buffer(static_cast<unsigned>(slot), data, size);
+    if (rc != 0) return std::error_code{-rc, std::system_category()}; // 常见：RLIMIT_MEMLOCK 不够（-ENOMEM）
+    free_buffer_slots_.pop_back();
+    buffer_regions_.push_back(buffer_region{static_cast<char const*>(data), size, slot});
+    return {};
+}
+
+void uring_backend::unregister_buffer(void* const data) noexcept {
+    std::lock_guard<std::mutex> lock{mutex_};
+    for (auto it = buffer_regions_.begin(); it != buffer_regions_.end(); ++it) {
+        if (it->base != data) continue;
+        if (not shut_down_) ring_.update_buffer(static_cast<unsigned>(it->slot), nullptr, 0U);
+        free_buffer_slots_.push_back(it->slot);
+        buffer_regions_.erase(it);
+        return;
+    }
+}
+
+int uring_backend::fixed_buffer_slot_locked(void const* const data, std::size_t const size) const noexcept {
+    auto const* const begin = static_cast<char const*>(data);
+    for (auto const& region : buffer_regions_)
+        if (begin >= region.base && begin + size <= region.base + region.size) return region.slot;
+    return -1;
+}
+
+int uring_backend::allocate_buffer_group() noexcept {
+    std::lock_guard<std::mutex> lock{mutex_};
+    if (not free_buffer_groups_.empty()) {
+        auto const group = free_buffer_groups_.back();
+        free_buffer_groups_.pop_back();
+        return group;
+    }
+    if (next_buffer_group_ > 0xFFFF) return -1;
+    return next_buffer_group_++;
+}
+
+void uring_backend::release_buffer_group(int const group) noexcept {
+    std::lock_guard<std::mutex> lock{mutex_};
+    free_buffer_groups_.push_back(group);
 }
 
 // ---- 工厂 ----

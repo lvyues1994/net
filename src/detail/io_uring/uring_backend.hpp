@@ -60,6 +60,20 @@ struct uring_backend final : execution_context::service, io_backend {
     std::mutex& mutex() noexcept { return mutex_; }
     void submit_locked(uring_op& op) noexcept;
 
+    // ---- 注册资源 ----
+    // 文件表槽位：打开的套接字 / 文件占一个，prepare() 里以 IOSQE_FIXED_FILE 引用；表满或内核不支持
+    // 返回 -1（照常用裸 fd）。任意线程可调（环锁）。
+    int register_file(int fd) noexcept;
+    void unregister_file(int slot) noexcept;
+    std::error_code register_buffer(void* data, std::size_t size) noexcept override;
+    void unregister_buffer(void* data) noexcept override;
+    // 环锁内（prepare() 里）：[data, data+size) 落在某个注册区域内就返回其槽位，否则 -1。
+    int fixed_buffer_slot_locked(void const* data, std::size_t size) const noexcept;
+    // 提供缓冲环的组号分配（多发接收用）。
+    int allocate_buffer_group() noexcept;
+    void release_buffer_group(int group) noexcept;
+    uring& ring() noexcept { return ring_; }
+
   protected:
     void shutdown() override;
 
@@ -112,6 +126,23 @@ struct uring_backend final : execution_context::service, io_backend {
     std::vector<std::unique_ptr<uring_op>> retired_; // 锁内
     std::vector<uring_op*> pending_cancels_;          // 锁内：环满时没发出去的取消请求
     bool shut_down_ = false;
+
+    // 注册文件表（锁内）：稀疏表 + 空闲槽位栈
+    static constexpr unsigned file_table_size = 4096U;
+    static constexpr unsigned buffer_table_size = 64U;
+    bool file_table_ = false;
+    std::vector<int> free_file_slots_;
+    // 注册缓冲表（锁内）
+    struct buffer_region {
+        char const* base;
+        std::size_t size;
+        int slot;
+    };
+    bool buffer_table_ = false;
+    std::vector<int> free_buffer_slots_;
+    std::vector<buffer_region> buffer_regions_;
+    std::vector<int> free_buffer_groups_;
+    int next_buffer_group_ = 0;
 };
 
 } // namespace detail

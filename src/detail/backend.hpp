@@ -175,6 +175,15 @@ struct io_backend {
     virtual std::unique_ptr<timer_impl> create_timer(io_context& context) = 0;
     virtual std::unique_ptr<file_impl> create_file(io_context& context) = 0;
 
+    // 注册一块用户缓冲区（io_uring：固定缓冲表，之后落在区域内的单缓冲读写走 READ_FIXED / WRITE_FIXED，
+    // 省掉每次操作的页钉扎）。这是优化提示：不支持的后端返回 not_supported，读写照常工作。
+    virtual std::error_code register_buffer(void* data, std::size_t size) noexcept {
+        static_cast<void>(data);
+        static_cast<void>(size);
+        return std::make_error_code(std::errc::not_supported);
+    }
+    virtual void unregister_buffer(void* data) noexcept { static_cast<void>(data); }
+
     // 监视信号自管道的读端（POSIX：管道 fd；Windows：回环套接字对的一端）：可读时排空它，并对
     // 每个信号号调用 deliver。
     virtual std::error_code register_signal_reader(native_socket_type read_end,

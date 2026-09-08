@@ -631,6 +631,50 @@ void buffer_sink_commit_eof_is_tcp_shutdown() {
     CHECK(adapter.finished());
 }
 
+// ---- 注册缓冲区：io_uring 上落在区域内的单缓冲读写走 READ_FIXED / WRITE_FIXED；其它后端报 not_supported、照常工作 ----
+
+auto echo_through_registered(net::tcp_socket* client, net::tcp_socket* server, unsigned char* region, std::size_t half)
+    CO2_BEG((net::task<std::error_code>), (client, server, region, half), net::io_result<std::size_t> w; net::io_result<std::size_t> r;
+            std::size_t i{}; std::size_t got{};) {
+    for (i = 0; i != half; ++i) region[i] = static_cast<unsigned char>(i * 7U);
+    CO2_AWAIT_SET(w, net::write(*client, net::buffer(region, half)));          // 写端：注册区域内的单缓冲
+    if (w.ec) CO2_RETURN(w.ec);
+    while (got < half) {                                                       // 读端：注册区域后半段
+        CO2_AWAIT_SET(r, server->read_some(net::buffer(region + half + got, half - got)));
+        if (r.ec) CO2_RETURN(r.ec);
+        got += r.value;
+    }
+    for (i = 0; i != half; ++i)
+        if (region[half + i] != static_cast<unsigned char>(i * 7U)) CO2_RETURN(std::make_error_code(std::errc::bad_message));
+    // 跨越区域边界的缓冲不走固定路径，也必须正确
+    CO2_AWAIT_SET(w, net::write(*client, net::buffer(region + half - 8, 16)));
+    if (w.ec) CO2_RETURN(w.ec);
+    CO2_AWAIT_SET(r, net::read(*server, net::buffer(region, 16)));
+    CO2_RETURN(r.ec);
+}
+CO2_END
+
+void registered_buffers_round_trip() {
+    connected_pair pair;
+    constexpr auto half = std::size_t{64U * 1024U};
+    std::vector<unsigned char> region(2U * half);
+    auto const registered = pair.ctx.register_buffer(net::buffer(region));
+    if (registered && registered != std::errc::not_supported)
+        std::cout << "register_buffer: " << registered.message() << " (falling back to plain buffers)\n";
+    std::error_code ec;
+    net::run_async(pair.ctx.get_executor(), [&](std::error_code e) { ec = e; }, [](std::exception_ptr) { CHECK(false); })(
+        echo_through_registered(&pair.client, &pair.server, region.data(), half));
+    pair.ctx.run();
+    CHECK(not ec);
+    pair.ctx.unregister_buffer(net::buffer(region));
+    // 注销后再用同一块缓冲：普通路径
+    pair.ctx.restart();
+    net::run_async(pair.ctx.get_executor(), [&](std::error_code e) { ec = e; }, [](std::exception_ptr) { CHECK(false); })(
+        echo_through_registered(&pair.client, &pair.server, region.data(), half));
+    pair.ctx.run();
+    CHECK(not ec);
+}
+
 void endpoints_and_options() {
     connected_pair pair;
     std::error_code ec;
@@ -669,6 +713,7 @@ int main() {
     assigning_a_listening_descriptor();
     write_sink_eof_is_tcp_shutdown();
     buffer_sink_commit_eof_is_tcp_shutdown();
+    registered_buffers_round_trip();
     endpoints_and_options();
     std::cout << "tcp tests passed\n";
     return 0;

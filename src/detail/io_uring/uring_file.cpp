@@ -19,11 +19,27 @@ void cancel_uring_file_op::operator()() const noexcept { op->owner_->backend().c
 // ---- op ----
 
 void uring_file_op::prepare(io_uring_sqe& sqe) noexcept {
+    if (owner_->file_slot() >= 0) {
+        sqe.fd = owner_->file_slot();
+        sqe.flags |= IOSQE_FIXED_FILE;
+    } else {
+        sqe.fd = owner_->native_handle();
+    }
+    sqe.off = offset;
+    // 单缓冲且落在注册缓冲区域内：READ_FIXED / WRITE_FIXED
+    if (vector_count == 1U) {
+        auto const slot = owner_->backend().fixed_buffer_slot_locked(vectors[0].iov_base, vectors[0].iov_len);
+        if (slot >= 0) {
+            sqe.opcode = direction_ == op_direction::read ? IORING_OP_READ_FIXED : IORING_OP_WRITE_FIXED;
+            sqe.addr = reinterpret_cast<std::uintptr_t>(vectors[0].iov_base);
+            sqe.len = static_cast<unsigned>(vectors[0].iov_len);
+            sqe.buf_index = static_cast<std::uint16_t>(slot);
+            return;
+        }
+    }
     sqe.opcode = direction_ == op_direction::read ? IORING_OP_READV : IORING_OP_WRITEV;
-    sqe.fd = owner_->native_handle();
     sqe.addr = reinterpret_cast<std::uintptr_t>(vectors);
     sqe.len = vector_count;
-    sqe.off = offset;
 }
 
 void uring_file_op::on_complete(int const res, unsigned) noexcept {
@@ -56,12 +72,15 @@ uring_file::~uring_file() {
 std::error_code uring_file::assign(int const fd) noexcept {
     if (fd_ >= 0) return make_error_code(error::already_open);
     fd_ = fd;
+    file_slot_ = backend_->register_file(fd);
     return {};
 }
 
 std::error_code uring_file::close() noexcept {
     if (fd_ < 0) return {};
     cancel();
+    backend_->unregister_file(file_slot_);
+    file_slot_ = -1;
     auto const fd = fd_;
     fd_ = -1;
     if (::close(fd) != 0) return std::error_code{errno, std::system_category()};
@@ -75,6 +94,8 @@ void uring_file::cancel() noexcept {
 
 int uring_file::release() noexcept {
     cancel();
+    backend_->unregister_file(file_slot_);
+    file_slot_ = -1;
     auto const fd = fd_;
     fd_ = -1;
     return fd;

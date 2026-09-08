@@ -56,7 +56,28 @@ std::size_t fill_vectors(iovec (&vectors)[N], buffer_array<Buffer, N> const& buf
 // ---- uring_socket_op ----
 
 void uring_socket_op::prepare(io_uring_sqe& sqe) noexcept {
-    sqe.fd = owner->native_handle();
+    if (owner->file_slot() >= 0) { // 注册文件：省掉每次操作的 fdget / fdput
+        sqe.fd = owner->file_slot();
+        sqe.flags |= IOSQE_FIXED_FILE;
+    } else {
+        sqe.fd = owner->native_handle();
+    }
+    // 单缓冲且落在注册缓冲区域内：READ_FIXED / WRITE_FIXED（省掉页钉扎）。prepare() 在环锁内调用。
+    if (op_kind == kind::read || op_kind == kind::write) {
+        auto const single = op_kind == kind::read ? (read_buffers.size() == 1U ? const_buffer{read_buffers.to_span()[0]} : const_buffer{})
+                                                  : (write_buffers.size() == 1U ? write_buffers.to_span()[0] : const_buffer{});
+        if (single.size() != 0U) {
+            auto const slot = owner->backend().fixed_buffer_slot_locked(single.data(), single.size());
+            if (slot >= 0) {
+                sqe.opcode = op_kind == kind::read ? IORING_OP_READ_FIXED : IORING_OP_WRITE_FIXED;
+                sqe.addr = reinterpret_cast<std::uintptr_t>(single.data());
+                sqe.len = static_cast<unsigned>(single.size());
+                sqe.off = static_cast<std::uint64_t>(-1); // 套接字：无位置
+                sqe.buf_index = static_cast<std::uint16_t>(slot);
+                return;
+            }
+        }
+    }
     switch (op_kind) {
     case kind::read:
     case kind::receive_from: {
@@ -160,7 +181,12 @@ void cancel_uring_socket_op::operator()() const noexcept { impl->cancel_op(impl-
 
 void uring_multishot_accept_op::prepare(io_uring_sqe& sqe) noexcept {
     sqe.opcode = IORING_OP_ACCEPT;
-    sqe.fd = listen_fd;
+    if (listen_slot >= 0) {
+        sqe.fd = listen_slot;
+        sqe.flags |= IOSQE_FIXED_FILE;
+    } else {
+        sqe.fd = listen_fd;
+    }
     sqe.ioprio = IORING_ACCEPT_MULTISHOT;
     // 不要对端地址：多发下所有完成共用一块地址暂存，会互相覆盖；对端地址由 remote_endpoint()
     // 在接受后的套接字上取。
@@ -211,6 +237,7 @@ std::error_code uring_socket::adopt(int const family, int const type, int, int c
     if (fd_ >= 0) return make_error_code(error::already_open);
     fd_ = fd;
     family_ = family;
+    file_slot_ = backend_->register_file(fd);
     // 接管一个已在监听的描述符：像 listen() 一样武装多发 accept。
     if (type == SOCK_STREAM && fd_is_listening(fd)) arm_multishot_accept();
     return {};
@@ -226,7 +253,7 @@ void uring_socket::arm_multishot_accept() noexcept {
     if (not multishot_accept_supported()) return;
     if (not acceptor_) acceptor_.reset(new acceptor_state{});
     if (acceptor_->op) return;
-    acceptor_->op.reset(new uring_multishot_accept_op{*this, fd_});
+    acceptor_->op.reset(new uring_multishot_accept_op{*this, fd_, file_slot_});
     acceptor_->armed = true;
     if (not backend_->submit(*acceptor_->op)) acceptor_->op.reset(); // 上下文已 shutdown
 }
@@ -296,6 +323,8 @@ std::error_code uring_socket::close() noexcept {
     cancel_op(write_op_);
     retire_multishot_accept();
     close_parked_fds();
+    backend_->unregister_file(file_slot_);
+    file_slot_ = -1;
     auto const closing = fd_;
     fd_ = -1;
     return posix::close_socket(closing);
@@ -313,6 +342,8 @@ int uring_socket::release() noexcept {
     cancel_op(write_op_);
     retire_multishot_accept();
     close_parked_fds(); // 停着的连接属于被拿走的监听套接字
+    backend_->unregister_file(file_slot_);
+    file_slot_ = -1;
     auto const released = fd_;
     fd_ = -1;
     return released;

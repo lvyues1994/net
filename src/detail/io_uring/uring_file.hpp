@@ -60,6 +60,7 @@ struct uring_file final : file_impl {
     void cancel() noexcept override;
     int release() noexcept override;
     int native_handle() const noexcept override { return fd_; }
+    int file_slot() const noexcept { return file_slot_; }
 
     void begin_read(std::uint64_t offset, span<mutable_buffer const> buffers) noexcept override;
     void begin_write(std::uint64_t offset, span<const_buffer const> buffers) noexcept override;
@@ -74,6 +75,7 @@ struct uring_file final : file_impl {
     io_context* context_;
     uring_backend* backend_;
     int fd_ = -1;
+    int file_slot_ = -1; // 注册文件表槽位（-1：用裸 fd）
     uring_file_op read_;
     uring_file_op write_;
 };

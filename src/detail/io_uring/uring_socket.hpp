@@ -110,7 +110,8 @@ struct uring_socket_op final : uring_op {
 // 作为 waiter 挂起而不提交 SQE。终止 CQE（无 F_MORE）后重新武装。拥有者关闭 / 释放描述符时把
 // 本操作退役给后端持有到终止 CQE（内核仍引用 user_data）。on_complete / rearm 在环锁内调用。
 struct uring_multishot_accept_op final : uring_op {
-    uring_multishot_accept_op(uring_socket& owner_, int const listen_fd_) noexcept : owner{&owner_}, listen_fd{listen_fd_} {
+    uring_multishot_accept_op(uring_socket& owner_, int const listen_fd_, int const listen_slot_) noexcept
+        : owner{&owner_}, listen_fd{listen_fd_}, listen_slot{listen_slot_} {
         persistent = true;
         counts_as_work = false; // 内部机制；用户可见的工作按每次 accept() 计
     }
@@ -122,6 +123,7 @@ struct uring_multishot_accept_op final : uring_op {
 
     uring_socket* owner; // 退役后为空：之后送来的 fd 直接关闭
     int listen_fd;
+    int listen_slot = -1; // 注册文件表槽位（-1：用裸 fd）
 };
 
 struct uring_socket final : socket_impl {
@@ -137,6 +139,7 @@ struct uring_socket final : socket_impl {
     void cancel() noexcept override;
     int release() noexcept override;
     int native_handle() const noexcept override { return fd_; }
+    int file_slot() const noexcept { return file_slot_; }
     std::error_code listen(int backlog) noexcept override;
 
     void begin_read(span<mutable_buffer const> buffers) noexcept override;
@@ -210,6 +213,7 @@ struct uring_socket final : socket_impl {
     io_context* context_;
     uring_backend* backend_;
     int fd_ = -1;
+    int file_slot_ = -1; // 注册文件表槽位（-1：用裸 fd）
     int family_ = 0;
     speculation_state speculation_;
     uring_socket_op read_op_;

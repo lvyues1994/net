@@ -307,6 +307,12 @@ bool backend_available(backend_kind const kind) noexcept {
 
 char const* io_context::backend_name() const noexcept { return impl_->backend.name(); }
 
+std::error_code io_context::register_buffer(mutable_buffer const region) noexcept {
+    return impl_->backend.register_buffer(region.data(), region.size());
+}
+
+void io_context::unregister_buffer(mutable_buffer const region) noexcept { impl_->backend.unregister_buffer(region.data()); }
+
 std::size_t io_context::run() {
     thread_context_guard guard{this};
     auto count = std::size_t{};

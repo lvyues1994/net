@@ -57,6 +57,20 @@ struct uring {
     void advance() noexcept;
     unsigned ready() const noexcept;
 
+    // ---- 注册资源（io_uring_register；失败返回 -errno） ----
+    // 稀疏文件表：之后用 update_file 往槽位里放 fd；SQE 以 IOSQE_FIXED_FILE + 槽位号引用，省掉每次
+    // 操作的 fdget / fdput。需要 5.19。
+    int register_sparse_files(unsigned count) noexcept;
+    int update_file(unsigned slot, int fd) noexcept; // fd = -1 清空槽位
+    // 稀疏缓冲表：之后用 update_buffer 登记区域；READ_FIXED / WRITE_FIXED 以 buf_index 引用，省掉每次
+    // 操作的页钉扎。需要 5.13。
+    int register_sparse_buffers(unsigned count) noexcept;
+    int update_buffer(unsigned slot, void* data, std::size_t size) noexcept; // data 为空清空槽位
+    // 提供缓冲环（IORING_REGISTER_PBUF_RING，5.19）：内核在带 IOSQE_BUFFER_SELECT 的接收里自己挑缓冲。
+    // ring 必须页对齐、entries 为 2 的幂；由调用方分配。
+    int register_buffer_ring(void* ring, unsigned entries, unsigned short group) noexcept;
+    int unregister_buffer_ring(unsigned short group) noexcept;
+
   private:
     void setup_mapped(io_uring_params const& params);
     void unmap() noexcept;
@@ -92,6 +106,8 @@ struct uring {
 bool uring_available() noexcept;
 // 内核 ≥ 5.19：IORING_ACCEPT_MULTISHOT 可用（没有 feature 位，按 uname 判断）。
 bool multishot_accept_supported() noexcept;
+bool multishot_recv_supported() noexcept; // IORING_RECV_MULTISHOT + 提供缓冲环：6.0
+bool kernel_at_least(int major, int minor) noexcept;
 
 } // namespace detail
 } // namespace net

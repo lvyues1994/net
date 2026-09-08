@@ -7,6 +7,7 @@
 #include <cstdio>
 
 #include <sys/mman.h>
+#include <sys/uio.h>
 #include <sys/syscall.h>
 #include <sys/utsname.h>
 #include <unistd.h>
@@ -37,6 +38,27 @@ int sys_io_uring_register(int const fd, unsigned const opcode, void const* const
 #endif
 #ifndef IORING_SETUP_R_DISABLED
 #define IORING_SETUP_R_DISABLED (1U << 6)
+#endif
+#ifndef IORING_REGISTER_FILES2
+#define IORING_REGISTER_FILES2 13
+#endif
+#ifndef IORING_REGISTER_FILES_UPDATE2
+#define IORING_REGISTER_FILES_UPDATE2 14
+#endif
+#ifndef IORING_REGISTER_BUFFERS2
+#define IORING_REGISTER_BUFFERS2 15
+#endif
+#ifndef IORING_REGISTER_BUFFERS_UPDATE
+#define IORING_REGISTER_BUFFERS_UPDATE 16
+#endif
+#ifndef IORING_REGISTER_PBUF_RING
+#define IORING_REGISTER_PBUF_RING 22
+#endif
+#ifndef IORING_UNREGISTER_PBUF_RING
+#define IORING_UNREGISTER_PBUF_RING 23
+#endif
+#ifndef IORING_RSRC_REGISTER_SPARSE
+#define IORING_RSRC_REGISTER_SPARSE (1U << 0)
 #endif
 #ifndef IORING_REGISTER_ENABLE_RINGS
 #define IORING_REGISTER_ENABLE_RINGS 12
@@ -200,16 +222,76 @@ void uring::advance() noexcept { store_release(cq_head_, *cq_head_ + 1U); }
 
 unsigned uring::ready() const noexcept { return load_acquire(cq_tail_) - *cq_head_; }
 
-bool multishot_accept_supported() noexcept {
-    static bool const supported = [] {
+bool kernel_at_least(int const want_major, int const want_minor) noexcept {
+    static int const version = [] {
         utsname info{};
-        if (::uname(&info) != 0) return false;
+        if (::uname(&info) != 0) return 0;
         auto major = 0;
         auto minor = 0;
-        if (std::sscanf(info.release, "%d.%d", &major, &minor) != 2) return false;
-        return major > 5 || (major == 5 && minor >= 19);
+        if (std::sscanf(info.release, "%d.%d", &major, &minor) != 2) return 0;
+        return major * 1000 + minor;
     }();
-    return supported;
+    return version >= want_major * 1000 + want_minor;
+}
+
+bool multishot_accept_supported() noexcept { return kernel_at_least(5, 19); }
+
+bool multishot_recv_supported() noexcept { return kernel_at_least(6, 0); }
+
+// ---- 注册资源 ----
+
+int uring::register_sparse_files(unsigned const count) noexcept {
+    io_uring_rsrc_register reg{};
+    reg.nr = count;
+    reg.flags = IORING_RSRC_REGISTER_SPARSE;
+    if (sys_io_uring_register(fd_, IORING_REGISTER_FILES2, &reg, sizeof(reg)) < 0) return -errno;
+    return 0;
+}
+
+int uring::update_file(unsigned const slot, int const fd) noexcept {
+    auto value = fd;
+    io_uring_rsrc_update2 update{};
+    update.offset = slot;
+    update.data = reinterpret_cast<std::uintptr_t>(&value);
+    update.nr = 1U;
+    if (sys_io_uring_register(fd_, IORING_REGISTER_FILES_UPDATE2, &update, sizeof(update)) < 0) return -errno;
+    return 0;
+}
+
+int uring::register_sparse_buffers(unsigned const count) noexcept {
+    io_uring_rsrc_register reg{};
+    reg.nr = count;
+    reg.flags = IORING_RSRC_REGISTER_SPARSE;
+    if (sys_io_uring_register(fd_, IORING_REGISTER_BUFFERS2, &reg, sizeof(reg)) < 0) return -errno;
+    return 0;
+}
+
+int uring::update_buffer(unsigned const slot, void* const data, std::size_t const size) noexcept {
+    iovec vec{};
+    vec.iov_base = data;
+    vec.iov_len = data != nullptr ? size : 0U;
+    io_uring_rsrc_update2 update{};
+    update.offset = slot;
+    update.data = reinterpret_cast<std::uintptr_t>(&vec);
+    update.nr = 1U;
+    if (sys_io_uring_register(fd_, IORING_REGISTER_BUFFERS_UPDATE, &update, sizeof(update)) < 0) return -errno;
+    return 0;
+}
+
+int uring::register_buffer_ring(void* const ring, unsigned const entries, unsigned short const group) noexcept {
+    io_uring_buf_reg reg{};
+    reg.ring_addr = reinterpret_cast<std::uintptr_t>(ring);
+    reg.ring_entries = entries;
+    reg.bgid = group;
+    if (sys_io_uring_register(fd_, IORING_REGISTER_PBUF_RING, &reg, 1U) < 0) return -errno;
+    return 0;
+}
+
+int uring::unregister_buffer_ring(unsigned short const group) noexcept {
+    io_uring_buf_reg reg{};
+    reg.bgid = group;
+    if (sys_io_uring_register(fd_, IORING_UNREGISTER_PBUF_RING, &reg, 1U) < 0) return -errno;
+    return 0;
 }
 
 bool uring_available() noexcept {
