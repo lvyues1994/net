@@ -11,8 +11,17 @@
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 #include <openssl/x509_vfy.h>
+#if !defined(OPENSSL_IS_BORINGSSL)
+#include <openssl/ocsp.h>
+#endif
 
+#include "net/config.hpp"
+#include "net/error.hpp"
 #include "net/tls/error.hpp"
+#if NET_PLATFORM_WINDOWS
+#include "net/detail/socket_types.hpp"
+#include <wincrypt.h>
+#endif
 
 #include "tls/context_impl.hpp"
 
@@ -72,6 +81,86 @@ int alpn_select_thunk(SSL*, unsigned char const** out, unsigned char* outlen, un
     return SSL_TLSEXT_ERR_OK;
 }
 
+// SNI：按主机名换 SSL_CTX。SSL_set_SSL_CTX 带走证书 / 私钥 / 验证设置；验证模式与回调按 OpenSSL 的建议
+// 显式同步。
+int servername_thunk(SSL* const ssl, int* const alert, void* const arg) {
+    static_cast<void>(alert);
+    auto* const impl = static_cast<detail::context_impl*>(arg);
+    if (impl == nullptr || not impl->on_servername) return SSL_TLSEXT_ERR_OK;
+    auto const* const name = ::SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+    if (name == nullptr) return SSL_TLSEXT_ERR_OK;
+    context const* selected = nullptr;
+    try {
+        selected = impl->on_servername(std::string{name});
+    } catch (...) {
+        return SSL_TLSEXT_ERR_ALERT_FATAL;
+    }
+    if (selected == nullptr) return SSL_TLSEXT_ERR_OK;
+    auto* const target = static_cast<SSL_CTX*>(selected->native_handle());
+    if (target == ::SSL_get_SSL_CTX(ssl)) return SSL_TLSEXT_ERR_OK;
+    if (::SSL_set_SSL_CTX(ssl, target) == nullptr) return SSL_TLSEXT_ERR_ALERT_FATAL;
+    ::SSL_set_verify(ssl, ::SSL_CTX_get_verify_mode(target), ::SSL_CTX_get_verify_callback(target));
+    return SSL_TLSEXT_ERR_OK;
+}
+
+// 会话回调：客户端流拿到可复用的会话（TLS 1.3 在 NewSessionTicket 到达时）。返回 1 表示接管引用。
+int new_session_thunk(SSL* const ssl, SSL_SESSION* const sess) {
+    auto* const hooks = static_cast<detail::stream_hooks*>(::SSL_get_ex_data(ssl, detail::stream_ex_data_index()));
+    if (hooks == nullptr || not hooks->is_client()) return 0;
+    hooks->on_new_session(sess);
+    return 1;
+}
+
+#if !defined(OPENSSL_IS_BORINGSSL)
+// OCSP status 回调：服务端附上响应；客户端验证收到的响应。
+int ocsp_status_thunk(SSL* const ssl, void* const arg) {
+    auto* const impl = static_cast<detail::context_impl*>(arg);
+    auto* const hooks = static_cast<detail::stream_hooks*>(::SSL_get_ex_data(ssl, detail::stream_ex_data_index()));
+    if (impl == nullptr) return SSL_TLSEXT_ERR_NOACK;
+    if (hooks == nullptr || not hooks->is_client()) { // 服务端
+        if (impl->ocsp_response.empty()) return SSL_TLSEXT_ERR_NOACK;
+        auto* const copy = static_cast<unsigned char*>(::OPENSSL_malloc(impl->ocsp_response.size()));
+        if (copy == nullptr) return SSL_TLSEXT_ERR_ALERT_FATAL;
+        std::memcpy(copy, impl->ocsp_response.data(), impl->ocsp_response.size());
+        ::SSL_set_tlsext_status_ocsp_resp(ssl, copy, static_cast<long>(impl->ocsp_response.size())); // 接管
+        return SSL_TLSEXT_ERR_OK;
+    }
+    // 客户端：0 使握手失败，1 接受。
+    unsigned char const* raw = nullptr;
+    auto const length = ::SSL_get_tlsext_status_ocsp_resp(ssl, &raw);
+    if (raw == nullptr || length <= 0) {
+        if (not impl->ocsp_required) return 1;
+        hooks->set_ocsp_error(make_error_code(error::ocsp_response_missing));
+        return 0;
+    }
+    auto const invalid = [&] {
+        hooks->set_ocsp_error(make_error_code(error::ocsp_response_invalid));
+        return 0;
+    };
+    auto const* p = raw;
+    std::unique_ptr<OCSP_RESPONSE, void (*)(OCSP_RESPONSE*)> response{::d2i_OCSP_RESPONSE(nullptr, &p, length), &::OCSP_RESPONSE_free};
+    if (not response || ::OCSP_response_status(response.get()) != OCSP_RESPONSE_STATUS_SUCCESSFUL) return invalid();
+    std::unique_ptr<OCSP_BASICRESP, void (*)(OCSP_BASICRESP*)> basic{::OCSP_response_get1_basic(response.get()), &::OCSP_BASICRESP_free};
+    if (not basic) return invalid();
+    auto* const chain = ::SSL_get0_verified_chain(ssl);
+    auto* const store = ::SSL_CTX_get_cert_store(::SSL_get_SSL_CTX(ssl));
+    if (chain == nullptr || sk_X509_num(chain) == 0 || ::OCSP_basic_verify(basic.get(), chain, store, 0) != 1) return invalid();
+    auto* const leaf = sk_X509_value(chain, 0);
+    auto* const issuer = sk_X509_num(chain) > 1 ? sk_X509_value(chain, 1) : leaf; // 自签：自己是签发者
+    std::unique_ptr<OCSP_CERTID, void (*)(OCSP_CERTID*)> id{::OCSP_cert_to_id(nullptr, leaf, issuer), &::OCSP_CERTID_free};
+    if (not id) return invalid();
+    auto status = 0;
+    auto reason = 0;
+    ASN1_GENERALIZEDTIME* revoked_at = nullptr;
+    ASN1_GENERALIZEDTIME* this_update = nullptr;
+    ASN1_GENERALIZEDTIME* next_update = nullptr;
+    if (::OCSP_resp_find_status(basic.get(), id.get(), &status, &reason, &revoked_at, &this_update, &next_update) != 1) return invalid();
+    if (status != V_OCSP_CERTSTATUS_GOOD) return invalid();
+    if (::OCSP_check_validity(this_update, next_update, 300L, -1L) != 1) return invalid();
+    return 1;
+}
+#endif
+
 int verify_thunk(int const preverified, X509_STORE_CTX* const store) {
     auto* const ssl = static_cast<SSL*>(::X509_STORE_CTX_get_ex_data(store, ::SSL_get_ex_data_X509_STORE_CTX_idx()));
     if (ssl == nullptr) return preverified;
@@ -130,10 +219,35 @@ context_impl::context_impl() {
     ::SSL_CTX_set_options(ctx, SSL_OP_NO_RENEGOTIATION);
 #endif
     ::SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
-    ::SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
+    // 客户端会话经 new-session 回调交给流，不进内部缓存；服务端靠无状态的会话票据恢复，不需要缓存。
+    ::SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_NO_INTERNAL_STORE);
+    ::SSL_CTX_sess_set_new_cb(ctx, &new_session_thunk);
+    static unsigned char const session_id_context[] = "net";
+    ::SSL_CTX_set_session_id_context(ctx, session_id_context, sizeof(session_id_context) - 1U);
     ::SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
     ::SSL_CTX_set_default_passwd_cb(ctx, &password_thunk);
     ::SSL_CTX_set_default_passwd_cb_userdata(ctx, this);
+#if defined(OPENSSL_IS_BORINGSSL)
+    ::SSL_CTX_set_tlsext_servername_callback(ctx, &servername_thunk);
+    ::SSL_CTX_set_tlsext_servername_arg(ctx, this);
+#else
+    // OpenSSL 的 SSL_CTX_set_tlsext_*_cb 是带 C 风格转换的宏；直接调 callback_ctrl。
+    ::SSL_CTX_callback_ctrl(ctx, SSL_CTRL_SET_TLSEXT_SERVERNAME_CB, reinterpret_cast<void (*)()>(&servername_thunk));
+    ::SSL_CTX_ctrl(ctx, SSL_CTRL_SET_TLSEXT_SERVERNAME_ARG, 0, this);
+    ::SSL_CTX_callback_ctrl(ctx, SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB, reinterpret_cast<void (*)()>(&ocsp_status_thunk));
+    ::SSL_CTX_ctrl(ctx, SSL_CTRL_SET_TLSEXT_STATUS_REQ_CB_ARG, 0, this);
+#endif
+}
+
+int stream_ex_data_index() noexcept {
+    static int const index = ::SSL_get_ex_new_index(0, nullptr, nullptr, nullptr, nullptr);
+    return index;
+}
+
+session session_access::make(SSL_SESSION* const owned) noexcept {
+    session s;
+    if (owned != nullptr) s.handle_ = std::shared_ptr<void>{owned, [](void* const p) { ::SSL_SESSION_free(static_cast<SSL_SESSION*>(p)); }};
+    return s;
 }
 
 context_impl::~context_impl() {
@@ -316,6 +430,82 @@ void context::set_verify_callback(verify_callback callback) {
 }
 
 void context::set_password_callback(password_callback callback) { impl_->on_password = std::move(callback); }
+
+// ---- SNI ----
+
+void context::set_servername_callback(servername_callback callback) { impl_->on_servername = std::move(callback); }
+
+// ---- 证书库与吊销 ----
+
+std::error_code context::add_os_certificates() {
+#if NET_PLATFORM_WINDOWS
+    auto* const store = ::SSL_CTX_get_cert_store(impl_->ctx);
+    auto const system_store = ::CertOpenSystemStoreW(0, L"ROOT");
+    if (system_store == nullptr) return std::error_code{static_cast<int>(::GetLastError()), std::system_category()};
+    PCCERT_CONTEXT entry = nullptr;
+    auto added = 0;
+    while ((entry = ::CertEnumCertificatesInStore(system_store, entry)) != nullptr) {
+        auto const* der = entry->pbCertEncoded;
+        std::unique_ptr<X509, void (*)(X509*)> cert{::d2i_X509(nullptr, &der, static_cast<long>(entry->cbCertEncoded)), &::X509_free};
+        if (cert && ::X509_STORE_add_cert(store, cert.get()) == 1) ++added;
+        ::ERR_clear_error(); // 重复证书等非致命错误
+    }
+    ::CertCloseStore(system_store, 0);
+    return added > 0 ? std::error_code{} : std::make_error_code(std::errc::no_such_file_or_directory);
+#else
+    return set_default_verify_paths();
+#endif
+}
+
+std::error_code context::add_crl(std::string const& crl_pem) {
+    std::unique_ptr<BIO, void (*)(BIO*)> bio{::BIO_new_mem_buf(crl_pem.data(), static_cast<int>(crl_pem.size())), &::BIO_free_all};
+    if (not bio) return provider_error();
+    auto* const store = ::SSL_CTX_get_cert_store(impl_->ctx);
+    auto added = 0;
+    for (;;) {
+        std::unique_ptr<X509_CRL, void (*)(X509_CRL*)> crl{::PEM_read_bio_X509_CRL(bio.get(), nullptr, nullptr, nullptr), &::X509_CRL_free};
+        if (not crl) break;
+        if (::X509_STORE_add_crl(store, crl.get()) != 1) return provider_error();
+        ++added;
+    }
+    ::ERR_clear_error(); // PEM 读到末尾的"no start line"
+    return added > 0 ? std::error_code{} : std::make_error_code(std::errc::invalid_argument);
+}
+
+std::error_code context::set_crl_check(crl_check const mode) {
+    auto* const store = ::SSL_CTX_get_cert_store(impl_->ctx);
+    ::X509_STORE_set_flags(store, 0); // 先清掉再按需置位
+    auto* const param = ::X509_STORE_get0_param(store);
+    ::X509_VERIFY_PARAM_clear_flags(param, X509_V_FLAG_CRL_CHECK | X509_V_FLAG_CRL_CHECK_ALL);
+    if (mode == crl_check::none) return {};
+    auto flags = static_cast<unsigned long>(X509_V_FLAG_CRL_CHECK);
+    if (mode == crl_check::chain) flags |= X509_V_FLAG_CRL_CHECK_ALL;
+    if (::X509_STORE_set_flags(store, flags) != 1) return provider_error();
+    return {};
+}
+
+// ---- OCSP stapling ----
+
+std::error_code context::set_ocsp_response(std::string der_response) {
+    impl_->ocsp_response = std::move(der_response);
+#if defined(OPENSSL_IS_BORINGSSL)
+    if (::SSL_CTX_set_ocsp_response(impl_->ctx, reinterpret_cast<std::uint8_t const*>(impl_->ocsp_response.data()),
+                                    impl_->ocsp_response.size()) != 1)
+        return provider_error();
+#endif
+    return {};
+}
+
+std::error_code context::request_ocsp_stapling(bool const require) {
+    impl_->ocsp_requested = true;
+    impl_->ocsp_required = require;
+#if defined(OPENSSL_IS_BORINGSSL)
+    ::SSL_CTX_enable_ocsp_stapling(impl_->ctx);
+#else
+    if (::SSL_CTX_set_tlsext_status_type(impl_->ctx, TLSEXT_STATUSTYPE_ocsp) != 1) return provider_error();
+#endif
+    return {};
+}
 
 // ---- 提供者 ----
 

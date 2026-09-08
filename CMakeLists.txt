@@ -156,6 +156,9 @@ add_library(net::net ALIAS net)
 if(WIN32)
     target_link_libraries(net PUBLIC ws2_32 mswsock)
     target_compile_definitions(net PUBLIC _WIN32_WINNT=0x0A00 WIN32_LEAN_AND_MEAN NOMINMAX)
+    if(net_has_tls)
+        target_link_libraries(net PUBLIC crypt32) # tls::context::add_os_certificates：系统证书库
+    endif()
 endif()
 
 if(net_has_tls)

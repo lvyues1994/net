@@ -68,6 +68,18 @@ struct stream {
     // 释放会话状态，回到可以再次 handshake() 的状态。前置条件：没有操作在进行。
     virtual void reset() = 0;
 
+    // ---- 会话复用 / SNI / OCSP ----
+    // 握手前：尝试恢复这个会话（客户端）。跨 reset() 保留。
+    virtual void set_session(session const& s) = 0;
+    // 最近一次拿到的可复用会话（客户端；TLS 1.3 在收到 NewSessionTicket 之后才有，通常是握手后
+    // 第一次读之后）。没有则无效。
+    virtual session current_session() const = 0;
+    virtual bool session_reused() const noexcept = 0;
+    // 服务端：客户端 SNI 发来的主机名（握手后；没有则空）。
+    virtual std::string servername() const = 0;
+    // 握手后：服务端附上的 OCSP 响应（DER；没有则空）。
+    virtual std::string ocsp_response() const = 0;
+
     // 下一次客户端握手用的主机名：SNI 与证书校验。IP 字面量只做证书匹配、不发 SNI。空串
     // 关闭两者。跨 reset() 保留。
     virtual void set_hostname(std::string hostname) = 0;
@@ -113,6 +125,11 @@ struct openssl_stream final : stream {
     void reset() override;
     void set_hostname(std::string hostname) override;
     std::string alpn_selected() const override;
+    void set_session(session const& s) override;
+    session current_session() const override;
+    bool session_reused() const noexcept override;
+    std::string servername() const override;
+    std::string ocsp_response() const override;
     any_stream& next_layer() noexcept override { return stream_; }
 
     // 提供者的原生句柄（SSL*）。

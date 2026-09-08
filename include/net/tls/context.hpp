@@ -45,7 +45,30 @@ using password_callback = std::function<std::string(std::size_t max_length, pass
 
 namespace detail {
 struct context_impl;
-}
+struct session_access;
+} // namespace detail
+
+struct context;
+
+// SNI 服务端回调：按客户端发来的主机名选另一个 context（证书 / 密钥 / 验证设置随之切换）。返回空
+// 指针保持当前 context。被选中的 context 必须活到握手结束。
+using servername_callback = std::function<context const*(std::string const& hostname)>;
+
+// 吊销检查范围（CRL）：只查叶子证书，或整条链。
+enum class crl_check : unsigned char { none, leaf, chain };
+
+// 会话复用的句柄：客户端握手完成（TLS 1.3：收到 NewSessionTicket）后从流上取得，交给下一条连接的
+// stream::set_session 做会话恢复（省一次完整握手）。可复制、可跨线程传递；不透明。
+struct session {
+    session() noexcept = default;
+    bool valid() const noexcept { return handle_ != nullptr; }
+    explicit operator bool() const noexcept { return valid(); }
+    void* native_handle() const noexcept { return handle_.get(); } // SSL_SESSION*
+
+  private:
+    friend struct detail::session_access;
+    std::shared_ptr<void> handle_;
+};
 
 struct context {
     // 默认：TLS 1.2+，验证模式 none，无证书，无信任锚。
@@ -88,6 +111,25 @@ struct context {
     void set_verify_callback(verify_callback callback);
     // 读取加密私钥时提供口令。
     void set_password_callback(password_callback callback);
+
+    // ---- SNI 服务端 ----
+    void set_servername_callback(servername_callback callback);
+
+    // ---- 证书库与吊销 ----
+    // 操作系统的根证书库：Windows 用 CertOpenSystemStore("ROOT")，其它平台是提供者的默认路径。
+    std::error_code add_os_certificates();
+    // 加入一份或多份 PEM 编码的 CRL；set_crl_check 决定验证时是否使用。
+    std::error_code add_crl(std::string const& crl_pem);
+    std::error_code set_crl_check(crl_check mode);
+
+    // ---- OCSP stapling ----
+    // 服务端：随握手附上的 DER 编码 OCSP 响应（由部署方定期从 OCSP 响应方取得）。
+    std::error_code set_ocsp_response(std::string der_response);
+    // 客户端：在握手里请求 stapling。OpenSSL 上收到的响应会被验证（签名、对应本证书、状态 good、
+    // 有效期），不通过则握手以 ocsp_response_invalid 失败；require 为真时没有响应以
+    // ocsp_response_missing 失败。BoringSSL 没有 OCSP 解析 API：只传输，响应经 stream::ocsp_response()
+    // 交给调用方验证，require 语义相同。
+    std::error_code request_ocsp_stapling(bool require);
 
     // 提供者的原生句柄（OpenSSL / BoringSSL：SSL_CTX*）。
     void* native_handle() const noexcept;

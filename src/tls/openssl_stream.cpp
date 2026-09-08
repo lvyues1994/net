@@ -97,7 +97,7 @@ struct write_gate {
 
 } // namespace
 
-struct openssl_stream_impl {
+struct openssl_stream_impl final : detail::stream_hooks {
     openssl_stream_impl(any_stream* const next_layer, context const& ctx_) : next{next_layer}, ctx{ctx_} {
         inbuf.resize(staging_size);
         outbuf.resize(staging_size);
@@ -125,8 +125,14 @@ struct openssl_stream_impl {
         ::SSL_set_bio(ssl, in, out);
         input = in;
         output = out;
+        ::SSL_set_ex_data(ssl, detail::stream_ex_data_index(), static_cast<detail::stream_hooks*>(this));
         return {};
     }
+
+    // ---- stream_hooks（context 的回调经 SSL 的 ex_data 找回本对象） ----
+    void on_new_session(SSL_SESSION* const owned) noexcept override { latest_session = detail::session_access::make(owned); }
+    bool is_client() const noexcept override { return current_role == role::client; }
+    void set_ocsp_error(std::error_code const ec) noexcept override { ocsp_error = ec; }
 
     void destroy_ssl() noexcept {
         if (ssl != nullptr) ::SSL_free(ssl); // 连同 BIO
@@ -229,6 +235,11 @@ struct openssl_stream_impl {
             return step;
         case SSL_ERROR_SSL: {
             step.completed = true;
+            if (ocsp_error) { // OCSP 回调让握手失败：报它而不是提供者的通用错误
+                ::ERR_clear_error();
+                step.ec = ocsp_error;
+                return step;
+            }
             auto const verify = ::SSL_get_verify_result(ssl);
             if (verify != X509_V_OK) {
                 ::ERR_clear_error();
@@ -257,6 +268,10 @@ struct openssl_stream_impl {
     std::string hostname;
     write_gate gate;
     bool handshake_started = false;
+    role current_role = role::client;
+    session resume_session; // set_session：下一次客户端握手尝试恢复
+    session latest_session; // new-session 回调交来的可复用会话
+    std::error_code ocsp_error; // OCSP 回调判定的失败原因（握手错误时优先报它）
 };
 
 namespace {
@@ -333,6 +348,33 @@ void* openssl_stream::native_handle() const noexcept { return impl_->ssl; }
 
 void openssl_stream::set_hostname(std::string hostname) { impl_->hostname = std::move(hostname); }
 
+void openssl_stream::set_session(session const& s) { impl_->resume_session = s; }
+
+session openssl_stream::current_session() const { return impl_->latest_session; }
+
+bool openssl_stream::session_reused() const noexcept { return impl_->ssl != nullptr && ::SSL_session_reused(impl_->ssl) == 1; }
+
+std::string openssl_stream::servername() const {
+    if (impl_->ssl == nullptr) return {};
+    auto const* const name = ::SSL_get_servername(impl_->ssl, TLSEXT_NAMETYPE_host_name);
+    return name != nullptr ? std::string{name} : std::string{};
+}
+
+std::string openssl_stream::ocsp_response() const {
+    if (impl_->ssl == nullptr) return {};
+#if defined(OPENSSL_IS_BORINGSSL)
+    std::uint8_t const* data = nullptr;
+    std::size_t length = 0;
+    ::SSL_get0_ocsp_response(impl_->ssl, &data, &length);
+    return data != nullptr ? std::string{reinterpret_cast<char const*>(data), length} : std::string{};
+#else
+    unsigned char const* data = nullptr;
+    auto const length = ::SSL_get_tlsext_status_ocsp_resp(impl_->ssl, &data);
+    return data != nullptr && length > 0 ? std::string{reinterpret_cast<char const*>(data), static_cast<std::size_t>(length)}
+                                         : std::string{};
+#endif
+}
+
 void openssl_stream::reset() { impl_->destroy_ssl(); }
 
 std::string openssl_stream::alpn_selected() const {
@@ -347,8 +389,13 @@ std::string openssl_stream::alpn_selected() const {
 task<io_result<>> openssl_stream::handshake(role const r) {
     auto& impl = *impl_;
     // 每次握手都是全新的会话：之前的尝试（成功或失败）不保留。
+    impl.current_role = r;
+    impl.ocsp_error = std::error_code{};
     auto ec = impl.create_ssl();
     if (not ec) ec = impl.apply_hostname(r);
+    if (not ec && r == role::client && impl.resume_session)
+        if (::SSL_set_session(impl.ssl, static_cast<SSL_SESSION*>(impl.resume_session.native_handle())) != 1)
+            ec = take_provider_error(std::make_error_code(std::errc::invalid_argument));
     if (ec) return detail::fail(ec);
     if (r == role::client)
         ::SSL_set_connect_state(impl.ssl);

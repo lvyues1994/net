@@ -27,6 +27,17 @@
 #include "net/when_all.hpp"
 #include "net/when_any.hpp"
 
+#include <openssl/bio.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/ssl.h>
+#include <openssl/x509.h>
+#include <openssl/x509_vfy.h>
+#include <openssl/x509v3.h>
+#if !defined(OPENSSL_IS_BORINGSSL)
+#include <openssl/ocsp.h>
+#endif
+
 #include "check.hpp"
 #include "tls_test_certs.hpp"
 
@@ -656,6 +667,284 @@ void write_sink_eof_is_close_notify() {
     CHECK(received == payload);
 }
 
+// ---- CA 链、会话复用、SNI、CRL、OCSP ----
+
+net::tls::context leaf_server_context() {
+    net::tls::context ctx;
+    CHECK(not ctx.use_certificate(net_test_certs::leaf_certificate(), net::tls::file_format::pem));
+    CHECK(not ctx.use_private_key(net_test_certs::leaf_private_key(), net::tls::file_format::pem));
+    return ctx;
+}
+
+net::tls::context ca_client_context() {
+    net::tls::context ctx;
+    CHECK(not ctx.set_verify_mode(net::tls::verify_mode::peer));
+    CHECK(not ctx.add_certificate_authority(net_test_certs::ca_certificate()));
+    return ctx;
+}
+
+// 服务端：握手、发一条、等对端关闭；客户端读到那条后 TLS 1.3 的 NewSessionTicket 也已到达。
+auto server_send_one(net::tls::openssl_stream* tls)
+    CO2_BEG((net::task<std::error_code>), (tls), net::io_result<> h; net::io_result<std::size_t> w; char buf[16];
+            net::io_result<std::size_t> r; net::io_result<> s; std::string const greeting{"ticket"};) {
+    CO2_AWAIT_SET(h, tls->handshake(net::tls::role::server));
+    if (h.ec) CO2_RETURN(h.ec);
+    CO2_AWAIT_SET(w, net::write(*tls, net::buffer(greeting)));
+    if (w.ec) CO2_RETURN(w.ec);
+    CO2_AWAIT_SET(r, tls->read_some(net::buffer(buf)));
+    if (r.ec != net::error::eof) CO2_RETURN(r.ec ? r.ec : std::make_error_code(std::errc::protocol_error));
+    CO2_AWAIT_SET(s, tls->shutdown()); // 对端的 shutdown 等我们的 close_notify
+    CO2_RETURN(s.ec);
+}
+CO2_END
+
+auto client_receive_one(net::tls::openssl_stream* tls, net::tls::session* out)
+    CO2_BEG((net::task<std::error_code>), (tls, out), net::io_result<> h; char buf[16]; net::io_result<std::size_t> r; net::io_result<> s;) {
+    CO2_AWAIT_SET(h, tls->handshake(net::tls::role::client));
+    if (h.ec) CO2_RETURN(h.ec);
+    CO2_AWAIT_SET(r, net::read(*tls, net::buffer(buf, 6)));
+    if (r.ec) CO2_RETURN(r.ec);
+    *out = tls->current_session(); // 票据随第一批应用数据之前到达
+    CO2_AWAIT_SET(s, tls->shutdown());
+    CO2_RETURN(s.ec);
+}
+CO2_END
+
+void session_is_resumed_on_the_next_connection() {
+    auto server_ctx = leaf_server_context();
+    auto client_ctx = ca_client_context();
+    net::tls::session saved;
+    {
+        connected_pair pair;
+        net::tls::openssl_stream server{&pair.server, server_ctx};
+        net::tls::openssl_stream client{&pair.client, client_ctx};
+        client.set_hostname("localhost");
+        std::error_code server_ec;
+        std::error_code client_ec;
+        net::run_async(pair.ctx.get_executor(), [&](std::error_code e) { server_ec = e; }, [](std::exception_ptr) { CHECK(false); })(server_send_one(&server));
+        net::run_async(pair.ctx.get_executor(), [&](std::error_code e) { client_ec = e; }, [](std::exception_ptr) { CHECK(false); })(client_receive_one(&client, &saved));
+        pair.ctx.run();
+        CHECK(not server_ec);
+        CHECK(not client_ec);
+        CHECK(not client.session_reused()); // 第一次：完整握手
+        CHECK(saved.valid());
+    }
+    {
+        connected_pair pair;
+        net::tls::openssl_stream server{&pair.server, server_ctx};
+        net::tls::openssl_stream client{&pair.client, client_ctx};
+        client.set_hostname("localhost");
+        client.set_session(saved);
+        net::tls::session again;
+        std::error_code server_ec;
+        std::error_code client_ec;
+        net::run_async(pair.ctx.get_executor(), [&](std::error_code e) { server_ec = e; }, [](std::exception_ptr) { CHECK(false); })(server_send_one(&server));
+        net::run_async(pair.ctx.get_executor(), [&](std::error_code e) { client_ec = e; }, [](std::exception_ptr) { CHECK(false); })(client_receive_one(&client, &again));
+        pair.ctx.run();
+        CHECK(not server_ec);
+        CHECK(not client_ec);
+        CHECK(client.session_reused()); // 第二次：恢复
+        CHECK(server.session_reused());
+    }
+}
+
+void sni_callback_switches_the_server_context() {
+    connected_pair pair;
+    auto default_ctx = server_context();      // CN=localhost 的自签证书
+    auto other_ctx = net::tls::context{};     // CN=other.example
+    CHECK(not other_ctx.use_certificate(net_test_certs::other_certificate(), net::tls::file_format::pem));
+    CHECK(not other_ctx.use_private_key(net_test_certs::other_private_key(), net::tls::file_format::pem));
+    std::string seen;
+    default_ctx.set_servername_callback([&](std::string const& hostname) -> net::tls::context const* {
+        seen = hostname;
+        return hostname == "other.example" ? &other_ctx : nullptr;
+    });
+    // 客户端只信任 other.example 的证书并声称要连它：握手成功说明服务端按 SNI 换了证书
+    net::tls::context client_ctx;
+    CHECK(not client_ctx.set_verify_mode(net::tls::verify_mode::peer));
+    CHECK(not client_ctx.add_certificate_authority(net_test_certs::other_certificate()));
+    net::tls::openssl_stream server{&pair.server, default_ctx};
+    net::tls::openssl_stream client{&pair.client, client_ctx};
+    client.set_hostname("other.example");
+    std::error_code server_ec;
+    std::error_code client_ec;
+    net::run_async(pair.ctx.get_executor(), [&](std::error_code e) { server_ec = e; }, [](std::exception_ptr) { CHECK(false); })(server_handshake_only(&server));
+    net::run_async(pair.ctx.get_executor(), [&](std::error_code e) { client_ec = e; }, [](std::exception_ptr) { CHECK(false); })(client_handshake_only(&client));
+    pair.ctx.run();
+    CHECK(not server_ec);
+    CHECK(not client_ec);
+    CHECK_EQ(seen, "other.example");
+    CHECK_EQ(server.servername(), "other.example");
+}
+
+// 用 CA 私钥现场签一份 CRL（吊销叶子）。
+std::string make_crl_revoking_leaf() {
+    using bio_ptr = std::unique_ptr<BIO, void (*)(BIO*)>;
+    bio_ptr ca_bio{::BIO_new_mem_buf(net_test_certs::ca_certificate(), -1), &::BIO_free_all};
+    std::unique_ptr<X509, void (*)(X509*)> ca{::PEM_read_bio_X509(ca_bio.get(), nullptr, nullptr, nullptr), &::X509_free};
+    bio_ptr key_bio{::BIO_new_mem_buf(net_test_certs::ca_private_key(), -1), &::BIO_free_all};
+    std::unique_ptr<EVP_PKEY, void (*)(EVP_PKEY*)> key{::PEM_read_bio_PrivateKey(key_bio.get(), nullptr, nullptr, nullptr), &::EVP_PKEY_free};
+    bio_ptr leaf_bio{::BIO_new_mem_buf(net_test_certs::leaf_certificate(), -1), &::BIO_free_all};
+    std::unique_ptr<X509, void (*)(X509*)> leaf{::PEM_read_bio_X509(leaf_bio.get(), nullptr, nullptr, nullptr), &::X509_free};
+    CHECK(ca && key && leaf);
+    std::unique_ptr<X509_CRL, void (*)(X509_CRL*)> crl{::X509_CRL_new(), &::X509_CRL_free};
+    CHECK(::X509_CRL_set_version(crl.get(), 1) == 1);
+    CHECK(::X509_CRL_set_issuer_name(crl.get(), ::X509_get_subject_name(ca.get())) == 1);
+    std::unique_ptr<ASN1_TIME, void (*)(ASN1_TIME*)> now{::X509_gmtime_adj(nullptr, 0), &::ASN1_TIME_free};
+    std::unique_ptr<ASN1_TIME, void (*)(ASN1_TIME*)> next{::X509_gmtime_adj(nullptr, 3600L * 24L), &::ASN1_TIME_free};
+    CHECK(::X509_CRL_set1_lastUpdate(crl.get(), now.get()) == 1);
+    CHECK(::X509_CRL_set1_nextUpdate(crl.get(), next.get()) == 1);
+    auto* const revoked = ::X509_REVOKED_new();
+    CHECK(::X509_REVOKED_set_serialNumber(revoked, ::X509_get_serialNumber(leaf.get())) == 1);
+    CHECK(::X509_REVOKED_set_revocationDate(revoked, now.get()) == 1);
+    CHECK(::X509_CRL_add0_revoked(crl.get(), revoked) == 1);
+    CHECK(::X509_CRL_sign(crl.get(), key.get(), ::EVP_sha256()) > 0);
+    bio_ptr out{::BIO_new(::BIO_s_mem()), &::BIO_free_all};
+    CHECK(::PEM_write_bio_X509_CRL(out.get(), crl.get()) == 1);
+    char* data = nullptr;
+    auto const length = ::BIO_get_mem_data(out.get(), &data);
+    return std::string{data, static_cast<std::size_t>(length)};
+}
+
+std::error_code handshake_against(net::tls::context& server_ctx, net::tls::context& client_ctx, std::error_code* server_out = nullptr) {
+    connected_pair pair;
+    net::tls::openssl_stream server{&pair.server, server_ctx};
+    net::tls::openssl_stream client{&pair.client, client_ctx};
+    client.set_hostname("localhost");
+    std::error_code server_ec;
+    std::error_code client_ec;
+    net::run_async(pair.ctx.get_executor(), [&](std::error_code e) { server_ec = e; }, [](std::exception_ptr) { CHECK(false); })(server_handshake_only(&server));
+    net::run_async(pair.ctx.get_executor(), [&](std::error_code e) { client_ec = e; }, [](std::exception_ptr) { CHECK(false); })(client_handshake_only(&client));
+    pair.ctx.run();
+    if (server_out != nullptr) *server_out = server_ec;
+    return client_ec;
+}
+
+void crl_revocation_is_enforced() {
+    auto server_ctx = leaf_server_context();
+    // 链验证本身：信任 CA 就能验证叶子
+    {
+        auto client_ctx = ca_client_context();
+        CHECK(not handshake_against(server_ctx, client_ctx));
+    }
+    auto const crl = make_crl_revoking_leaf();
+    // 只加 CRL 不开检查：照常通过
+    {
+        auto client_ctx = ca_client_context();
+        CHECK(not client_ctx.add_crl(crl));
+        CHECK(not handshake_against(server_ctx, client_ctx));
+    }
+    // 开叶子检查：证书已吊销
+    {
+        auto client_ctx = ca_client_context();
+        CHECK(not client_ctx.add_crl(crl));
+        CHECK(not client_ctx.set_crl_check(net::tls::crl_check::leaf));
+        auto const ec = handshake_against(server_ctx, client_ctx);
+        CHECK(ec.category() == net::tls::verify_category());
+        CHECK_EQ(ec.value(), static_cast<int>(X509_V_ERR_CERT_REVOKED));
+    }
+    // 整链检查但没有 CA 自己的 CRL：无法取得 CRL
+    {
+        auto client_ctx = ca_client_context();
+        CHECK(not client_ctx.set_crl_check(net::tls::crl_check::chain));
+        auto const ec = handshake_against(server_ctx, client_ctx);
+        CHECK(ec.category() == net::tls::verify_category());
+        CHECK_EQ(ec.value(), static_cast<int>(X509_V_ERR_UNABLE_TO_GET_CRL));
+    }
+    // 关掉检查恢复
+    {
+        auto client_ctx = ca_client_context();
+        CHECK(not client_ctx.add_crl(crl));
+        CHECK(not client_ctx.set_crl_check(net::tls::crl_check::leaf));
+        CHECK(not client_ctx.set_crl_check(net::tls::crl_check::none));
+        CHECK(not handshake_against(server_ctx, client_ctx));
+    }
+    // 垃圾 CRL
+    net::tls::context junk;
+    CHECK(junk.add_crl("not a crl") == std::errc::invalid_argument);
+    // 操作系统证书库：Linux 上是默认路径，至少不报错
+    CHECK(not junk.add_os_certificates());
+}
+
+#if !defined(OPENSSL_IS_BORINGSSL)
+// 用 CA 私钥现场签一份 OCSP 响应（good 或 revoked）。
+std::string make_ocsp_response(bool const good) {
+    using bio_ptr = std::unique_ptr<BIO, void (*)(BIO*)>;
+    bio_ptr ca_bio{::BIO_new_mem_buf(net_test_certs::ca_certificate(), -1), &::BIO_free_all};
+    std::unique_ptr<X509, void (*)(X509*)> ca{::PEM_read_bio_X509(ca_bio.get(), nullptr, nullptr, nullptr), &::X509_free};
+    bio_ptr key_bio{::BIO_new_mem_buf(net_test_certs::ca_private_key(), -1), &::BIO_free_all};
+    std::unique_ptr<EVP_PKEY, void (*)(EVP_PKEY*)> key{::PEM_read_bio_PrivateKey(key_bio.get(), nullptr, nullptr, nullptr), &::EVP_PKEY_free};
+    bio_ptr leaf_bio{::BIO_new_mem_buf(net_test_certs::leaf_certificate(), -1), &::BIO_free_all};
+    std::unique_ptr<X509, void (*)(X509*)> leaf{::PEM_read_bio_X509(leaf_bio.get(), nullptr, nullptr, nullptr), &::X509_free};
+    CHECK(ca && key && leaf);
+    std::unique_ptr<OCSP_BASICRESP, void (*)(OCSP_BASICRESP*)> basic{::OCSP_BASICRESP_new(), &::OCSP_BASICRESP_free};
+    auto* const id = ::OCSP_cert_to_id(nullptr, leaf.get(), ca.get());
+    std::unique_ptr<ASN1_TIME, void (*)(ASN1_TIME*)> this_update{::X509_gmtime_adj(nullptr, 0), &::ASN1_TIME_free};
+    std::unique_ptr<ASN1_TIME, void (*)(ASN1_TIME*)> next_update{::X509_gmtime_adj(nullptr, 3600L), &::ASN1_TIME_free};
+    CHECK(::OCSP_basic_add1_status(basic.get(), id, good ? V_OCSP_CERTSTATUS_GOOD : V_OCSP_CERTSTATUS_REVOKED, 0,
+                                   good ? nullptr : this_update.get(), this_update.get(), next_update.get()) != nullptr);
+    ::OCSP_CERTID_free(id);
+    CHECK(::OCSP_basic_sign(basic.get(), ca.get(), key.get(), ::EVP_sha256(), nullptr, 0) == 1);
+    std::unique_ptr<OCSP_RESPONSE, void (*)(OCSP_RESPONSE*)> response{::OCSP_response_create(OCSP_RESPONSE_STATUS_SUCCESSFUL, basic.get()),
+                                                                       &::OCSP_RESPONSE_free};
+    CHECK(response);
+    unsigned char* der = nullptr;
+    auto const length = ::i2d_OCSP_RESPONSE(response.get(), &der);
+    CHECK(length > 0);
+    std::string out{reinterpret_cast<char const*>(der), static_cast<std::size_t>(length)};
+    ::OPENSSL_free(der);
+    return out;
+}
+
+void ocsp_stapling_is_requested_and_verified() {
+    // good：握手通过，客户端拿到响应
+    {
+        auto server_ctx = leaf_server_context();
+        CHECK(not server_ctx.set_ocsp_response(make_ocsp_response(true)));
+        auto client_ctx = ca_client_context();
+        CHECK(not client_ctx.request_ocsp_stapling(true));
+        connected_pair pair;
+        net::tls::openssl_stream server{&pair.server, server_ctx};
+        net::tls::openssl_stream client{&pair.client, client_ctx};
+        client.set_hostname("localhost");
+        std::error_code server_ec;
+        std::error_code client_ec;
+        net::run_async(pair.ctx.get_executor(), [&](std::error_code e) { server_ec = e; }, [](std::exception_ptr) { CHECK(false); })(server_handshake_only(&server));
+        net::run_async(pair.ctx.get_executor(), [&](std::error_code e) { client_ec = e; }, [](std::exception_ptr) { CHECK(false); })(client_handshake_only(&client));
+        pair.ctx.run();
+        CHECK(not server_ec);
+        CHECK(not client_ec);
+        CHECK(not client.ocsp_response().empty());
+    }
+    // revoked：客户端拒绝
+    {
+        auto server_ctx = leaf_server_context();
+        CHECK(not server_ctx.set_ocsp_response(make_ocsp_response(false)));
+        auto client_ctx = ca_client_context();
+        CHECK(not client_ctx.request_ocsp_stapling(true));
+        CHECK(handshake_against(server_ctx, client_ctx) == net::error::ocsp_response_invalid);
+    }
+    // 服务端没附响应：require 失败，optional 通过
+    {
+        auto server_ctx = leaf_server_context();
+        auto strict = ca_client_context();
+        CHECK(not strict.request_ocsp_stapling(true));
+        CHECK(handshake_against(server_ctx, strict) == net::error::ocsp_response_missing);
+        auto lenient = ca_client_context();
+        CHECK(not lenient.request_ocsp_stapling(false));
+        CHECK(not handshake_against(server_ctx, lenient));
+    }
+    // 不是给这张证书的响应（用自签的 server 证书当叶子）：无法验证
+    {
+        auto server_ctx = server_context();
+        CHECK(not server_ctx.set_ocsp_response(make_ocsp_response(true)));
+        auto client_ctx = client_context();
+        CHECK(not client_ctx.request_ocsp_stapling(true));
+        CHECK(handshake_against(server_ctx, client_ctx) == net::error::ocsp_response_invalid);
+    }
+}
+#endif
+
 } // namespace
 
 int main() {
@@ -675,6 +964,12 @@ int main() {
     handshake_timeout_via_when_any();
     multithreaded_sessions_each_on_a_strand();
     write_sink_eof_is_close_notify();
+    session_is_resumed_on_the_next_connection();
+    sni_callback_switches_the_server_context();
+    crl_revocation_is_enforced();
+#if !defined(OPENSSL_IS_BORINGSSL)
+    ocsp_stapling_is_requested_and_verified();
+#endif
     std::cout << "tls tests passed (" << net::tls::provider_name() << ")\n";
     return 0;
 }

@@ -24,6 +24,8 @@ struct net_error_category final : std::error_category {
         case error::no_data: return "The query is valid but does not have associated address data";
         case error::invalid_address: return "Invalid address string";
         case error::stream_truncated: return "Stream truncated before close_notify";
+        case error::ocsp_response_missing: return "OCSP stapling required but no response was sent";
+        case error::ocsp_response_invalid: return "OCSP response invalid or certificate not good";
         }
         return "Unknown net error " + std::to_string(value);
     }

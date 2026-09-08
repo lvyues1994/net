@@ -22,6 +22,8 @@ enum class error : int {
     no_data,
     invalid_address,   // 地址字符串无法解析
     stream_truncated,  // TLS：传输在 close_notify 之前结束（无法与截断攻击区分）
+    ocsp_response_missing, // TLS：要求 OCSP stapling 但服务端没有附上响应
+    ocsp_response_invalid, // TLS：OCSP 响应无法验证 / 状态不是 good
 };
 
 std::error_category const& net_category() noexcept;

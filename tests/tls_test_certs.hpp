@@ -58,4 +58,56 @@ inline char const* other_private_key() noexcept {
         "-----END PRIVATE KEY-----\n";
 }
 
+// 一对 CA + 叶子（CN=localhost，SAN = DNS:localhost, IP:127.0.0.1，由 CA 签发；ECDSA P-256，10 年）：
+// 用于链验证、CRL 与 OCSP stapling 的测试。CA 私钥在此只为测试时签 CRL / OCSP 响应。
+
+inline char const* ca_certificate() noexcept {
+    return
+        "-----BEGIN CERTIFICATE-----\n"
+        "MIIBkjCCATegAwIBAgIULCkEuHO+9/l+cEoKRYWkXbcw9BQwCgYIKoZIzj0EAwIw\n"
+        "FjEUMBIGA1UEAwwLbmV0IHRlc3QgQ0EwHhcNMjYwOTA4MTYwNzUzWhcNMzYwOTA1\n"
+        "MTYwNzUzWjAWMRQwEgYDVQQDDAtuZXQgdGVzdCBDQTBZMBMGByqGSM49AgEGCCqG\n"
+        "SM49AwEHA0IABI+Rib6MClT4E75obT4x1H0jG8R5u+WWoOFjoujxYFzD0/tgTT61\n"
+        "TUrvS40/HApgL+vsT9S40cPtFysabmHRafyjYzBhMB0GA1UdDgQWBBTtKoO1FsLq\n"
+        "rZPXpKBOMjsgHpwarjAfBgNVHSMEGDAWgBTtKoO1FsLqrZPXpKBOMjsgHpwarjAP\n"
+        "BgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBBjAKBggqhkjOPQQDAgNJADBG\n"
+        "AiEAxL0uHZ6Zwn0Oi0BkiNNBdlnw/6IielnlFhw9xEBT0YACIQDN0JeGnW2Rjb4i\n"
+        "SoANaF4X+td8qZHWITDZRH2gBKL0fw==\n"
+        "-----END CERTIFICATE-----\n";
+}
+
+inline char const* ca_private_key() noexcept {
+    return
+        "-----BEGIN PRIVATE KEY-----\n"
+        "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg/l3QJHcOpKT7Iw4H\n"
+        "d2ZqL/yQSMfa1m+4PUiA2NqALA+hRANCAASPkYm+jApU+BO+aG0+MdR9IxvEebvl\n"
+        "lqDhY6Lo8WBcw9P7YE0+tU1K70uNPxwKYC/r7E/UuNHD7RcrGm5h0Wn8\n"
+        "-----END PRIVATE KEY-----\n";
+}
+
+inline char const* leaf_certificate() noexcept {
+    return
+        "-----BEGIN CERTIFICATE-----\n"
+        "MIIBuDCCAV+gAwIBAgIUSbyXsDLLvTtHnuetQdtEsoTGAiwwCgYIKoZIzj0EAwIw\n"
+        "FjEUMBIGA1UEAwwLbmV0IHRlc3QgQ0EwHhcNMjYwOTA4MTYwNzUzWhcNMzYwOTA1\n"
+        "MTYwNzUzWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO\n"
+        "PQMBBwNCAAQvHcyW7D3DafTQduIdAi6mbn1FQGFQu74nomoB29Ykt3e/dpgxbgwh\n"
+        "IeE4m9AydvUHEePlVAQ/bqmE2anrYbRKo4GMMIGJMBoGA1UdEQQTMBGCCWxvY2Fs\n"
+        "aG9zdIcEfwAAATAJBgNVHRMEAjAAMB8GA1UdIwQYMBaAFO0qg7UWwuqtk9ekoE4y\n"
+        "OyAenBquMAsGA1UdDwQEAwIHgDATBgNVHSUEDDAKBggrBgEFBQcDATAdBgNVHQ4E\n"
+        "FgQUvgypHyZr2RM2i1yxekua8EShHPIwCgYIKoZIzj0EAwIDRwAwRAIgeXjkYWBA\n"
+        "EK2G3Bh78Z7ZhKQcZgNRtz/flYh5HEw2x/4CIA0RsqhuPk9pCG4aLL2TJaOkaRbj\n"
+        "Va6BMfnY/dq735rV\n"
+        "-----END CERTIFICATE-----\n";
+}
+
+inline char const* leaf_private_key() noexcept {
+    return
+        "-----BEGIN PRIVATE KEY-----\n"
+        "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgtAULG0BgJ1sYC0v+\n"
+        "u2/hUhbdi/MnQFoSsGVUY6XGSZ6hRANCAAQvHcyW7D3DafTQduIdAi6mbn1FQGFQ\n"
+        "u74nomoB29Ykt3e/dpgxbgwhIeE4m9AydvUHEePlVAQ/bqmE2anrYbRK\n"
+        "-----END PRIVATE KEY-----\n";
+}
+
 } // namespace net_test_certs
