@@ -58,14 +58,12 @@ CO2_END
 void every_backend_can_be_selected() {
     {
         net::io_context ctx;
-        CHECK(ctx.backend() == net::backend_kind::epoll);
-        CHECK_EQ(std::string{ctx.backend_name()}, "epoll");
+        CHECK(ctx.backend() == net::default_backend_t::kind); // Linux：epoll；Windows：iocp
+        CHECK_EQ(std::string{ctx.backend_name()}, net::to_string(net::default_backend_t::kind));
     }
-    CHECK(net::backend_available(net::backend_kind::epoll));
-    CHECK(net::backend_available(net::backend_kind::poll));
-    CHECK(net::backend_available(net::backend_kind::select));
+    CHECK(net::backend_available(net::default_backend_t::kind));
     net::backend_kind const kinds[] = {net::backend_kind::epoll, net::backend_kind::poll, net::backend_kind::select,
-                                       net::backend_kind::io_uring};
+                                       net::backend_kind::io_uring, net::backend_kind::iocp};
     for (auto const kind : kinds) {
         if (not net::backend_available(kind)) {
             std::cout << "skipping unavailable backend " << net::to_string(kind) << '\n';
@@ -79,10 +77,25 @@ void every_backend_can_be_selected() {
         ctx.run();
         CHECK_EQ(ticks, 1);
     }
+#if NET_PLATFORM_WINDOWS
+    net::io_context by_tag_iocp{net::iocp};
+    CHECK(by_tag_iocp.backend() == net::backend_kind::iocp);
+    // 不可用的标签：构造抛 not_supported
+    auto threw = false;
+    try {
+        net::io_context by_tag_epoll{net::epoll};
+    } catch (std::system_error const& e) {
+        threw = e.code() == std::errc::not_supported;
+    }
+    CHECK(threw);
+#else
+    CHECK(net::backend_available(net::backend_kind::poll));
+    CHECK(net::backend_available(net::backend_kind::select));
     net::io_context by_tag_poll{net::poll};
     CHECK(by_tag_poll.backend() == net::backend_kind::poll);
     net::io_context by_tag_select{net::select, 2};
     CHECK(by_tag_select.backend() == net::backend_kind::select);
+#endif
     if (net::backend_available(net::backend_kind::io_uring)) {
         net::io_context by_tag_uring{net::io_uring};
         CHECK(by_tag_uring.backend() == net::backend_kind::io_uring);

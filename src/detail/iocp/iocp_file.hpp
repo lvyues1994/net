@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 
 #include "net/continuation.hpp"
@@ -40,6 +41,7 @@ struct iocp_file_op final : iocp_op {
     std::error_code ec;
     std::size_t bytes_transferred = 0;
     bool sync_failed = false;
+    std::atomic<bool> cancelled{false}; // 本地取消：完成包的错误码统一报 operation_aborted
     continuation cont;
     io_env const* env = nullptr;
     bool pending = false;

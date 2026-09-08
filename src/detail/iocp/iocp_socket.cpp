@@ -63,6 +63,7 @@ std::error_code ensure_bound(native_socket_type const s, int const family) noexc
 } // namespace
 
 void cancel_iocp_socket_op::operator()() const noexcept {
+    op->cancelled.store(true, std::memory_order_release);
     auto const s = op->owner_->native_handle();
     if (socket_is_valid(s)) ::CancelIoEx(reinterpret_cast<HANDLE>(s), op->overlapped());
 }
@@ -72,7 +73,8 @@ void cancel_iocp_socket_op::operator()() const noexcept {
 void iocp_socket_op::on_complete(DWORD const error, DWORD const bytes) noexcept {
     using k = kind;
     if (error != 0) {
-        ec = iocp_error(error, op_kind == k::accept);
+        ec = cancelled.load(std::memory_order_acquire) ? make_error_code(error::operation_aborted)
+                                                       : iocp_error(error, op_kind == k::accept);
         bytes_transferred = 0U;
         if (op_kind == k::accept && socket_is_valid(accept_socket)) {
             ::closesocket(accept_socket);
@@ -176,13 +178,18 @@ std::error_code iocp_socket::listen(int const backlog) noexcept {
 
 void iocp_socket::cancel_pending() noexcept {
     if (not socket_is_valid(fd_)) return;
+    if (read_op_.pending) read_op_.cancelled.store(true, std::memory_order_release);
+    if (write_op_.pending) write_op_.cancelled.store(true, std::memory_order_release);
     if (read_op_.pending || write_op_.pending) ::CancelIoEx(reinterpret_cast<HANDLE>(fd_), nullptr);
 }
 
 std::error_code iocp_socket::close() noexcept {
     if (not socket_is_valid(fd_)) return {};
     auto const s = fd_;
-    fd_ = invalid_socket; // 在飞的操作以 ERROR_OPERATION_ABORTED 完成
+    if (read_op_.pending) read_op_.cancelled.store(true, std::memory_order_release);
+    if (write_op_.pending) write_op_.cancelled.store(true, std::memory_order_release);
+    fd_ = invalid_socket; // 在飞的操作随 closesocket 以取消完成（错误码可能是 995 或 64，统一报 aborted）
+    listener_nonblocking_ = false;
     if (::closesocket(s) != 0) return wsa_error();
     return {};
 }
@@ -193,6 +200,7 @@ native_socket_type iocp_socket::release() noexcept {
     cancel_pending();
     auto const s = fd_;
     fd_ = invalid_socket;
+    listener_nonblocking_ = false;
     return s; // 仍挂在端口上（Windows 不允许解除关联）
 }
 
@@ -203,6 +211,7 @@ void iocp_socket::begin_read(span<mutable_buffer const> const buffers) noexcept 
     read_op_.op_kind = iocp_socket_op::kind::read;
     read_op_.buffer_count = fill_wsabuf(read_op_.buffers, buffers);
     read_op_.sync_failed = false;
+    read_op_.cancelled.store(false, std::memory_order_relaxed);
 }
 
 void iocp_socket::begin_write(span<const_buffer const> const buffers) noexcept {
@@ -210,6 +219,7 @@ void iocp_socket::begin_write(span<const_buffer const> const buffers) noexcept {
     write_op_.op_kind = iocp_socket_op::kind::write;
     write_op_.buffer_count = fill_wsabuf(write_op_.buffers, buffers);
     write_op_.sync_failed = false;
+    write_op_.cancelled.store(false, std::memory_order_relaxed);
 }
 
 void iocp_socket::begin_receive_from(span<mutable_buffer const> const buffers, sockaddr* const sender, socklen_t const capacity,
@@ -221,6 +231,7 @@ void iocp_socket::begin_receive_from(span<mutable_buffer const> const buffers, s
     read_op_.from_length = static_cast<int>(capacity);
     read_op_.address_length_out = sender_length;
     read_op_.sync_failed = false;
+    read_op_.cancelled.store(false, std::memory_order_relaxed);
 }
 
 void iocp_socket::begin_send_to(span<const_buffer const> const buffers, sockaddr const* const target, socklen_t const length) noexcept {
@@ -230,6 +241,7 @@ void iocp_socket::begin_send_to(span<const_buffer const> const buffers, sockaddr
     std::memcpy(&write_op_.address, target, static_cast<std::size_t>(length));
     write_op_.address_length = static_cast<int>(length);
     write_op_.sync_failed = false;
+    write_op_.cancelled.store(false, std::memory_order_relaxed);
 }
 
 void iocp_socket::begin_connect(sockaddr const* const address, socklen_t const length, int const family, int const type,
@@ -237,6 +249,7 @@ void iocp_socket::begin_connect(sockaddr const* const address, socklen_t const l
     CO2_CONTRACT_CHECK(not write_op_.pending);
     write_op_.op_kind = iocp_socket_op::kind::connect;
     write_op_.sync_failed = false;
+    write_op_.cancelled.store(false, std::memory_order_relaxed);
     if (not socket_is_valid(fd_)) {
         auto const ec = open(family, type, protocol);
         if (ec) {
@@ -258,6 +271,7 @@ void iocp_socket::begin_accept() noexcept {
     CO2_CONTRACT_CHECK(not read_op_.pending);
     read_op_.op_kind = iocp_socket_op::kind::accept;
     read_op_.sync_failed = false;
+    read_op_.cancelled.store(false, std::memory_order_relaxed);
     read_op_.accepted_fd = invalid_socket;
     if (not socket_is_valid(fd_)) {
         read_op_.ec = make_error_code(error::not_open);
@@ -284,13 +298,38 @@ bool iocp_socket::ready(op_direction const direction) noexcept {
         op.sync_failed = true;
         return true;
     }
-    if (op.op_kind != iocp_socket_op::kind::connect && op.op_kind != iocp_socket_op::kind::accept && op.buffer_count == 0U) {
+    if (op.op_kind == iocp_socket_op::kind::accept) return speculate_accept(op);
+    if (op.op_kind != iocp_socket_op::kind::connect && op.buffer_count == 0U) {
         op.ec.clear(); // 空序列：不发起
         op.bytes_transferred = 0U;
         op.sync_failed = true;
         return true;
     }
     return false;
+}
+
+bool iocp_socket::speculate_accept(iocp_socket_op& op) noexcept {
+    // 就绪型后端的 accept 在 ready() 里用非阻塞 accept4 投机，连接已排队时同步完成；多个协程在一个
+    // 接受器上"connect 完就 accept"因此从不重叠。这里对齐：监听套接字设为非阻塞（不影响重叠调用），
+    // 同步 accept() 成功就不经过端口。
+    if (not listener_nonblocking_) {
+        u_long nonblocking = 1;
+        if (::ioctlsocket(fd_, static_cast<long>(FIONBIO), &nonblocking) != 0) return false; // 投机不了：走 AcceptEx
+        listener_nonblocking_ = true;
+    }
+    auto const s = ::accept(fd_, nullptr, nullptr); // 继承监听套接字的重叠属性
+    if (socket_is_valid(s)) {
+        op.accepted_fd = s;
+        op.accepted_family = family_;
+        op.ec.clear();
+        op.sync_failed = true;
+        return true;
+    }
+    auto const error = ::WSAGetLastError();
+    if (error == WSAEWOULDBLOCK) return false;
+    op.ec = iocp_error(static_cast<DWORD>(error), true);
+    op.sync_failed = true;
+    return true;
 }
 
 bool iocp_socket::issue(iocp_socket_op& op) noexcept {

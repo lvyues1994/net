@@ -180,7 +180,8 @@ target_include_directories(
 # 这些是 PUBLIC 的：消费方的翻译单元包含本库的头时同样需要。
 if(MSVC)
     target_compile_options(net PUBLIC /permissive- /Zc:__cplusplus /Zc:preprocessor /EHsc /utf-8 /bigobj)
-    target_compile_options(net PRIVATE /W4)
+    target_compile_options(net PRIVATE /W4 /wd4324)
+    target_compile_definitions(net PRIVATE _CRT_SECURE_NO_WARNINGS)
 else()
     target_compile_options(
         net

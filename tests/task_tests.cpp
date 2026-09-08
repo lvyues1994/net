@@ -132,7 +132,10 @@ void environment_propagates_to_children() {
     counting_resource resource;
     ctx.set_frame_allocator(&resource);
     auto ok = false;
-    net::run_async(ctx.get_executor(), [&](bool v) { ok = v; }, [](std::exception_ptr) { CHECK(false); })(inspect_env(nullptr, &resource, 3));
+    // 工厂形态：C++14 不保证 run_async(...) 先于实参 inspect_env(...) 求值（MSVC 先算实参，顶层帧就落到
+    // 默认分配器上），要数帧分配必须让任务在启动器之后创建。
+    net::run_async(ctx.get_executor(), [&](bool v) { ok = v; }, [](std::exception_ptr) { CHECK(false); })(
+        [&] { return inspect_env(nullptr, &resource, 3); });
     ctx.run();
     CHECK(ok);
     CHECK_EQ(resource.allocations.load(), 4); // 1 个父帧 + 3 层子帧
@@ -197,7 +200,7 @@ void run_with_frame_allocator_allocates_child_frames_from_it() {
     counting_resource resource;
     auto result = 0;
     net::run_async(ctx.get_executor(), net::stop_token{}, &resource, [&](int v) { result = v; },
-                   [](std::exception_ptr) { CHECK(false); })(uses_resource(&resource));
+                   [](std::exception_ptr) { CHECK(false); })([&] { return uses_resource(&resource); });
     ctx.run();
     CHECK_EQ(result, 6);
     CHECK_EQ(resource.allocations.load(), 2); // uses_resource 的帧 + twice 的帧

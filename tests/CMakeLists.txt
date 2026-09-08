@@ -34,7 +34,9 @@ function(net_configure_test_target target)
             CXX_STANDARD_REQUIRED YES
             CXX_EXTENSIONS NO)
     if(MSVC)
-        target_compile_options(${target} PRIVATE /W4)
+        # C4324：co2 的帧按 alignas 填充，是有意的；getenv 的 C4996 是 CRT 的"不安全"提示。
+        target_compile_options(${target} PRIVATE /W4 /wd4324)
+        target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS)
     else()
         target_compile_options(
             ${target}

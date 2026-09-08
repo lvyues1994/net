@@ -11,6 +11,7 @@ namespace net {
 namespace detail {
 
 void cancel_iocp_file_op::operator()() const noexcept {
+    op->cancelled.store(true, std::memory_order_release);
     auto const h = op->owner_->native_handle();
     if (file_is_valid(h)) ::CancelIoEx(h, op->overlapped());
 }
@@ -22,7 +23,7 @@ void iocp_file_op::on_complete(DWORD const error, DWORD const bytes) noexcept {
         return;
     }
     if (error != 0) {
-        ec = iocp_error(error);
+        ec = cancelled.load(std::memory_order_acquire) ? make_error_code(error::operation_aborted) : iocp_error(error);
         bytes_transferred = 0U;
         return;
     }
@@ -51,13 +52,18 @@ std::error_code iocp_file::assign(native_file_type const handle) noexcept {
 std::error_code iocp_file::close() noexcept {
     if (not file_is_valid(handle_)) return {};
     auto const h = handle_;
+    if (read_.pending) read_.cancelled.store(true, std::memory_order_release);
+    if (write_.pending) write_.cancelled.store(true, std::memory_order_release);
     handle_ = INVALID_HANDLE_VALUE;
     if (not ::CloseHandle(h)) return std::error_code{static_cast<int>(::GetLastError()), std::system_category()};
     return {};
 }
 
 void iocp_file::cancel() noexcept {
-    if (file_is_valid(handle_) && (read_.pending || write_.pending)) ::CancelIoEx(handle_, nullptr);
+    if (not file_is_valid(handle_)) return;
+    if (read_.pending) read_.cancelled.store(true, std::memory_order_release);
+    if (write_.pending) write_.cancelled.store(true, std::memory_order_release);
+    if (read_.pending || write_.pending) ::CancelIoEx(handle_, nullptr);
 }
 
 native_file_type iocp_file::release() noexcept {
@@ -85,6 +91,7 @@ void iocp_file::begin_read(std::uint64_t const offset, span<mutable_buffer const
     read_.offset = offset;
     pick_first(buffers, read_.data, read_.length);
     read_.sync_failed = false;
+    read_.cancelled.store(false, std::memory_order_relaxed);
 }
 
 void iocp_file::begin_write(std::uint64_t const offset, span<const_buffer const> const buffers) noexcept {
@@ -92,6 +99,7 @@ void iocp_file::begin_write(std::uint64_t const offset, span<const_buffer const>
     write_.offset = offset;
     pick_first(buffers, write_.data, write_.length);
     write_.sync_failed = false;
+    write_.cancelled.store(false, std::memory_order_relaxed);
 }
 
 bool iocp_file::ready(op_direction const direction) noexcept {

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 
 #include "net/continuation.hpp"
@@ -57,7 +58,10 @@ struct iocp_socket_op final : iocp_op {
 
     std::error_code ec;          // 同步失败（发起前）或完成结果
     std::size_t bytes_transferred = 0;
-    bool sync_failed = false;    // begin_* / 发起时已经失败：ready() 直接为真
+    bool sync_failed = false;    // begin_* / 发起 / 投机时已经有结果：ready() 直接为真
+    // 本地取消（cancel / close / release / stop_token）：完成包带的错误码不一定是 995——closesocket 常给
+    // ERROR_NETNAME_DELETED（与对端 RST 同码），所以以这个标记为准统一报 operation_aborted。
+    std::atomic<bool> cancelled{false};
     continuation cont;
     io_env const* env = nullptr;
     bool pending = false;
@@ -104,6 +108,8 @@ struct iocp_socket final : socket_impl {
     // 发起系统调用；返回 true 表示已发布（完成包会到），false 表示同步失败（op.ec 已设）。
     bool issue(iocp_socket_op& op) noexcept;
     void cancel_pending() noexcept;
+    // accept 的投机：监听套接字非阻塞后同步 accept()，队列里已有连接就不必经过端口。
+    bool speculate_accept(iocp_socket_op& op) noexcept;
 
     io_context* context_;
     iocp_backend* backend_;
@@ -111,6 +117,7 @@ struct iocp_socket final : socket_impl {
     int family_ = 0;
     int type_ = 0;
     int protocol_ = 0;
+    bool listener_nonblocking_ = false;
     iocp_socket_op read_op_;
     iocp_socket_op write_op_;
 };
