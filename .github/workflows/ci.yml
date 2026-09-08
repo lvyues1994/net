@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, iocp-windows]
   pull_request:
-    branches: [main]
+    branches: [main, iocp-windows]
   workflow_dispatch:
 
 concurrency:
