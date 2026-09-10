@@ -4,10 +4,12 @@
 #include <cstdio>
 #include <string>
 
-#include <sys/stat.h>
+#include "net/config.hpp"
+
 #if NET_PLATFORM_WINDOWS
 #include <process.h>
 #else
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 

@@ -112,8 +112,7 @@ void cancel_aborts_a_pending_receive() {
 void multicast_options_join_send_receive_leave() {
 #if NET_PLATFORM_WINDOWS
     std::cout << "multicast over the loopback interface is not reliable on Windows runners, skipping\n";
-    return;
-#endif
+#else
     test_context ctx;
     auto const group = net::ip::make_address("239.255.0.1");
     CHECK(group.to_v4().is_multicast());
@@ -174,6 +173,7 @@ void multicast_options_join_send_receive_leave() {
     auto v6_hops = net::ip::multicast::hops{3};
     v6_hops.for_v6();
     CHECK_EQ(v6_hops.name(), IPV6_MULTICAST_HOPS);
+#endif
 }
 
 } // namespace
