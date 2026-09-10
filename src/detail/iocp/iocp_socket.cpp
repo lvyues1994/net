@@ -41,12 +41,21 @@ LPFN_CONNECTEX load_connect_ex(native_socket_type const s) noexcept {
     return fn;
 }
 
-// ConnectEx 要求套接字已绑定：没绑定就绑到本族的通配地址。
+// ConnectEx 要求套接字已绑定：没绑定就绑到本族的通配地址。AF_UNIX 没有通配接口，绑未命名
+// sockaddr_un（长度到 sun_path）即可；绑 AF_INET 会 WSAEAFNOSUPPORT，客户端立刻失败、
+// 对端 AcceptEx 一直挂着，io_context::run() 回不来。
 std::error_code ensure_bound(native_socket_type const s, int const family) noexcept {
     sockaddr_storage current{};
     auto length = static_cast<int>(sizeof(current));
     if (::getsockname(s, reinterpret_cast<sockaddr*>(&current), &length) == 0) return {};
     if (::WSAGetLastError() != WSAEINVAL) return wsa_error();
+    if (family == AF_UNIX) {
+        sockaddr_un unnamed{};
+        unnamed.sun_family = AF_UNIX;
+        if (::bind(s, reinterpret_cast<sockaddr*>(&unnamed), static_cast<int>(offsetof(sockaddr_un, sun_path))) != 0)
+            return wsa_error();
+        return {};
+    }
     if (family == AF_INET6) {
         sockaddr_in6 any{};
         any.sin6_family = AF_INET6;

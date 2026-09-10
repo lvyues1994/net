@@ -54,6 +54,11 @@ template <class Protocol> struct basic_endpoint {
     std::string path() const {
         if (length_ <= static_cast<socklen_t>(offsetof(sockaddr_un, sun_path))) return {};
         auto const n = static_cast<std::size_t>(length_) - offsetof(sockaddr_un, sun_path);
+#if NET_PLATFORM_WINDOWS
+        // Windows 没有抽象命名空间。getsockname / getpeername 对未命名端点仍回
+        // sizeof(sockaddr_un)、sun_path 全 0；按 POSIX 长度应只有 sun_family。
+        if (n == 0U || data_.sun_path[0] == '\0') return {};
+#endif
         // 内核回填的文件系统路径可能带结尾 '\0'
         auto const len = n != 0U && data_.sun_path[0] != '\0' && data_.sun_path[n - 1U] == '\0' ? n - 1U : n;
         return std::string{data_.sun_path, len};

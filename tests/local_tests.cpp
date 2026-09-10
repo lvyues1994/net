@@ -176,8 +176,11 @@ CO2_END
 void connect_errors_are_reported() {
     test_context ctx;
     net::local_stream_socket client{ctx};
-    auto const ec = run_task(ctx, connect_only(&client, net::local::stream_protocol::endpoint{"/nonexistent/dir/sock"}));
-    // Windows 的 afunix 对不存在的路径报 WSAECONNREFUSED / ERROR_PATH_NOT_FOUND 之一
+    // 父目录必须存在：Windows AF_UNIX 在父目录不存在时给 WSAENETDOWN（10050），
+    // 对不上 no_such_file / connection_refused。Corosio 的 testConnectToNonexistent
+    // 同样用临时目录下不存在的套接字文件（他们这条只在 POSIX 上跑，且只断言有错误）。
+    path_guard guard{unique_path("missing")};
+    auto const ec = run_task(ctx, connect_only(&client, net::local::stream_protocol::endpoint{guard.path}));
     CHECK(ec == std::errc::no_such_file_or_directory || ec == std::errc::connection_refused);
     // 路径过长
     auto threw = false;

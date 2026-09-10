@@ -894,7 +894,10 @@ void ocsp_stapling_is_requested_and_verified() {
         CHECK(not lenient.request_ocsp_stapling(false));
         CHECK(not handshake_against(server_ctx, lenient));
     }
-    // 不是给这张证书的响应（用自签的 server 证书当叶子）：验证响应的提供者无法验证
+    // 不是给这张证书的响应（用自签的 server 证书当叶子）。验证响应的提供者应拒绝握手：
+    // 较早的 OpenSSL 会把错配 staple 发出去，客户端校验失败 → ocsp_response_invalid；
+    // OpenSSL 3.6+ 在服务端拒发（tlsv1 bad certificate status response），客户端收不到
+    // 响应 → ocsp_response_missing。两种都表示"这份 staple 不能用"。
     {
         auto server_ctx = server_context();
         CHECK(not server_ctx.set_ocsp_response(staple));
@@ -904,7 +907,7 @@ void ocsp_stapling_is_requested_and_verified() {
         if (net::tls::is_boringssl())
             CHECK(not ec);
         else
-            CHECK(ec == net::error::ocsp_response_invalid);
+            CHECK(ec == net::error::ocsp_response_invalid || ec == net::error::ocsp_response_missing);
     }
 }
 
