@@ -14,9 +14,9 @@
 #include <afunix.h>  // AF_UNIX 的 sockaddr_un（ConnectEx 前的绑定）
 #include <mswsock.h> // 必须在 winsock2.h（socket_types.hpp）之后
 
-// IOCP 的套接字实现：WSARecv / WSASend / WSARecvFrom / WSASendTo / ConnectEx / AcceptEx，全部重叠，
-// 完成经端口到达。ready() 不做投机：发起就是提交（与 Corosio 一样，同步完成的调用也会投完成包，
-// 这样 suspend 之后不需要再碰操作对象）。发起立刻失败（不是 WSA_IO_PENDING）时同步以错误完成。
+// IOCP 的套接字实现：WSARecv / WSASend / WSARecvFrom / WSASendTo / ConnectEx / AcceptEx，全部重叠。
+// ready() 只对 accept 投机（非阻塞 accept()：队列里已有连接就不同时挂两个 AcceptEx）；读写靠
+// FILE_SKIP_COMPLETION_PORT_ON_SUCCESS 在 issue() 里消化同步成功。发起立刻失败时同步以错误完成。
 
 namespace net {
 namespace detail {
@@ -113,6 +113,8 @@ struct iocp_socket final : socket_impl {
     void cancel_pending() noexcept;
     // 关联端口后：IFS 提供者上开启"同步成功不投完成包"，让已就绪的读写 / 排队的连接不经过端口。
     void enable_skip_on_success() noexcept;
+    // accept 投机：监听套接字非阻塞后同步 accept()，队列里已有连接就不必经过端口。
+    bool speculate_accept(iocp_socket_op& op) noexcept;
 
     io_context* context_;
     iocp_backend* backend_;
@@ -121,6 +123,7 @@ struct iocp_socket final : socket_impl {
     int type_ = 0;
     int protocol_ = 0;
     bool skip_on_success_ = false; // FILE_SKIP_COMPLETION_PORT_ON_SUCCESS 已开：同步返回 0 就没有完成包
+    bool listener_nonblocking_ = false; // 投机 accept 时把监听套接字设成非阻塞（不影响 AcceptEx）
     iocp_socket_op read_op_;
     iocp_socket_op write_op_;
 };

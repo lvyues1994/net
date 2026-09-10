@@ -206,6 +206,7 @@ std::error_code iocp_socket::close() noexcept {
     if (write_op_.pending) write_op_.cancelled.store(true, std::memory_order_release);
     fd_ = invalid_socket; // 在飞的操作随 closesocket 以取消完成（错误码可能是 995 或 64，统一报 aborted）
     skip_on_success_ = false;
+    listener_nonblocking_ = false;
     if (::closesocket(s) != 0) return wsa_error();
     return {};
 }
@@ -217,6 +218,7 @@ native_socket_type iocp_socket::release() noexcept {
     auto const s = fd_;
     fd_ = invalid_socket;
     skip_on_success_ = false;
+    listener_nonblocking_ = false;
     return s; // 仍挂在端口上（Windows 不允许解除关联）
 }
 
@@ -314,6 +316,8 @@ bool iocp_socket::ready(op_direction const direction) noexcept {
         op.sync_failed = true;
         return true;
     }
+    // accept 没有用户缓冲区：绝不能掉进下面的"空序列"捷径，否则会带着 invalid_socket 假装成功。
+    if (op.op_kind == iocp_socket_op::kind::accept) return speculate_accept(op);
     if (op.op_kind != iocp_socket_op::kind::connect && op.buffer_count == 0U) {
         op.ec.clear(); // 空序列：不发起
         op.bytes_transferred = 0U;
@@ -321,6 +325,30 @@ bool iocp_socket::ready(op_direction const direction) noexcept {
         return true;
     }
     return false;
+}
+
+bool iocp_socket::speculate_accept(iocp_socket_op& op) noexcept {
+    // 就绪型后端的 accept 在 ready() 里用非阻塞 accept4 投机，连接已排队时同步完成；多个协程在一个
+    // 接受器上"connect 完就 accept"因此从不重叠。FILE_SKIP_COMPLETION_PORT_ON_SUCCESS 替代不了这一步：
+    // 它只在已经 issue 了 AcceptEx 之后消化同步成功，第二个协程的 begin_accept 仍会撞上 pending 契约。
+    if (not listener_nonblocking_) {
+        u_long nonblocking = 1;
+        if (::ioctlsocket(fd_, static_cast<long>(FIONBIO), &nonblocking) != 0) return false; // 投机不了：走 AcceptEx
+        listener_nonblocking_ = true;
+    }
+    auto const s = ::accept(fd_, nullptr, nullptr); // 继承监听套接字的重叠属性
+    if (socket_is_valid(s)) {
+        op.accepted_fd = s;
+        op.accepted_family = family_;
+        op.ec.clear();
+        op.sync_failed = true;
+        return true;
+    }
+    auto const error = ::WSAGetLastError();
+    if (error == WSAEWOULDBLOCK) return false;
+    op.ec = iocp_error(static_cast<DWORD>(error), true);
+    op.sync_failed = true;
+    return true;
 }
 
 iocp_socket::issue_result iocp_socket::issue(iocp_socket_op& op) noexcept {
