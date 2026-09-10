@@ -18,8 +18,13 @@
 #include "net/tls/error.hpp"
 
 #include "tls/context_impl.hpp"
+#if defined(NET_TLS_WOLFSSL)
+#include <wolfssl/error-ssl.h>
+#include <wolfssl/ssl.h>
+#include <wolfssl/wolfcrypt/error-crypt.h>
+#endif
 
-// OpenSSL / BoringSSL 引擎 + 驱动协程。
+// OpenSSL / BoringSSL / wolfSSL 引擎 + 驱动协程。
 //
 // 引擎是 sans-I/O 的：SSL 对象挂两个内存 BIO——传输读到的密文写进输入 BIO，SSL 产生的密文
 // 从输出 BIO 取出发给传输。每个 TLS 操作是一个驱动协程：调用引擎 → 把输出 BIO 里的密文
@@ -94,6 +99,46 @@ struct write_gate {
     waiter* head = nullptr;
     waiter* tail = nullptr;
 };
+
+#if defined(NET_TLS_WOLFSSL)
+// wolfSSL 的证书失败大多不落到 SSL_get_verify_result，而是错误队列里的原生码：翻译成三个提供者
+// 上一致的结果——证书链的问题给 verify_category() 的 X509_V_ERR_*，stapling 的问题给
+// net::error 的 ocsp_*。默认 error_code{} 表示"不是这一类错误"，由调用方回退到提供者错误。
+std::error_code error_from_wolfssl(long const code) noexcept {
+    auto const verify = [](int const value) { return std::error_code{value, verify_category()}; };
+    switch (code) {
+    case ASN_SELF_SIGNED_E: return verify(X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT);
+    case ASN_NO_SIGNER_E: return verify(X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY);
+    case ASN_SIG_CONFIRM_E: return verify(X509_V_ERR_CERT_SIGNATURE_FAILURE);
+    case ASN_AFTER_DATE_E: return verify(X509_V_ERR_CERT_HAS_EXPIRED);
+    case ASN_BEFORE_DATE_E: return verify(X509_V_ERR_CERT_NOT_YET_VALID);
+    case ASN_PATHLEN_SIZE_E: return verify(X509_V_ERR_PATH_LENGTH_EXCEEDED);
+    case DOMAIN_NAME_MISMATCH: return verify(X509_V_ERR_HOSTNAME_MISMATCH);
+    case IPADDR_MISMATCH: return verify(X509_V_ERR_IP_ADDRESS_MISMATCH);
+    case VERIFY_CERT_ERROR: return verify(X509_V_ERR_CERT_REJECTED);
+    case CRL_CERT_REVOKED: return verify(X509_V_ERR_CERT_REVOKED);
+    case CRL_MISSING: return verify(X509_V_ERR_UNABLE_TO_GET_CRL);
+    case CRL_CERT_DATE_ERR: return verify(X509_V_ERR_CRL_HAS_EXPIRED);
+    // must-staple 但服务端没附上响应：TLS 1.3 与 TLS 1.2 分别走这两个码。
+    case OCSP_CERT_UNKNOWN:
+    case OCSP_LOOKUP_FAIL: return make_error_code(error::ocsp_response_missing);
+    // 响应本身有问题（解不开 / 签名不对 / 对不上本证书 / 状态不是 good）。
+    case OCSP_CERT_REVOKED:
+    case OCSP_INVALID_STATUS:
+    case BAD_CERTIFICATE_STATUS_ERROR: return make_error_code(error::ocsp_response_invalid);
+    default: return {};
+    }
+}
+
+// 队列里最早的一条错误按上表翻译；ERR_peek_error 交出的是原生码转成的无符号值，取负还原。
+std::error_code peek_wolfssl_error() noexcept {
+    auto native = static_cast<long>(::ERR_peek_error());
+    if (native > 0) native = -native;
+    auto const ec = error_from_wolfssl(native);
+    if (ec) ::ERR_clear_error();
+    return ec;
+}
+#endif
 
 } // namespace
 
@@ -212,6 +257,12 @@ struct openssl_stream_impl final : detail::stream_hooks {
             if (ret == 0) {
                 // 已发出 close_notify；再调一次会等待对端的 close_notify（WANT_READ）。
                 ret = ::SSL_shutdown(ssl);
+                if (ret == 0) {
+                    // wolfSSL（WOLFSSL_ERROR_CODE_OPENSSL）：对端的 close_notify 还没到时第二次也返回 0，
+                    // 而不是 -1 / WANT_READ；OpenSSL 的 SSL_get_error(ssl, 0) 会把它当传输结束。按 WANT_READ 处理。
+                    step.want_input = true;
+                    return step;
+                }
             }
             break;
         }
@@ -244,14 +295,27 @@ struct openssl_stream_impl final : detail::stream_hooks {
             if (verify != X509_V_OK) {
                 ::ERR_clear_error();
                 step.ec = std::error_code{static_cast<int>(verify), verify_category()};
-            } else {
-                step.ec = take_provider_error(std::make_error_code(std::errc::protocol_error));
+                return step;
             }
+#if defined(NET_TLS_WOLFSSL)
+            if (auto const mapped = peek_wolfssl_error()) {
+                step.ec = mapped;
+                return step;
+            }
+#endif
+            step.ec = take_provider_error(std::make_error_code(std::errc::protocol_error));
             return step;
         }
         case SSL_ERROR_SYSCALL:
         default:
             step.completed = true;
+#if defined(NET_TLS_WOLFSSL)
+            // wolfSSL 把证书 / stapling 的失败经 SSL_ERROR_SYSCALL 报出来（不一定是 SSL_ERROR_SSL）。
+            if (auto const mapped = peek_wolfssl_error()) {
+                step.ec = mapped;
+                return step;
+            }
+#endif
             step.ec = take_provider_error(ret == 0 ? make_error_code(error::stream_truncated)
                                                    : std::make_error_code(std::errc::io_error));
             return step;
@@ -317,6 +381,22 @@ auto to_void(task<io_result<std::size_t>> inner) CO2_BEG((task<io_result<>>), (i
 }
 CO2_END
 
+#if defined(OPENSSL_IS_BORINGSSL)
+// 只传输 stapling 的提供者：require 没有引擎侧的落点，握手成功后按"有没有响应"补判。
+auto require_ocsp_after(openssl_stream_impl* impl, task<io_result<>> inner)
+    CO2_BEG((task<io_result<>>), (impl, inner), io_result<> r;) {
+    CO2_AWAIT_SET(r, std::move(inner));
+    if (not r.ec && impl->ssl != nullptr) {
+        std::uint8_t const* data = nullptr;
+        std::size_t length = 0;
+        ::SSL_get0_ocsp_response(impl->ssl, &data, &length);
+        if (data == nullptr || length == 0U) r.ec = make_error_code(error::ocsp_response_missing);
+    }
+    CO2_RETURN(r);
+}
+CO2_END
+#endif
+
 } // namespace
 
 void openssl_stream_impl_deleter::operator()(openssl_stream_impl* const impl) const noexcept { delete impl; }
@@ -360,6 +440,8 @@ std::string openssl_stream::servername() const {
     return name != nullptr ? std::string{name} : std::string{};
 }
 
+// 服务端：本端附上的响应。客户端：OpenSSL 与 BoringSSL 交出收到的 DER；wolfSSL 不交（它自己
+// 验证 staple，原始字节只留在内部的扩展里），在那里客户端上恒为空。
 std::string openssl_stream::ocsp_response() const {
     if (impl_->ssl == nullptr) return {};
 #if defined(OPENSSL_IS_BORINGSSL)
@@ -368,7 +450,7 @@ std::string openssl_stream::ocsp_response() const {
     ::SSL_get0_ocsp_response(impl_->ssl, &data, &length);
     return data != nullptr ? std::string{reinterpret_cast<char const*>(data), length} : std::string{};
 #else
-    unsigned char const* data = nullptr;
+    unsigned char* data = nullptr;
     auto const length = ::SSL_get_tlsext_status_ocsp_resp(impl_->ssl, &data);
     return data != nullptr && length > 0 ? std::string{reinterpret_cast<char const*>(data), static_cast<std::size_t>(length)}
                                          : std::string{};
@@ -401,8 +483,18 @@ task<io_result<>> openssl_stream::handshake(role const r) {
         ::SSL_set_connect_state(impl.ssl);
     else
         ::SSL_set_accept_state(impl.ssl);
+#if NET_TLS_OCSP_NATIVE
+    // wolfSSL 的 status_request 扩展挂在 SSL 上（没有 SSL_CTX 级别的开关），必须在握手之前。
+    if (r == role::client && impl.ctx.impl().ocsp_requested &&
+        ::wolfSSL_UseOCSPStapling(impl.ssl, WOLFSSL_CSR_OCSP, 0) != WOLFSSL_SUCCESS)
+        return detail::fail(take_provider_error(std::make_error_code(std::errc::invalid_argument)));
+#endif
     impl.handshake_started = true;
-    return detail::to_void(detail::run_op(&impl, detail::op_kind::handshake, mutable_buffer_array<>{}, const_buffer_array<>{}));
+    auto inner = detail::to_void(detail::run_op(&impl, detail::op_kind::handshake, mutable_buffer_array<>{}, const_buffer_array<>{}));
+#if defined(OPENSSL_IS_BORINGSSL)
+    if (r == role::client && impl.ctx.impl().ocsp_required) return detail::require_ocsp_after(&impl, std::move(inner));
+#endif
+    return inner;
 }
 
 task<io_result<>> openssl_stream::shutdown() {

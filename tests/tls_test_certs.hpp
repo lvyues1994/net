@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cstring>
+#include <string>
+
 // 测试用的自签名证书（10 年有效期，openssl req 生成）。
 //   server：CN=localhost，SAN = DNS:localhost, IP:127.0.0.1, IP:::1，可作 CA（自签）
 //   other： CN=other.example，用于验证"证书不匹配主机名 / 不受信任"的失败路径
@@ -108,6 +111,65 @@ inline char const* leaf_private_key() noexcept {
         "u2/hUhbdi/MnQFoSsGVUY6XGSZ6hRANCAAQvHcyW7D3DafTQduIdAi6mbn1FQGFQ\n"
         "u74nomoB29Ykt3e/dpgxbgwhIeE4m9AydvUHEePlVAQ/bqmE2anrYbRK\n"
         "-----END PRIVATE KEY-----\n";
+}
+
+// CA 签发的 CRL，吊销上面的叶子（nextUpdate 10 年）：CRL 检查的测试用。
+inline char const* leaf_crl() noexcept {
+    return
+        "-----BEGIN X509 CRL-----\n"
+        "MIHGMG4CAQEwCgYIKoZIzj0EAwIwFjEUMBIGA1UEAwwLbmV0IHRlc3QgQ0EXDTI2\n"
+        "MDkwODE2MzA1N1oXDTM2MDkwNTE2MzA1N1owJzAlAhRJvJewMsu9O0ee561B20Sy\n"
+        "hMYCLBcNMjYwOTA4MTYzMDU3WjAKBggqhkjOPQQDAgNIADBFAiBrfcxP5eItR20u\n"
+        "q0hRvvq7EUvC1MPD3cbelhuzpzUl6AIhAKJuWYErHy7oeyf1h8CWSXSjnusQXMQJ\n"
+        "OLTR3kxaV0zg\n"
+        "-----END X509 CRL-----\n";
+}
+
+namespace detail {
+
+// base64 → 原始字节（忽略换行与 '=' 填充）：下面的 OCSP 响应是 DER，不适合直接写成字符串字面量。
+inline std::string from_base64(char const* const text) {
+    static char const* const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    auto bits = 0U;
+    auto count = 0;
+    for (auto const* p = text; *p != '\0'; ++p) {
+        auto const* const found = std::strchr(alphabet, *p);
+        if (found == nullptr) continue;
+        bits = (bits << 6) | static_cast<unsigned>(found - alphabet);
+        count += 6;
+        if (count >= 8) {
+            count -= 8;
+            out.push_back(static_cast<char>((bits >> count) & 0xFFU));
+        }
+    }
+    return out;
+}
+
+} // namespace detail
+
+// CA 为上面的叶子签的 OCSP 响应（DER；nextUpdate 10 年，不内嵌响应方证书——签发者已经在信任锚里）：
+// OCSP stapling 的测试用。写成常量而不是现场签，是因为只有 OpenSSL 有构造 OCSP 响应的 API，
+// BoringSSL 与 wolfSSL 下同一份测试也要能跑。
+inline std::string leaf_ocsp_response_good() {
+    return detail::from_base64(
+        "MIIBGAoBAKCCAREwggENBgkrBgEFBQcwAQEEgf8wgfwwgaShGDAWMRQwEgYDVQQD"
+        "DAtuZXQgdGVzdCBDQRgPMjAyNjA5MTAxNDA1NDlaMHcwdTBNMAkGBSsOAwIaBQAE"
+        "FDOankq906KQl1JIsLgoo2HwUx6TBBTtKoO1FsLqrZPXpKBOMjsgHpwargIUSbyX"
+        "sDLLvTtHnuetQdtEsoTGAiyAABgPMjAyNjA5MTAxNDA1NDlaoBEYDzIwMzYwOTA3"
+        "MTQwNTQ5WjAKBggqhkjOPQQDAgNHADBEAiBFs0aEFtpH/TEKKSffz0TJuOysX/K9"
+        "HpIXFV3FG6udLgIgbm3wemgmjG7Nzt87lVN2NvgIBqo4lgCm/8sVPWCCsk4=");
+}
+
+inline std::string leaf_ocsp_response_revoked() {
+    return detail::from_base64(
+        "MIIBLwoBAKCCASgwggEkBgkrBgEFBQcwAQEEggEVMIIBETCBt6EYMBYxFDASBgNV"
+        "BAMMC25ldCB0ZXN0IENBGA8yMDI2MDkxMDE0MDU0OVowgYkwgYYwTTAJBgUrDgMC"
+        "GgUABBQzmp5KvdOikJdSSLC4KKNh8FMekwQU7SqDtRbC6q2T16SgTjI7IB6cGq4C"
+        "FEm8l7Ayy707R57nrUHbRLKExgIsoREYDzIwMjYwOTA4MTYzMDU3WhgPMjAyNjA5"
+        "MTAxNDA1NDlaoBEYDzIwMzYwOTA3MTQwNTQ5WjAKBggqhkjOPQQDAgNJADBGAiEA"
+        "zfW/aAzIPo6Um69oJiA+iZUb4dHFse2HQDo2k0TUjIwCIQCfMTi9eB0bJpY0TzmU"
+        "Ke+IsmtWHT/w4EQdfSr6ACxpZA==");
 }
 
 } // namespace net_test_certs

@@ -9,8 +9,8 @@
 
 // TLS 上下文（P4100R1 §8.8 Paper 14：传输安全包装器；形态取自 Corosio 的 tls_context）：
 // 证书、私钥、信任锚、验证模式、协议版本、密码套件、ALPN 与回调。它对提供者中立——
-// 同一份 API 由 OpenSSL 或 BoringSSL 实现（构建期 NET_TLS_PROVIDER 选择，两者共用
-// OpenSSL API 子集）；公共头不包含任何 OpenSSL 头。
+// 同一份 API 由 OpenSSL、BoringSSL 或 wolfSSL 实现（构建期 NET_TLS_PROVIDER 选择，三者共用
+// OpenSSL API 子集，wolfSSL 经它的 OpenSSL 兼容层）；公共头不包含任何 OpenSSL 头。
 //
 // context 是共享句柄：拷贝共享同一份配置（与 SSL_CTX 相同）。设置在调用时即刻应用并
 // 返回错误；之后创建的 tls::stream 使用当时的配置。
@@ -99,7 +99,8 @@ struct context {
     std::error_code set_max_protocol_version(version v);
     // TLS 1.2 及以下的密码套件（OpenSSL 语法）。
     std::error_code set_ciphersuites(std::string const& ciphers);
-    // TLS 1.3 密码套件。BoringSSL 不允许配置，返回 std::errc::function_not_supported。
+    // TLS 1.3 密码套件。BoringSSL 不允许配置，返回 std::errc::function_not_supported；wolfSSL 只有
+    // 一张统一的套件表，这里与 set_ciphersuites 是同一个设置。
     std::error_code set_ciphersuites_tls13(std::string const& ciphers);
     // ALPN 协议列表，按偏好排序（例如 {"h2", "http/1.1"}）。
     std::error_code set_alpn(std::vector<std::string> const& protocols);
@@ -125,13 +126,14 @@ struct context {
     // ---- OCSP stapling ----
     // 服务端：随握手附上的 DER 编码 OCSP 响应（由部署方定期从 OCSP 响应方取得）。
     std::error_code set_ocsp_response(std::string der_response);
-    // 客户端：在握手里请求 stapling。OpenSSL 上收到的响应会被验证（签名、对应本证书、状态 good、
-    // 有效期），不通过则握手以 ocsp_response_invalid 失败；require 为真时没有响应以
-    // ocsp_response_missing 失败。BoringSSL 没有 OCSP 解析 API：只传输，响应经 stream::ocsp_response()
-    // 交给调用方验证，require 语义相同。
+    // 客户端：在握手里请求 stapling。收到的响应会被验证（签名、对应本证书、状态 good、有效期），
+    // 不通过则握手以 ocsp_response_invalid 失败；require 为真时没有响应以 ocsp_response_missing
+    // 失败。OpenSSL 上验证由本库做，wolfSSL 上由提供者自己做（因此 stream::ocsp_response() 在
+    // wolfSSL 的客户端上为空——提供者不交出原始响应）。BoringSSL 没有 OCSP 解析 API：只传输，
+    // 响应经 stream::ocsp_response() 交给调用方验证，require 只判定"有没有响应"。
     std::error_code request_ocsp_stapling(bool require);
 
-    // 提供者的原生句柄（OpenSSL / BoringSSL：SSL_CTX*）。
+    // 提供者的原生句柄（OpenSSL / BoringSSL：SSL_CTX*；wolfSSL：WOLFSSL_CTX*）。
     void* native_handle() const noexcept;
 
     detail::context_impl& impl() const noexcept { return *impl_; }
@@ -140,9 +142,10 @@ struct context {
     std::shared_ptr<detail::context_impl> impl_;
 };
 
-// 链接的提供者："OpenSSL 3.0.13" / "BoringSSL"。
+// 链接的提供者："OpenSSL 3.0.13" / "BoringSSL" / "wolfSSL 5.8.2"。
 char const* provider_name() noexcept;
 bool is_boringssl() noexcept;
+bool is_wolfssl() noexcept;
 
 } // namespace tls
 } // namespace net

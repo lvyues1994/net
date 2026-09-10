@@ -1,6 +1,6 @@
 // TLS：回环握手 / 回显 / 干净关闭、证书与主机名校验失败、传输截断、ALPN、大块传输经
-// any_stream（类型擦除的 TLS）、取消、协议版本不匹配、上下文配置错误。OpenSSL 与 BoringSSL
-// 共用（差异处按 is_boringssl() 分支）。
+// any_stream（类型擦除的 TLS）、取消、协议版本不匹配、上下文配置错误。OpenSSL、BoringSSL 与
+// wolfSSL 共用（差异处按 is_boringssl() / is_wolfssl() 分支）。
 
 #include <atomic>
 #include <chrono>
@@ -27,6 +27,11 @@
 #include "net/when_all.hpp"
 #include "net/when_any.hpp"
 
+// 测试固定编译在 C++14（公共头必须在 C++14 可用），而 BoringSSL 的 C++ 便利层（span.h 用
+// std::is_convertible_v）要求 C++17。测试只用 C API，关掉那一层；另外两家没有这个宏，无害。
+#if __cplusplus < 201703L
+#define BORINGSSL_NO_CXX
+#endif
 #include <openssl/bio.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
@@ -34,9 +39,6 @@
 #include <openssl/x509.h>
 #include <openssl/x509_vfy.h>
 #include <openssl/x509v3.h>
-#if !defined(OPENSSL_IS_BORINGSSL)
-#include <openssl/ocsp.h>
-#endif
 
 #include "check.hpp"
 #include "tls_test_certs.hpp"
@@ -777,35 +779,6 @@ void sni_callback_switches_the_server_context() {
     CHECK_EQ(server.servername(), "other.example");
 }
 
-// 用 CA 私钥现场签一份 CRL（吊销叶子）。
-std::string make_crl_revoking_leaf() {
-    using bio_ptr = std::unique_ptr<BIO, void (*)(BIO*)>;
-    bio_ptr ca_bio{::BIO_new_mem_buf(net_test_certs::ca_certificate(), -1), &::BIO_free_all};
-    std::unique_ptr<X509, void (*)(X509*)> ca{::PEM_read_bio_X509(ca_bio.get(), nullptr, nullptr, nullptr), &::X509_free};
-    bio_ptr key_bio{::BIO_new_mem_buf(net_test_certs::ca_private_key(), -1), &::BIO_free_all};
-    std::unique_ptr<EVP_PKEY, void (*)(EVP_PKEY*)> key{::PEM_read_bio_PrivateKey(key_bio.get(), nullptr, nullptr, nullptr), &::EVP_PKEY_free};
-    bio_ptr leaf_bio{::BIO_new_mem_buf(net_test_certs::leaf_certificate(), -1), &::BIO_free_all};
-    std::unique_ptr<X509, void (*)(X509*)> leaf{::PEM_read_bio_X509(leaf_bio.get(), nullptr, nullptr, nullptr), &::X509_free};
-    CHECK(ca && key && leaf);
-    std::unique_ptr<X509_CRL, void (*)(X509_CRL*)> crl{::X509_CRL_new(), &::X509_CRL_free};
-    CHECK(::X509_CRL_set_version(crl.get(), 1) == 1);
-    CHECK(::X509_CRL_set_issuer_name(crl.get(), ::X509_get_subject_name(ca.get())) == 1);
-    std::unique_ptr<ASN1_TIME, void (*)(ASN1_TIME*)> now{::X509_gmtime_adj(nullptr, 0), &::ASN1_TIME_free};
-    std::unique_ptr<ASN1_TIME, void (*)(ASN1_TIME*)> next{::X509_gmtime_adj(nullptr, 3600L * 24L), &::ASN1_TIME_free};
-    CHECK(::X509_CRL_set1_lastUpdate(crl.get(), now.get()) == 1);
-    CHECK(::X509_CRL_set1_nextUpdate(crl.get(), next.get()) == 1);
-    auto* const revoked = ::X509_REVOKED_new();
-    CHECK(::X509_REVOKED_set_serialNumber(revoked, ::X509_get_serialNumber(leaf.get())) == 1);
-    CHECK(::X509_REVOKED_set_revocationDate(revoked, now.get()) == 1);
-    CHECK(::X509_CRL_add0_revoked(crl.get(), revoked) == 1);
-    CHECK(::X509_CRL_sign(crl.get(), key.get(), ::EVP_sha256()) > 0);
-    bio_ptr out{::BIO_new(::BIO_s_mem()), &::BIO_free_all};
-    CHECK(::PEM_write_bio_X509_CRL(out.get(), crl.get()) == 1);
-    char* data = nullptr;
-    auto const length = ::BIO_get_mem_data(out.get(), &data);
-    return std::string{data, static_cast<std::size_t>(length)};
-}
-
 std::error_code handshake_against(net::tls::context& server_ctx, net::tls::context& client_ctx, std::error_code* server_out = nullptr) {
     connected_pair pair;
     net::tls::openssl_stream server{&pair.server, server_ctx};
@@ -814,7 +787,12 @@ std::error_code handshake_against(net::tls::context& server_ctx, net::tls::conte
     std::error_code server_ec;
     std::error_code client_ec;
     net::run_async(pair.ctx.get_executor(), [&](std::error_code e) { server_ec = e; }, [](std::exception_ptr) { CHECK(false); })(server_handshake_only(&server));
-    net::run_async(pair.ctx.get_executor(), [&](std::error_code e) { client_ec = e; }, [](std::exception_ptr) { CHECK(false); })(client_handshake_only(&client));
+    // 客户端拒绝握手后关掉传输：提供者不保证一定会发致命告警（wolfSSL 拒绝 OCSP staple 时就不
+    // 发），不关的话服务端会一直等下去。真实调用方在握手失败后也是这样收拾连接的。
+    net::run_async(pair.ctx.get_executor(), [&](std::error_code e) {
+        client_ec = e;
+        if (e) pair.client.close();
+    }, [](std::exception_ptr) { CHECK(false); })(client_handshake_only(&client));
     pair.ctx.run();
     if (server_out != nullptr) *server_out = server_ec;
     return client_ec;
@@ -827,7 +805,7 @@ void crl_revocation_is_enforced() {
         auto client_ctx = ca_client_context();
         CHECK(not handshake_against(server_ctx, client_ctx));
     }
-    auto const crl = make_crl_revoking_leaf();
+    std::string const crl = net_test_certs::leaf_crl();
     // 只加 CRL 不开检查：照常通过
     {
         auto client_ctx = ca_client_context();
@@ -866,41 +844,15 @@ void crl_revocation_is_enforced() {
     CHECK(not junk.add_os_certificates());
 }
 
-#if !defined(OPENSSL_IS_BORINGSSL)
-// 用 CA 私钥现场签一份 OCSP 响应（good 或 revoked）。
-std::string make_ocsp_response(bool const good) {
-    using bio_ptr = std::unique_ptr<BIO, void (*)(BIO*)>;
-    bio_ptr ca_bio{::BIO_new_mem_buf(net_test_certs::ca_certificate(), -1), &::BIO_free_all};
-    std::unique_ptr<X509, void (*)(X509*)> ca{::PEM_read_bio_X509(ca_bio.get(), nullptr, nullptr, nullptr), &::X509_free};
-    bio_ptr key_bio{::BIO_new_mem_buf(net_test_certs::ca_private_key(), -1), &::BIO_free_all};
-    std::unique_ptr<EVP_PKEY, void (*)(EVP_PKEY*)> key{::PEM_read_bio_PrivateKey(key_bio.get(), nullptr, nullptr, nullptr), &::EVP_PKEY_free};
-    bio_ptr leaf_bio{::BIO_new_mem_buf(net_test_certs::leaf_certificate(), -1), &::BIO_free_all};
-    std::unique_ptr<X509, void (*)(X509*)> leaf{::PEM_read_bio_X509(leaf_bio.get(), nullptr, nullptr, nullptr), &::X509_free};
-    CHECK(ca && key && leaf);
-    std::unique_ptr<OCSP_BASICRESP, void (*)(OCSP_BASICRESP*)> basic{::OCSP_BASICRESP_new(), &::OCSP_BASICRESP_free};
-    auto* const id = ::OCSP_cert_to_id(nullptr, leaf.get(), ca.get());
-    std::unique_ptr<ASN1_TIME, void (*)(ASN1_TIME*)> this_update{::X509_gmtime_adj(nullptr, 0), &::ASN1_TIME_free};
-    std::unique_ptr<ASN1_TIME, void (*)(ASN1_TIME*)> next_update{::X509_gmtime_adj(nullptr, 3600L), &::ASN1_TIME_free};
-    CHECK(::OCSP_basic_add1_status(basic.get(), id, good ? V_OCSP_CERTSTATUS_GOOD : V_OCSP_CERTSTATUS_REVOKED, 0,
-                                   good ? nullptr : this_update.get(), this_update.get(), next_update.get()) != nullptr);
-    ::OCSP_CERTID_free(id);
-    CHECK(::OCSP_basic_sign(basic.get(), ca.get(), key.get(), ::EVP_sha256(), nullptr, 0) == 1);
-    std::unique_ptr<OCSP_RESPONSE, void (*)(OCSP_RESPONSE*)> response{::OCSP_response_create(OCSP_RESPONSE_STATUS_SUCCESSFUL, basic.get()),
-                                                                       &::OCSP_RESPONSE_free};
-    CHECK(response);
-    unsigned char* der = nullptr;
-    auto const length = ::i2d_OCSP_RESPONSE(response.get(), &der);
-    CHECK(length > 0);
-    std::string out{reinterpret_cast<char const*>(der), static_cast<std::size_t>(length)};
-    ::OPENSSL_free(der);
-    return out;
-}
-
+// OCSP stapling：服务端附上 CA 签的响应，客户端在握手里请求它。三个提供者的分工不同——
+// OpenSSL 由本库验证响应，wolfSSL 由提供者自己验证，BoringSSL 只传输——用同一份响应常量把
+// 共同的契约和各自的差异都测到。
 void ocsp_stapling_is_requested_and_verified() {
-    // good：握手通过，客户端拿到响应
+    auto const staple = net_test_certs::leaf_ocsp_response_good();
+    // good：握手通过；能交出原始响应的提供者要原样交出
     {
         auto server_ctx = leaf_server_context();
-        CHECK(not server_ctx.set_ocsp_response(make_ocsp_response(true)));
+        CHECK(not server_ctx.set_ocsp_response(staple));
         auto client_ctx = ca_client_context();
         CHECK(not client_ctx.request_ocsp_stapling(true));
         connected_pair pair;
@@ -914,15 +866,23 @@ void ocsp_stapling_is_requested_and_verified() {
         pair.ctx.run();
         CHECK(not server_ec);
         CHECK(not client_ec);
-        CHECK(not client.ocsp_response().empty());
+        // wolfSSL 自己验证 staple，不把原始字节交出来。
+        if (net::tls::is_wolfssl())
+            CHECK(client.ocsp_response().empty());
+        else
+            CHECK_EQ(client.ocsp_response(), staple);
     }
-    // revoked：客户端拒绝
+    // revoked：验证响应的提供者拒绝握手；只传输的 BoringSSL 通过，由调用方自己看响应
     {
         auto server_ctx = leaf_server_context();
-        CHECK(not server_ctx.set_ocsp_response(make_ocsp_response(false)));
+        CHECK(not server_ctx.set_ocsp_response(net_test_certs::leaf_ocsp_response_revoked()));
         auto client_ctx = ca_client_context();
         CHECK(not client_ctx.request_ocsp_stapling(true));
-        CHECK(handshake_against(server_ctx, client_ctx) == net::error::ocsp_response_invalid);
+        auto const ec = handshake_against(server_ctx, client_ctx);
+        if (net::tls::is_boringssl())
+            CHECK(not ec);
+        else
+            CHECK(ec == net::error::ocsp_response_invalid);
     }
     // 服务端没附响应：require 失败，optional 通过
     {
@@ -934,16 +894,19 @@ void ocsp_stapling_is_requested_and_verified() {
         CHECK(not lenient.request_ocsp_stapling(false));
         CHECK(not handshake_against(server_ctx, lenient));
     }
-    // 不是给这张证书的响应（用自签的 server 证书当叶子）：无法验证
+    // 不是给这张证书的响应（用自签的 server 证书当叶子）：验证响应的提供者无法验证
     {
         auto server_ctx = server_context();
-        CHECK(not server_ctx.set_ocsp_response(make_ocsp_response(true)));
+        CHECK(not server_ctx.set_ocsp_response(staple));
         auto client_ctx = client_context();
         CHECK(not client_ctx.request_ocsp_stapling(true));
-        CHECK(handshake_against(server_ctx, client_ctx) == net::error::ocsp_response_invalid);
+        auto const ec = handshake_against(server_ctx, client_ctx);
+        if (net::tls::is_boringssl())
+            CHECK(not ec);
+        else
+            CHECK(ec == net::error::ocsp_response_invalid);
     }
 }
-#endif
 
 } // namespace
 
@@ -967,9 +930,7 @@ int main() {
     session_is_resumed_on_the_next_connection();
     sni_callback_switches_the_server_context();
     crl_revocation_is_enforced();
-#if !defined(OPENSSL_IS_BORINGSSL)
     ocsp_stapling_is_requested_and_verified();
-#endif
     std::cout << "tls tests passed (" << net::tls::provider_name() << ")\n";
     return 0;
 }

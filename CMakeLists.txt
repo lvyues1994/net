@@ -95,13 +95,16 @@ set(net_io_uring_sources
 # tls::context / tls::stream 的实现建立在 OpenSSL API 子集之上，OpenSSL 与 BoringSSL 共用同
 # 一份源码，构建期选择链接哪一个。BoringSSL 可以给现成的安装根目录，或用 FetchContent
 # 从源码构建（约 400 个目标，不需要 Go / Perl）。
-set(NET_TLS_PROVIDER "OpenSSL" CACHE STRING "TLS provider: OpenSSL | BoringSSL | OFF")
-set_property(CACHE NET_TLS_PROVIDER PROPERTY STRINGS OpenSSL BoringSSL OFF)
+set(NET_TLS_PROVIDER "OpenSSL" CACHE STRING "TLS provider: OpenSSL | BoringSSL | wolfSSL | OFF")
+set_property(CACHE NET_TLS_PROVIDER PROPERTY STRINGS OpenSSL BoringSSL wolfSSL OFF)
+set(NET_WOLFSSL_GIT_TAG "v5.8.2-stable" CACHE STRING "wolfSSL tag fetched for NET_TLS_PROVIDER=wolfSSL")
 set(NET_BORINGSSL_ROOT "" CACHE PATH "Prebuilt BoringSSL root containing include/ and lib/ (empty: FetchContent)")
 set(NET_BORINGSSL_GIT_TAG "0.20250701.0" CACHE STRING "BoringSSL tag fetched when NET_BORINGSSL_ROOT is empty")
 
 set(net_tls_sources)
 set(net_tls_libraries)
+set(net_tls_include_dirs)
+set(net_tls_definitions)
 set(net_has_tls OFF)
 if(NET_TLS_PROVIDER STREQUAL "OpenSSL")
     find_package(OpenSSL REQUIRED)
@@ -130,8 +133,40 @@ elseif(NET_TLS_PROVIDER STREQUAL "BoringSSL")
         set(net_tls_libraries ssl crypto)
     endif()
     set(net_has_tls ON)
+elseif(NET_TLS_PROVIDER STREQUAL "wolfSSL")
+    # wolfSSL 经它的 OpenSSL 兼容层（OPENSSL_ALL / OPENSSL_EXTRA）使用：同一份 TLS 源码。WOLFSSL_ASIO 一把
+    # 打开 Asio 风格消费者需要的全部兼容开关（EX_DATA、OCSP、KEY_GEN…）；<openssl/*.h> 经
+    # ${wolfssl_SOURCE_DIR}/wolfssl 这个包含目录落到 wolfssl/openssl/*.h。
+    include(FetchContent)
+    FetchContent_Declare(wolfssl
+        GIT_REPOSITORY https://github.com/wolfSSL/wolfssl.git
+        GIT_TAG ${NET_WOLFSSL_GIT_TAG}
+        GIT_SHALLOW TRUE)
+    set(WOLFSSL_ASIO yes CACHE STRING "" FORCE)
+    set(WOLFSSL_OPENSSLALL yes CACHE STRING "" FORCE)
+    set(WOLFSSL_OPENSSLEXTRA yes CACHE STRING "" FORCE)
+    set(WOLFSSL_SNI yes CACHE STRING "" FORCE)
+    set(WOLFSSL_ALPN yes CACHE STRING "" FORCE)
+    set(WOLFSSL_CRL yes CACHE STRING "" FORCE)
+    set(WOLFSSL_OCSP yes CACHE STRING "" FORCE)
+    set(WOLFSSL_OCSPSTAPLING yes CACHE STRING "" FORCE)
+    set(WOLFSSL_SESSION_TICKET yes CACHE STRING "" FORCE)
+    set(WOLFSSL_EXAMPLES no CACHE STRING "" FORCE)
+    set(WOLFSSL_CRYPT_TESTS no CACHE STRING "" FORCE)
+    set(WOLFSSL_INSTALL no CACHE STRING "" FORCE)
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(wolfssl)
+    if(NOT MSVC)
+        # wolfSSL 自己的构建带 -Werror；GCC 12+ 在 -O2 上对 tls.c 的 TLS 1.3 密钥派生误报
+        # stringop-overflow，整个依赖就编不过。依赖的警告不该让我们的构建失败。
+        target_compile_options(wolfssl PRIVATE -Wno-error)
+    endif()
+    set(net_tls_libraries $<BUILD_INTERFACE:wolfssl>) # FetchContent 的目标不在导出集里：只在构建树内链接
+    set(net_tls_include_dirs $<BUILD_INTERFACE:${wolfssl_SOURCE_DIR}/wolfssl>)
+    set(net_tls_definitions NET_TLS_WOLFSSL=1 WOLFSSL_USE_OPTIONS_H) # settings.h 替消费方包含 options.h
+    set(net_has_tls ON)
 elseif(NOT NET_TLS_PROVIDER STREQUAL "OFF")
-    message(FATAL_ERROR "NET_TLS_PROVIDER must be OpenSSL, BoringSSL or OFF (got '${NET_TLS_PROVIDER}')")
+    message(FATAL_ERROR "NET_TLS_PROVIDER must be OpenSSL, BoringSSL, wolfSSL or OFF (got '${NET_TLS_PROVIDER}')")
 endif()
 
 if(net_has_tls)
@@ -163,7 +198,10 @@ endif()
 
 if(net_has_tls)
     target_link_libraries(net PUBLIC ${net_tls_libraries})
-    target_compile_definitions(net PUBLIC NET_HAS_TLS=1 "NET_TLS_PROVIDER_NAME=\"${NET_TLS_PROVIDER}\"")
+    target_compile_definitions(net PUBLIC NET_HAS_TLS=1 "NET_TLS_PROVIDER_NAME=\"${NET_TLS_PROVIDER}\"" ${net_tls_definitions})
+    if(net_tls_include_dirs)
+        target_include_directories(net PUBLIC ${net_tls_include_dirs})
+    endif()
     message(STATUS "net: TLS provider ${NET_TLS_PROVIDER}")
 else()
     message(STATUS "net: TLS disabled")

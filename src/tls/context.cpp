@@ -11,8 +11,13 @@
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 #include <openssl/x509_vfy.h>
-#if !defined(OPENSSL_IS_BORINGSSL)
+
+#include "tls/context_impl.hpp" // OPENSSL_IS_BORINGSSL / NET_TLS_* 判定要在提供者头之后
+#if NET_TLS_OCSP_VERIFY
 #include <openssl/ocsp.h>
+#endif
+#if defined(NET_TLS_WOLFSSL)
+#include <wolfssl/ssl.h> // CRL 与 OCSP stapling 的开关没有 OpenSSL 兼容名，用 wolfSSL 原生 API
 #endif
 
 #include "net/config.hpp"
@@ -22,8 +27,6 @@
 #include "net/detail/socket_types.hpp"
 #include <wincrypt.h>
 #endif
-
-#include "tls/context_impl.hpp"
 
 namespace net {
 namespace tls {
@@ -111,8 +114,11 @@ int new_session_thunk(SSL* const ssl, SSL_SESSION* const sess) {
     return 1;
 }
 
+// OCSP status 回调：服务端附上响应；客户端验证收到的响应。wolfSSL 只在服务端调用它——客户端的
+// staple 由提供者自己验证（见 request_ocsp_stapling）。BoringSSL 两侧都不用它（服务端的响应经
+// SSL_CTX_set_ocsp_response 直接给），连编译都不需要：它的 SSL_get_tlsext_status_ocsp_resp 取
+// const uint8_t**，与另外两家的签名对不上。
 #if !defined(OPENSSL_IS_BORINGSSL)
-// OCSP status 回调：服务端附上响应；客户端验证收到的响应。
 int ocsp_status_thunk(SSL* const ssl, void* const arg) {
     auto* const impl = static_cast<detail::context_impl*>(arg);
     auto* const hooks = static_cast<detail::stream_hooks*>(::SSL_get_ex_data(ssl, detail::stream_ex_data_index()));
@@ -126,13 +132,16 @@ int ocsp_status_thunk(SSL* const ssl, void* const arg) {
         return SSL_TLSEXT_ERR_OK;
     }
     // 客户端：0 使握手失败，1 接受。
-    unsigned char const* raw = nullptr;
+    unsigned char* raw = nullptr;
     auto const length = ::SSL_get_tlsext_status_ocsp_resp(ssl, &raw);
     if (raw == nullptr || length <= 0) {
         if (not impl->ocsp_required) return 1;
         hooks->set_ocsp_error(make_error_code(error::ocsp_response_missing));
         return 0;
     }
+#if !NET_TLS_OCSP_VERIFY
+    return 1; // wolfSSL：客户端根本不会走到这里，留着让两种构型都能编译
+#else
     auto const invalid = [&] {
         hooks->set_ocsp_error(make_error_code(error::ocsp_response_invalid));
         return 0;
@@ -158,6 +167,7 @@ int ocsp_status_thunk(SSL* const ssl, void* const arg) {
     if (status != V_OCSP_CERTSTATUS_GOOD) return invalid();
     if (::OCSP_check_validity(this_update, next_update, 300L, -1L) != 1) return invalid();
     return 1;
+#endif
 }
 #endif
 
@@ -230,6 +240,14 @@ context_impl::context_impl() {
 #if defined(OPENSSL_IS_BORINGSSL)
     ::SSL_CTX_set_tlsext_servername_callback(ctx, &servername_thunk);
     ::SSL_CTX_set_tlsext_servername_arg(ctx, this);
+#elif defined(NET_TLS_WOLFSSL)
+    ::SSL_CTX_set_tlsext_servername_callback(ctx, &servername_thunk);
+    ::SSL_CTX_set_tlsext_servername_arg(ctx, this);
+    // 顺序有讲究：装 status 回调会顺带打开 OCSP stapling，而打开 stapling 会把回调的 arg
+    // （wolfSSL 内部就是 OCSP 的 IO 上下文 cm->ocspIOCtx）重置掉。arg 必须最后设，此后不能再调
+    // wolfSSL_CTX_EnableOCSPStapling——否则服务端的回调拿到空 arg，直接不附响应。
+    ::SSL_CTX_set_tlsext_status_cb(ctx, &ocsp_status_thunk);
+    ::SSL_CTX_set_tlsext_status_arg(ctx, this);
 #else
     // OpenSSL 的 SSL_CTX_set_tlsext_*_cb 是带 C 风格转换的宏；直接调 callback_ctrl。
     ::SSL_CTX_callback_ctrl(ctx, SSL_CTRL_SET_TLSEXT_SERVERNAME_CB, reinterpret_cast<void (*)()>(&servername_thunk));
@@ -412,7 +430,7 @@ std::error_code context::set_alpn(std::vector<std::string> const& protocols) {
 
 std::error_code context::set_verify_mode(verify_mode const mode) {
     impl_->mode = mode;
-    auto flags = SSL_VERIFY_NONE;
+    int flags = SSL_VERIFY_NONE;
     if (mode == verify_mode::peer) flags = SSL_VERIFY_PEER;
     if (mode == verify_mode::require_peer) flags = SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
     ::SSL_CTX_set_verify(impl_->ctx, flags, impl_->on_verify ? &verify_thunk : nullptr);
@@ -469,10 +487,27 @@ std::error_code context::add_crl(std::string const& crl_pem) {
         ++added;
     }
     ::ERR_clear_error(); // PEM 读到末尾的"no start line"
-    return added > 0 ? std::error_code{} : std::make_error_code(std::errc::invalid_argument);
+    if (added == 0) return std::make_error_code(std::errc::invalid_argument);
+#if defined(NET_TLS_WOLFSSL)
+    return set_crl_check(impl_->crl_mode); // wolfSSL 装入 CRL 就开始检查：按当前模式重设
+#else
+    return {};
+#endif
 }
 
 std::error_code context::set_crl_check(crl_check const mode) {
+    impl_->crl_mode = mode;
+#if defined(NET_TLS_WOLFSSL)
+    auto* const manager = ::wolfSSL_CTX_GetCertManager(impl_->ctx);
+    if (manager == nullptr) return provider_error();
+    if (mode == crl_check::none) {
+        if (::wolfSSL_CertManagerDisableCRL(manager) != WOLFSSL_SUCCESS) return provider_error();
+        return {};
+    }
+    if (::wolfSSL_CertManagerEnableCRL(manager, mode == crl_check::chain ? WOLFSSL_CRL_CHECKALL : WOLFSSL_CRL_CHECK) != WOLFSSL_SUCCESS)
+        return provider_error();
+    return {};
+#else
     auto* const store = ::SSL_CTX_get_cert_store(impl_->ctx);
     ::X509_STORE_set_flags(store, 0); // 先清掉再按需置位
     auto* const param = ::X509_STORE_get0_param(store);
@@ -482,6 +517,7 @@ std::error_code context::set_crl_check(crl_check const mode) {
     if (mode == crl_check::chain) flags |= X509_V_FLAG_CRL_CHECK_ALL;
     if (::X509_STORE_set_flags(store, flags) != 1) return provider_error();
     return {};
+#endif
 }
 
 // ---- OCSP stapling ----
@@ -493,6 +529,7 @@ std::error_code context::set_ocsp_response(std::string der_response) {
                                     impl_->ocsp_response.size()) != 1)
         return provider_error();
 #endif
+    // wolfSSL：服务端的 stapling 开关与 status 回调在 context_impl 的构造里就位，这里只存响应。
     return {};
 }
 
@@ -501,6 +538,10 @@ std::error_code context::request_ocsp_stapling(bool const require) {
     impl_->ocsp_required = require;
 #if defined(OPENSSL_IS_BORINGSSL)
     ::SSL_CTX_enable_ocsp_stapling(impl_->ctx);
+#elif defined(NET_TLS_WOLFSSL)
+    // wolfSSL 自己验证收到的 staple（签名、对应本证书、状态、有效期，全部离线），并自己实施
+    // must-staple；扩展本身是每个 SSL 在握手前挂上的（见 openssl_stream 的 handshake）。
+    if (require && ::wolfSSL_CTX_EnableOCSPMustStaple(impl_->ctx) != WOLFSSL_SUCCESS) return provider_error();
 #else
     if (::SSL_CTX_set_tlsext_status_type(impl_->ctx, TLSEXT_STATUSTYPE_ocsp) != 1) return provider_error();
 #endif
@@ -513,12 +554,20 @@ char const* provider_name() noexcept {
 #if defined(OPENSSL_IS_BORINGSSL)
     return "BoringSSL";
 #else
-    return ::OpenSSL_version(OPENSSL_VERSION);
+    return ::OpenSSL_version(OPENSSL_VERSION); // wolfSSL 的兼容层给出 "wolfSSL x.y.z"
 #endif
 }
 
 bool is_boringssl() noexcept {
 #if defined(OPENSSL_IS_BORINGSSL)
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool is_wolfssl() noexcept {
+#if defined(NET_TLS_WOLFSSL)
     return true;
 #else
     return false;

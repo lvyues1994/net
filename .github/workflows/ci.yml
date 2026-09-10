@@ -242,6 +242,51 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure --timeout 120
 
+  wolfssl:
+    name: wolfSSL provider
+    runs-on: ubuntu-latest
+    env:
+      WOLFSSL_TAG: v5.8.2-stable
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out co2
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CO2_REPOSITORY }}
+          ref: ${{ env.CO2_REF }}
+          path: co2
+
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+
+      # wolfSSL 从源码构建（要 OpenSSL 兼容层的那组开关，发行版的包不带）；按标签缓存。
+      - name: Cache wolfSSL
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/_deps/wolfssl-src
+            build/_deps/wolfssl-build
+            build/_deps/wolfssl-subbuild
+          key: wolfssl-${{ env.WOLFSSL_TAG }}-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DNET_CO2_DIR=$GITHUB_WORKSPACE/co2 \
+            -DNET_TLS_PROVIDER=wolfSSL \
+            -DNET_WOLFSSL_GIT_TAG=$WOLFSSL_TAG \
+            -DNET_BUILD_EXAMPLES=OFF
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --timeout 120
+
   benchmarks:
     name: Benchmarks (quick)
     runs-on: ubuntu-latest
