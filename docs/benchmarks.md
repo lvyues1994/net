@@ -47,11 +47,10 @@
 - **定时器**：net 快 20%。两边都是 timerfd + 二叉堆；差别在完成路径。
 - **TCP 往返**：Asio callbacks 比 net epoll 快 15%（3.0 vs 3.5 µs），awaitable 快 10%。系统调用数
   相同（`strace -c` 可验：`read`(EAGAIN) + `epoll_wait` + `sendmsg` 各一次每方向）。差在每次完成
-  的固定开销：net 每个操作完成经 `io_context` 互斥锁三次（`post` 续体、`on_work_finished`、
-  `do_one` 出队），Asio 的 reactor 线程把完成放进**线程局部的私有队列**、`outstanding_work_` 是
-  原子——一次往返 4 个完成，差出的 ~500 ns 就在这里。另外 net 的 `read` / `write` 组合操作每次
-  一个 task 帧（4 allocs/往返），Asio 的 `async_read` 复合操作用回收分配器。这两项是下一步
-  明确的优化点：反应器线程完成的操作直接进本线程队列不加锁；`outstanding_work` 改原子。
+  的固定开销。反应器线程上的完成与 Asio 同形：`complete()` 的 `post` 进本线程私有队列（不加锁、
+  不唤醒），`outstanding_work` 是原子（仅 1→0 时才拿队列锁叫醒），`do_one` 先排空私有队列。
+  其它线程的 `post`（解析器工作线程、`stop`、取消）仍走全局队列锁。剩余差距主要在 `read` /
+  `write` 组合操作每次一个 task 帧（4 allocs/往返），Asio 的 `async_read` 复合操作用回收分配器。
 - **吞吐**：同一原因，每 64 KiB 一次完成，Asio 快 15%；瓶颈仍是内核回环的两次拷贝。
 - **connect + accept**：三者在噪声内（7.9–8.9 µs，内核握手为主）。net 曾慢 5 µs：`assign`
   对本库自己 `socket()` / `accept4()` 出来的、已带 `SOCK_NONBLOCK | SOCK_CLOEXEC` 的描述符又做

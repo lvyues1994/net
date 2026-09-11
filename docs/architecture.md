@@ -128,12 +128,14 @@ tcache malloc 比任何带原子操作的回收器都快，所以 Linux 上默�
 `is_executor<E>` 以 SFINAE 检查 P4003R3 §4.3 的七条要求。`executor_ref` 是两指针的
 非拥有视图（`detail::executor_vtable_for<E>`），`any_executor` 是拥有型的。
 
-- `io_context`：互斥锁保护的侵入式 `continuation` 队列 + 工作计数 + 反应器。`run()`
-  循环：有队列元素就 `safe_resume`；无工作则返回；否则一个线程进反应器
-  （`epoll_wait`），其它线程等条件变量。`post` 叫醒空闲线程或（唯一的线程在
-  `epoll_wait` 里时）写 eventfd 打断它。`dispatch` 在本线程正 `run()` 本上下文时直接
-  返回 `c.h`。线程与上下文的关系用线程局部的调用栈记录（允许嵌套 `run()`）。
-- `thread_pool`：固定线程数，同一份队列/工作计数模型；池自身持有一份初始工作直到
+- `io_context`：全局侵入式 `continuation` 队列（互斥锁）+ 每线程每上下文的私有队列 +
+  原子工作计数 + 反应器。`run()` 循环：先排空私有队列再取全局队列，`safe_resume`；
+  无工作且两队皆空则返回；否则一个线程进反应器（`epoll_wait`），其它线程等条件变量。
+  本线程 `post` 进私有队列（不加锁）；其它线程的 `post` 走全局锁并叫醒空闲线程，或
+  （唯一的线程在 `epoll_wait` 里时）写 eventfd 打断它。`dispatch` 在本线程正 `run()`
+  本上下文时直接返回 `c.h`。线程与上下文的关系用线程局部的调用栈记录（允许嵌套
+  `run()`；嵌套 `poll` 把外层私有队列拼回全局，离开时也把残留私有项刷回全局）。
+- `thread_pool`：固定线程数，同一份全局队列 + 原子工作计数；池自身持有一份初始工作直到
   `join()`。
 - `strand<Ex>`：互斥锁 + 侵入式队列 + 一个派发帧（completion_frame）。首个到达的续体
   把派发帧 `post` 到内层执行器；派发帧取走整批续体逐个 `safe_resume`，期间到达的排入

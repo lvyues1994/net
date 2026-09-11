@@ -19,10 +19,11 @@
 // io_context 只持有一个抽象的 detail::io_backend；I/O 对象经抽象接口对接，代码与后端无关。
 //
 // 工作计数：run_async 与 run 在链存续期间持有一份工作；后端为每个排队中的 I/O 操作与
-// 定时器持有一份。计数归零且队列为空时 run() 返回。
+// 定时器持有一份。计数是原子的；归零且私有/全局队列都空时 run() 返回。
 //
 // dispatch：调用线程正在 run() 本上下文时直接返回 c.h（对称转移，零开销恢复），否则排队
-// 并返回 noop_coroutine()。post 总是排队。恢复一律经由 safe_resume。
+// 并返回 noop_coroutine()。post 总是排队——本线程正在 run() 本上下文时进入线程私有队列
+// （不加锁、不唤醒），其它线程走全局队列锁。恢复一律经由 safe_resume。
 //
 // 销毁：析构时未完成的操作被放弃（等待它们的协程不再恢复，其帧不会被销毁）。销毁前应
 // 通过 stop_token 请求停止并 run() 到所有链完成。
@@ -38,7 +39,8 @@ struct io_context_access;
 // 一个线程会调用 run() / run_one() / poll() 系列函数，而且始终是同一个线程。后端据此启用单线程
 // 优化——io_uring 以 IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN 创建（内核省掉 SQ
 // 锁、完成批量交付），第一个调用 run() 的线程成为唯一提交者。违反承诺时 io_uring_enter 以
-// EEXIST 失败并抛出。就绪型后端忽略它。
+// EEXIST 失败并抛出。就绪型后端忽略它。此提示目前只影响 io_uring 的建环标志；其它线程的
+// post() / stop() 仍然安全（全局队列仍有锁，stop() 仍会 interrupt() 正在 backend.run() 的线程）。
 constexpr int single_thread_hint = 0;
 
 struct io_context : execution_context {

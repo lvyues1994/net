@@ -1,5 +1,6 @@
 #include "net/thread_pool.hpp"
 
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -56,20 +57,20 @@ struct thread_pool::impl {
         cv.notify_one();
     }
 
-    void work_started() noexcept {
-        std::lock_guard<std::mutex> lock{mutex};
-        ++outstanding_work;
-    }
+    void work_started() noexcept { outstanding_work.fetch_add(1, std::memory_order_relaxed); }
 
     void work_finished() noexcept {
-        std::lock_guard<std::mutex> lock{mutex};
-        CO2_CONTRACT_CHECK(outstanding_work > 0);
-        if (--outstanding_work == 0) cv.notify_all();
+        auto const prev = outstanding_work.fetch_sub(1, std::memory_order_acq_rel);
+        CO2_CONTRACT_CHECK(prev > 0);
+        if (prev == 1) {
+            std::lock_guard<std::mutex> lock{mutex};
+            cv.notify_all();
+        }
     }
 
     void request_stop() {
+        stopped.store(true, std::memory_order_release);
         std::lock_guard<std::mutex> lock{mutex};
-        stopped = true;
         cv.notify_all();
     }
 
@@ -77,7 +78,9 @@ struct thread_pool::impl {
         std::lock_guard<std::mutex> lock{mutex};
         if (not initial_work_held) return;
         initial_work_held = false;
-        if (--outstanding_work == 0) cv.notify_all();
+        auto const prev = outstanding_work.fetch_sub(1, std::memory_order_acq_rel);
+        CO2_CONTRACT_CHECK(prev > 0);
+        if (prev == 1) cv.notify_all();
     }
 
     void join_threads() {
@@ -89,7 +92,7 @@ struct thread_pool::impl {
         current_pool_slot() = owner;
         std::unique_lock<std::mutex> lock{mutex};
         for (;;) {
-            if (stopped) break;
+            if (stopped.load(std::memory_order_acquire)) break;
             if (head != nullptr) {
                 auto const handle = pop()->h;
                 lock.unlock();
@@ -97,7 +100,7 @@ struct thread_pool::impl {
                 lock.lock();
                 continue;
             }
-            if (outstanding_work <= 0) break;
+            if (outstanding_work.load(std::memory_order_acquire) <= 0) break;
             cv.wait(lock);
         }
         current_pool_slot() = nullptr;
@@ -108,9 +111,9 @@ struct thread_pool::impl {
     std::condition_variable cv;
     continuation* head = nullptr;
     continuation* tail = nullptr;
-    long outstanding_work = 1; // 初始工作，join() 释放
+    std::atomic<long> outstanding_work{1}; // 初始工作，join() 释放；仅 1→0 叫醒
     bool initial_work_held = true;
-    bool stopped = false;
+    std::atomic<bool> stopped{false};
     std::vector<std::thread> threads;
 };
 
