@@ -373,7 +373,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build libssl-dev
-          pip install gcovr
+          pip install 'gcovr==7.2'
 
       - name: Configure
         run: |
@@ -391,10 +391,13 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure --timeout 120
 
-      # 只统计本库的 include/ 与 src/（不含 co2、系统头、测试本身）。
+      # 只统计本库的 include/ 与 src/（不含 co2、系统头、测试本身）。同一份源码为四个后端各编一个测试变体，
+      # gcov 对重复的 .gcda 会报 stamp / 解析警告：忽略，不让报告因此失败。
       - name: Report
         run: |
+          mkdir -p coverage
           gcovr --root . --filter include/ --filter src/ \
+            --gcov-ignore-parse-errors=all --gcov-ignore-errors=all \
             --exclude-unreachable-branches --exclude-throw-branches \
             --print-summary \
             --xml coverage.xml --html-details coverage/index.html \
