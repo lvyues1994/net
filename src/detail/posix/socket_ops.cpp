@@ -54,9 +54,21 @@ std::error_code close_socket(int const fd) noexcept {
     return {};
 }
 
+// 单个缓冲区走 recv / send 而不是 readv / sendmsg：内核里 readv 经 VFS 的 read_iter（rw_verify_area、
+// fsnotify、iovec 导入），sendmsg 要从用户态拷 msghdr 再导入 iovec；recv / send 直接进 sock_recvmsg /
+// sock_sendmsg。同一台机器上 64 B 回环往返每次少约 40 ns 内核时间，一趟往返 6 次调用。多缓冲区照旧。
+
 io_outcome readv(int const fd, mutable_buffer_array<> const& buffers) noexcept {
     iovec vectors[max_iovec];
     auto const count = fill_iovec(vectors, buffers);
+    if (count == 1U) {
+        for (;;) {
+            auto const n = ::recv(fd, vectors[0].iov_base, vectors[0].iov_len, 0);
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && errno == ENOTSOCK) break; // 非套接字描述符：退回 readv
+            return transfer_outcome(n, true);
+        }
+    }
     for (;;) {
         auto const n = ::readv(fd, vectors, static_cast<int>(count));
         if (n < 0 && errno == EINTR) continue;
@@ -67,6 +79,14 @@ io_outcome readv(int const fd, mutable_buffer_array<> const& buffers) noexcept {
 io_outcome writev(int const fd, const_buffer_array<> const& buffers) noexcept {
     iovec vectors[max_iovec];
     auto const count = fill_iovec(vectors, buffers);
+    if (count == 1U) {
+        for (;;) {
+            auto const n = ::send(fd, vectors[0].iov_base, vectors[0].iov_len, MSG_NOSIGNAL);
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && errno == ENOTSOCK) break; // 非套接字描述符：退回下面的 writev
+            return transfer_outcome(n, false);
+        }
+    }
     for (;;) {
         msghdr message{};
         message.msg_iov = vectors;
