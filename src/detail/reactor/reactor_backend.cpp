@@ -307,17 +307,13 @@ long long reactor_backend::wait_timeout_ns(long const limit_ms) const noexcept {
 }
 
 void reactor_backend::arm_timer_fd_locked() noexcept {
-    // 锁内。
-    if (timers_.empty()) {
-        if (armed_) {
-            itimerspec const disarm{};
-            ::timerfd_settime(timer_fd_, 0, &disarm, nullptr);
-            armed_ = false;
-        }
-        return;
-    }
+    // 锁内。timerfd 只需保证"不晚于堆顶到期"叫醒：已经武装在一个不晚于堆顶的时刻就不动它——过早醒来一次
+    // 是空转，重新武装是一次系统调用。每次读都套超时的服务器里堆顶每趟往返都往后挪，原先每趟一次
+    // timerfd_settime，现在稳态下每个超时周期一次。堆空时也不解除武装：留着的那次到期最多带来一次空唤醒
+    //（到期时 run() 读掉它、armed_ 置假），下一次有定时器再按堆顶武装。
+    if (timers_.empty()) return;
     auto const expiry = timers_.front()->expiry;
-    if (armed_ && expiry == armed_expiry_) return;
+    if (armed_ && armed_expiry_ <= expiry) return;
     // steady_clock 在 Linux/libstdc++ 上就是 CLOCK_MONOTONIC：直接用绝对时间。
     auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(expiry.time_since_epoch()).count();
     if (ns <= 0) ns = 1; // it_value 全零表示解除武装；过去的时刻立刻到期
