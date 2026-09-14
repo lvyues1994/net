@@ -72,6 +72,8 @@ native_file_type iocp_file::release() noexcept {
     auto const h = handle_;
     handle_ = INVALID_HANDLE_VALUE;
     skip_on_success_ = false;
+    // 同 iocp_socket::release：没有在飞的操作才解除端口关联（见 iocp_backend::dissociate 的前置条件）。
+    if (file_is_valid(h) && not read_.pending && not write_.pending) iocp_backend::dissociate(h);
     return h;
 }
 

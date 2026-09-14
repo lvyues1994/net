@@ -79,6 +79,44 @@ std::error_code iocp_backend::associate(HANDLE const handle) noexcept {
     return {};
 }
 
+namespace {
+
+// ntdll 的 NtSetInformationFile；winternl.h 里没有 FileReplaceCompletionInformation（61），自己声明最小的几样。
+struct nt_io_status_block {
+    union {
+        LONG status;
+        PVOID pointer;
+    };
+    ULONG_PTR information;
+};
+
+struct nt_file_completion_information {
+    HANDLE port;
+    PVOID key;
+};
+
+constexpr ULONG file_replace_completion_information = 61;
+
+using nt_set_information_file_fn = LONG(NTAPI*)(HANDLE, nt_io_status_block*, PVOID, ULONG, ULONG);
+
+nt_set_information_file_fn load_nt_set_information_file() noexcept {
+    auto const ntdll = ::GetModuleHandleW(L"ntdll.dll");
+    if (ntdll == nullptr) return nullptr;
+    // FARPROC → 具体函数指针要经 void(*)() 两步转换，直接转 MinGW 报 -Wcast-function-type。
+    return reinterpret_cast<nt_set_information_file_fn>(
+        reinterpret_cast<void (*)()>(::GetProcAddress(ntdll, "NtSetInformationFile")));
+}
+
+} // namespace
+
+bool iocp_backend::dissociate(HANDLE const handle) noexcept {
+    static nt_set_information_file_fn const set_information_file = load_nt_set_information_file();
+    if (set_information_file == nullptr) return false;
+    nt_io_status_block status{};
+    nt_file_completion_information info{nullptr, nullptr}; // 端口为空：解除关联
+    return set_information_file(handle, &status, &info, sizeof(info), file_replace_completion_information) == 0;
+}
+
 std::unique_ptr<socket_impl> iocp_backend::create_socket(io_context& context) {
     return std::unique_ptr<socket_impl>{new iocp_socket{context, *this}};
 }

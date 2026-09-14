@@ -43,6 +43,11 @@ struct iocp_backend final : execution_context::service, io_backend, timer_schedu
     HANDLE port() const noexcept { return port_; }
     // 把句柄挂到端口上（一个句柄只能挂一次）。
     std::error_code associate(HANDLE handle) noexcept;
+    // 把句柄从端口上摘下来（release() 用）：公开 API 里没有这个操作，只有 NtSetInformationFile 的
+    // FileReplaceCompletionInformation 能做到——Corosio 的 win_dissociate 同一招。返回是否成功；失败时句柄
+    // 仍挂在端口上，再 adopt 进别的 io_context 会 ERROR_INVALID_PARAMETER。
+    // 前置条件：句柄上没有在飞的操作——摘下之后完成（包括取消的完成）不再投到端口，等它的协程就永远不恢复。
+    static bool dissociate(HANDLE handle) noexcept;
 
     bool add_timer(timer_op& op) noexcept override;
     bool cancel_timer(timer_op& op, bool from_stop_token) noexcept override;

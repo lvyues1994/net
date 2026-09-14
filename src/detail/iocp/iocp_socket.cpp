@@ -228,7 +228,11 @@ native_socket_type iocp_socket::release() noexcept {
     fd_ = invalid_socket;
     skip_on_success_ = false;
     listener_nonblocking_ = false;
-    return s; // 仍挂在端口上（Windows 不允许解除关联）
+    // 没有在飞的操作时把套接字从端口上摘下来，之后它可以 adopt 进别的 io_context。有在飞的操作（刚
+    // CancelIoEx，取消完成还没到）就不能摘：摘了之后完成包不再投到端口，等它的协程永远不恢复——那种情形
+    // 保持原样（仍挂在端口上，取消完成照常到达）。
+    if (socket_is_valid(s) && not read_op_.pending && not write_op_.pending) iocp_backend::dissociate(reinterpret_cast<HANDLE>(s));
+    return s;
 }
 
 // ---- 记参数 ----
