@@ -251,6 +251,13 @@ elseif(NOT NET_DEFAULT_FRAME_ALLOCATOR STREQUAL "new_delete")
     message(FATAL_ERROR "NET_DEFAULT_FRAME_ALLOCATOR must be new_delete or recycling")
 endif()
 
+# 协程帧里内联 awaiter 槽的字节数（co2 的 CO2_AWAIT_STORAGE_SIZE，默认 64）。放不进槽的 awaiter 由 co2 堆分配。
+# net 的组合算法 read / write、run()、when_all 的 awaiter 都在 100–160 字节：192 让它们全部内联、零分配，
+# 代价是每个协程帧多 128 字节。co2 是纯头文件库，这个值必须在所有翻译单元一致，所以作为 PUBLIC 定义
+# 随 net::net 传给消费方。
+set(NET_AWAIT_STORAGE_SIZE 192 CACHE STRING "Inline awaiter slot size per coroutine frame (CO2_AWAIT_STORAGE_SIZE)")
+target_compile_definitions(net PUBLIC CO2_AWAIT_STORAGE_SIZE=${NET_AWAIT_STORAGE_SIZE})
+
 option(NET_BUILD_TESTS "Build net tests" ${NET_BUILD_TESTS_DEFAULT})
 option(NET_BUILD_EXAMPLES "Build net examples" ${NET_BUILD_EXAMPLES_DEFAULT})
 option(NET_BUILD_BENCHMARKS "Build net performance benchmarks" OFF)

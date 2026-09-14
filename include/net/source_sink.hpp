@@ -231,8 +231,9 @@ template <class Stream> struct stream_read_source {
         return stream_->read_some(buffers);
     }
 
-    template <class MutableBufferSequence> task<io_result<std::size_t>> read(MutableBufferSequence const& buffers) {
-        return net::read(*stream_, buffers); // 序列按值进入 net::read 的帧：任意多个缓冲区都覆盖
+    template <class MutableBufferSequence>
+    auto read(MutableBufferSequence const& buffers) -> decltype(net::read(std::declval<Stream&>(), buffers)) {
+        return net::read(*stream_, buffers); // 序列按值进入 net::read 的 awaiter：任意多个缓冲区都覆盖
     }
 
     Stream& next_layer() noexcept { return *stream_; }
@@ -252,7 +253,8 @@ template <class Stream> struct stream_write_sink {
         return stream_->write_some(buffers);
     }
 
-    template <class ConstBufferSequence> task<io_result<std::size_t>> write(ConstBufferSequence const& buffers) {
+    template <class ConstBufferSequence>
+    auto write(ConstBufferSequence const& buffers) -> decltype(net::write(std::declval<Stream&>(), buffers)) {
         return net::write(*stream_, buffers);
     }
 
