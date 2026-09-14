@@ -34,6 +34,11 @@ struct io_backend;
 struct io_context_access;
 } // namespace detail
 
+// 一个 execution_context 若是 io_context 则返回它，否则空。timeout() / delay() 这类只拿到 io_env
+// 里 executor_ref 的组件用它找到定时器所属的 io_context（execution_context 没有虚函数，不能 dynamic_cast）。
+struct io_context;
+io_context* io_context_of(execution_context& context) noexcept;
+
 // concurrency_hint 的特殊值（对应 Asio 的 BOOST_ASIO_CONCURRENCY_HINT_UNSAFE）：调用方**承诺**只有
 // 一个线程会调用 run() / run_one() / poll() 系列函数，而且始终是同一个线程。后端据此启用单线程
 // 优化——io_uring 以 IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN 创建（内核省掉 SQ

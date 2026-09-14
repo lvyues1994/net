@@ -19,7 +19,9 @@
 #include "net/stream.hpp"
 #include "net/task.hpp"
 #include "net/tcp.hpp"
+#include "net/timeout.hpp"
 #include "net/timer.hpp"
+#include "net/when_any.hpp"
 
 #include "bench.hpp"
 
@@ -136,6 +138,35 @@ auto ping_some_n(net::tcp_socket* sock, std::size_t size, std::size_t n)
 }
 CO2_END
 
+// 带超时的往返：客户端每次读都套一个 1 s 的时限（从不触发）。两种写法——timeout() 专用 awaiter 对
+// when_any(read, timer.wait()) 组合子——差的是每次读多付的定时器与帧。
+auto ping_with_timeout_n(net::tcp_socket* sock, std::size_t size, std::size_t n)
+    CO2_BEG(net::task<>, (sock, size, n), std::vector<char> buf; std::size_t i{}; net::io_result<std::size_t> r;
+            net::io_result<std::size_t> w;) {
+    buf.assign(size, 'x');
+    for (i = 0; i != n; ++i) {
+        CO2_AWAIT_SET(w, sock->write_some(net::buffer(buf)));
+        if (w.ec) break;
+        CO2_AWAIT_SET(r, net::timeout(sock->read_some(net::buffer(buf)), std::chrono::seconds{1}));
+        if (r.ec) break;
+    }
+}
+CO2_END
+
+auto ping_with_when_any_n(net::io_context* ctx, net::tcp_socket* sock, std::size_t size, std::size_t n)
+    CO2_BEG(net::task<>, (ctx, sock, size, n), std::vector<char> buf; std::size_t i{}; net::steady_timer timer{*ctx};
+            net::when_any_result<std::tuple<std::size_t, std::tuple<>>> r; net::io_result<std::size_t> w;) {
+    buf.assign(size, 'x');
+    for (i = 0; i != n; ++i) {
+        CO2_AWAIT_SET(w, sock->write_some(net::buffer(buf)));
+        if (w.ec) break;
+        timer.expires_after(std::chrono::seconds{1});
+        CO2_AWAIT_SET(r, net::when_any(sock->read_some(net::buffer(buf)), timer.wait()));
+        if (r.ec || r.index != 0U) break;
+    }
+}
+CO2_END
+
 // 单向吞吐：发送方连续写 total 字节，接收方读完。
 auto send_total(net::tcp_socket* sock, std::size_t chunk, std::size_t total)
     CO2_BEG(net::task<>, (sock, chunk, total), std::vector<char> buf; std::size_t sent{}; net::io_result<std::size_t> w;) {
@@ -220,6 +251,28 @@ void bench_backend(bench::options const& o, net::backend_kind const kind, std::v
                                          pair.ctx.run();
                                      },
                                      "no composed-op frames: the gap to the row above is net::read / net::write"));
+    }
+
+    {
+        connected_pair pair{kind};
+        results.push_back(bench::run(o, name + ": tcp echo round trip, 64 B, read under timeout()", o.scale(20000U),
+                                     [&](std::size_t n) {
+                                         net::run_async(pair.ctx.get_executor())(echo_some_n(&pair.server, 64U, n));
+                                         net::run_async(pair.ctx.get_executor())(ping_with_timeout_n(&pair.client, 64U, n));
+                                         pair.ctx.run();
+                                     },
+                                     "a 1 s deadline armed and cancelled per read"));
+    }
+
+    {
+        connected_pair pair{kind};
+        results.push_back(bench::run(o, name + ": tcp echo round trip, 64 B, read under when_any(read, timer)", o.scale(20000U),
+                                     [&](std::size_t n) {
+                                         net::run_async(pair.ctx.get_executor())(echo_some_n(&pair.server, 64U, n));
+                                         net::run_async(pair.ctx.get_executor())(ping_with_when_any_n(&pair.ctx, &pair.client, 64U, n));
+                                         pair.ctx.run();
+                                     },
+                                     "same deadline via the when_any combinator"));
     }
 
     {

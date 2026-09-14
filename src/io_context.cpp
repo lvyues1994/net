@@ -354,8 +354,26 @@ io_context::io_context() : io_context(default_backend_t::kind, 1) {}
 
 io_context::io_context(int const concurrency_hint) : io_context(default_backend_t::kind, concurrency_hint) {}
 
+namespace {
+
+// io_context 在自己的服务表里登记这个标记：io_context_of 靠它把 execution_context& 认回 io_context*。
+struct io_context_marker final : execution_context::service {
+    explicit io_context_marker(execution_context& owner) noexcept : context{static_cast<io_context*>(&owner)} {}
+    void shutdown() override {}
+    io_context* context;
+};
+
+} // namespace
+
 io_context::io_context(backend_kind const backend, int const concurrency_hint)
-    : impl_{new impl{*this, backend, concurrency_hint}} {}
+    : impl_{new impl{*this, backend, concurrency_hint}} {
+    make_service<io_context_marker>();
+}
+
+io_context* io_context_of(execution_context& context) noexcept {
+    if (not context.has_service<io_context_marker>()) return nullptr;
+    return context.use_service<io_context_marker>().context;
+}
 
 io_context::~io_context() {
     shutdown();

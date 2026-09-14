@@ -12,6 +12,7 @@ set(net_test_sources
 set(net_platform_test_sources
     combinator_tests.cpp
     timer_tests.cpp
+    timeout_tests.cpp
     tcp_tests.cpp
     udp_tests.cpp
     resolver_tests.cpp
