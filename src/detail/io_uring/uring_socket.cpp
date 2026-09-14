@@ -238,10 +238,15 @@ std::error_code uring_socket::adopt(int const family, int const type, int, int c
     if (fd_ >= 0) return make_error_code(error::already_open);
     fd_ = fd;
     family_ = family;
-    file_slot_ = backend_->register_file(fd);
+    submitted_ = 0U; // 注册推迟到提交过 lazy_registration_threshold 个 SQE 之后（见头文件）
     // 接管一个已在监听的描述符：像 listen() 一样武装多发 accept。
     if (type == SOCK_STREAM && fd_is_listening(fd)) arm_multishot_accept();
     return {};
+}
+
+void uring_socket::ensure_registered() noexcept {
+    if (file_slot_ >= 0 || fd_ < 0) return;
+    file_slot_ = backend_->register_file(fd_);
 }
 
 std::error_code uring_socket::listen(int const backlog) noexcept {
@@ -254,6 +259,7 @@ void uring_socket::arm_multishot_accept() noexcept {
     if (not multishot_accept_supported()) return;
     if (not acceptor_) acceptor_.reset(new acceptor_state{});
     if (acceptor_->op) return;
+    ensure_registered(); // 监听套接字长寿：立刻进表
     acceptor_->op.reset(new uring_multishot_accept_op{*this, fd_, file_slot_});
     acceptor_->armed = true;
     if (not backend_->submit(*acceptor_->op)) acceptor_->op.reset(); // 上下文已 shutdown
@@ -353,6 +359,7 @@ int uring_socket::release() noexcept {
 std::unique_ptr<receive_stream_impl> uring_socket::create_receive_stream(std::size_t const buffer_count,
                                                                          std::size_t const buffer_size) {
     if (fd_ < 0 || not multishot_recv_supported()) return nullptr;
+    ensure_registered(); // 常驻的多发接收：长寿，立刻进表
     std::unique_ptr<uring_receive_stream> stream{new uring_receive_stream{*context_, *backend_, fd_, file_slot_, buffer_count, buffer_size}};
     if (not stream->valid()) return nullptr; // 环注册失败（内核 / 额度）：回退
     return std::unique_ptr<receive_stream_impl>{stream.release()};
@@ -639,6 +646,9 @@ coroutine_handle<> uring_socket::suspend(op_direction const direction, coroutine
         acceptor_->waiting = true;
         return noop_coroutine();
     }
+    // 第 lazy_registration_threshold 个提交：这个套接字活得够久，进注册文件表，本次及之后的 SQE 以
+    // IOSQE_FIXED_FILE 引用（prepare() 在 submit 里读 file_slot_）。
+    if (file_slot_ < 0 && ++submitted_ == lazy_registration_threshold) ensure_registered();
     // submit 之后不能再碰 env 与 op：别的线程可能已经完成操作、恢复并结束协程。提交前到达的
     // 停止请求由 cancel 记为 cancel_requested，submit 返回 false。
     if (not backend_->submit(op)) {

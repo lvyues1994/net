@@ -210,11 +210,20 @@ struct uring_socket final : socket_impl {
     void arm_multishot_accept() noexcept;
     void retire_multishot_accept() noexcept;
     void close_parked_fds() noexcept;
+    // 进注册文件表（已在表里 / 表满 / 内核不支持则无操作）。
+    void ensure_registered() noexcept;
+
+    // 注册文件表的账：进表、出表各一次 io_uring_register（每次约 1 µs，比一次 connect 贵），省的是之后每个
+    // SQE 的 fdget / fdput（几十 ns）。所以不在 open 时注册，而是等这个套接字提交过这么多 SQE 再进表——
+    // 短连接（connect+accept 基准里每条 4 次 register 占该场景 24% 内核时间）从不进表，长连接照旧受益。
+    // 监听套接字与多发接收流一开始就注册：它们天生长寿。
+    static constexpr unsigned lazy_registration_threshold = 32U;
 
     io_context* context_;
     uring_backend* backend_;
     int fd_ = -1;
     int file_slot_ = -1; // 注册文件表槽位（-1：用裸 fd）
+    unsigned submitted_ = 0U; // 已提交的 SQE 数（懒注册的计数）
     int family_ = 0;
     speculation_state speculation_;
     uring_socket_op read_op_;
