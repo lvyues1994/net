@@ -303,7 +303,7 @@ jobs:
       - name: Install packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build libssl-dev libboost-dev
+          sudo apt-get install -y ninja-build libssl-dev libboost-dev libuv1-dev
 
       - name: Configure
         run: |
@@ -326,6 +326,7 @@ jobs:
             ./bench_net --quick
             ./bench_tls --quick
             [ -x ./bench_asio ] && ./bench_asio --quick
+            [ -x ./bench_libuv ] && ./bench_libuv --quick
           } | tee ../../benchmark-results.txt
           {
             echo '## Benchmarks (quick mode, shared CI runner: numbers are indicative only)'
@@ -334,7 +335,81 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # 回归门：与 main 上最近一次成功运行的 artifact 逐行比，ns/op 退化超过 15% 发 warning 注解（不让作业失败：
+      # 共享 runner 的噪声就有 ±10%，连续两次超阈值才值得追）。
+      - name: Fetch previous results
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run_id=$(gh run list --workflow ci.yml --branch main --status success --limit 1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || true)
+          if [ -n "$run_id" ]; then
+            gh run download "$run_id" -n benchmark-results -D previous || echo "no benchmark-results artifact on run $run_id"
+          else
+            echo "no previous successful run on main"
+          fi
+
+      - name: Compare with previous
+        run: python3 .github/scripts/compare_benchmarks.py previous/benchmark-results.txt benchmark-results.txt --threshold 0.15 >> "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/upload-artifact@v4
         with:
           name: benchmark-results
           path: benchmark-results.txt
+
+  coverage:
+    name: Coverage (gcovr)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out co2
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CO2_REPOSITORY }}
+          ref: ${{ env.CO2_REF }}
+          path: co2
+
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libssl-dev
+          pip install gcovr
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="--coverage -O0" \
+            -DCMAKE_EXE_LINKER_FLAGS="--coverage" \
+            -DNET_CO2_DIR=$GITHUB_WORKSPACE/co2 \
+            -DNET_TLS_PROVIDER=OpenSSL \
+            -DNET_BUILD_EXAMPLES=OFF
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --timeout 120
+
+      # 只统计本库的 include/ 与 src/（不含 co2、系统头、测试本身）。
+      - name: Report
+        run: |
+          gcovr --root . --filter include/ --filter src/ \
+            --exclude-unreachable-branches --exclude-throw-branches \
+            --print-summary \
+            --xml coverage.xml --html-details coverage/index.html \
+            --txt coverage.txt
+          {
+            echo '## Coverage (gcovr, GCC Debug, all Linux backends)'
+            echo '```'
+            cat coverage.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            coverage.xml
+            coverage.txt
+            coverage/
