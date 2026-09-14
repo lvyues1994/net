@@ -3,8 +3,9 @@
 `net` 是一个 C++14 的协程原生 I/O 库，实现 WG21 "Network Endeavor" 系列提案
 （P4003R3《A Minimal Coroutine Execution Model》、P4172R1、P4100R1、P4124R0）描述的
 **IoAwaitable 协议**及其上的 `task<T>`、启动函数、执行器、缓冲区、流概念、组合子，
-以及 Linux 平台层：`io_context`（epoll / poll / select / io_uring 四种后端）、TCP/UDP
-套接字、定时器、DNS、信号，和 TLS 传输安全包装器（OpenSSL / BoringSSL 两个提供者）。
+以及平台层：`io_context`（Linux 上 epoll / poll / select / io_uring 四种后端，Windows 上 IOCP）、
+TCP/UDP 套接字、Unix 域套接字、文件、定时器、DNS、信号，和 TLS 传输安全包装器（OpenSSL / BoringSSL /
+wolfSSL 三个提供者）。
 
 无栈协程由姊妹库 [co2](../../coro/coro)（C++14 宏生成的状态机，协议与 C++20 协程
 规范同形）提供：提案里写 `co_await f()` 的地方，这里写 `CO2_AWAIT(f())`。
@@ -135,9 +136,11 @@ ctest --test-dir build --output-on-failure
 
 | 选项 | 默认 | 说明 |
 | --- | --- | --- |
-| `NET_TLS_PROVIDER` | `OpenSSL` | `OpenSSL`（`find_package`）/ `BoringSSL` / `OFF` |
+| `NET_TLS_PROVIDER` | `OpenSSL` | `OpenSSL`（`find_package`）/ `BoringSSL` / `wolfSSL` / `OFF` |
 | `NET_BORINGSSL_ROOT` | 空 | 现成的 BoringSSL 安装根（`include/`、`lib/`）；为空则 FetchContent 从源码构建（`NET_BORINGSSL_GIT_TAG`，无需 Go / Perl） |
+| `NET_WOLFSSL_GIT_TAG` | `v5.8.2-stable` | wolfSSL 经 FetchContent 从源码构建（要 OpenSSL 兼容层那组开关，发行版的包不带） |
 | `NET_DEFAULT_FRAME_ALLOCATOR` | `new_delete` | 上下文默认帧分配器：`new_delete` 或 `recycling`（见下文"性能"） |
+| `NET_AWAIT_STORAGE_SIZE` | `192` | 协程帧里内联 awaiter 槽的字节数（co2 的 `CO2_AWAIT_STORAGE_SIZE`）；`read` / `write` / `run` / `when_all` 的 awaiter 都在此内，放不下的由 co2 堆分配。PUBLIC 定义，随 `net::net` 传给消费方 |
 | `NET_BUILD_TESTS` / `NET_BUILD_EXAMPLES` / `NET_BUILD_BENCHMARKS` | ON / ON / OFF | 作为子项目时测试与示例默认关闭 |
 
 Windows（MSVC，Visual Studio 生成器是多配置的）：
@@ -182,7 +185,7 @@ OpenSSL 与 BoringSSL 两个提供者下通过。TSan 只抑制未插桩的 libc
 （`tests/tsan.supp`）。
 
 CI（`.github/workflows/ci.yml`）：GCC / Clang × Debug / Release × 两种默认帧分配器的构建与
-测试、ASan+UBSan 与 TSan 全量运行、BoringSSL 提供者作业（FetchContent 构建并缓存）、quick 模式
+测试、ASan+UBSan 与 TSan 全量运行、BoringSSL 与 wolfSSL 提供者作业（FetchContent 构建并缓存）、quick 模式
 基准（结果写入 step summary 并上传 artifact），以及 MSVC × Debug / Release 的 IOCP 作业
 （windows-latest，runner 自带的 OpenSSL 3；cl 的诊断经 `.github/matchers/msvc.json`、ctest 失败经
 `.github/scripts/annotate_ctest.py` 变成注解，公开仓库匿名可读）。
@@ -195,25 +198,28 @@ CI（`.github/workflows/ci.yml`）：GCC / Clang × Debug / Release × 两种默
 ## 性能
 
 `benchmarks/`（`-DNET_BUILD_BENCHMARKS=ON`，Release；`--quick` 供 CI）。无第三方依赖的小
-harness：多轮取中位数，全局 `operator new` 计数给出 allocs/op。**与 Boost.Asio 的逐行对照
-（callbacks 与 C++20 awaitable 两种写法）见 `docs/benchmarks.md`**：协程机制与执行器 hop 同一
-量级或更快（启动一条链快 3 倍），定时器快 20%，TCP 往返慢 10–15%（系统调用数相同，差在每次
-完成经 io_context 互斥锁三次；Asio 用线程局部私有队列 + 原子工作计数——已列为下一步优化）。
-i7-13700KF、GCC 13 -O3、Linux 7.0，单线程：
+harness：多轮取中位数，全局 `operator new` 计数给出 allocs/op，`getrusage` 给出每操作的用户态 / 内核态
+CPU。**与 Boost.Asio（callbacks 与 C++20 awaitable 两种写法）和 libuv 的逐行对照见 `docs/benchmarks.md`**：
+协程机制与执行器 hop 同一量级或更快（启动一条链快 3.5 倍），定时器快 20–25%，64 B 回环往返 epoll 比 Asio
+callbacks 慢 4%、io_uring 慢 2%，两者都快过 Asio 的 awaitable，每趟往返零分配。2026-09 这一轮把往返从慢 18% 收到
+4% 的三处改动，每处都有同一会话的 A/B：单缓冲传输用 `recv` / `send` 而不是 `readv` / `sendmsg`（−280 ns，内核时间
+追平 Asio）、`net::read` / `net::write` 改成无帧 awaiter（−200 ns，4 allocs → 0）、io_uring 套接字懒注册文件表
+（connect + accept −7%）；`io_context` 的私有队列 + 原子工作计数对单线程往返是中性的。
+i7-13700KF、GCC 13 -O3、Linux 7.0，单线程，`taskset -c 6`，2026-09-15：
 
 | 核心路径（`bench_core`） | ns/op | allocs/op |
 | --- | --- | --- |
-| `read_some`：原生（具体类型） | 2.4 | 0 |
-| `read_some`：抽象（对 `Stream` 的模板） | 2.3 | 0 |
-| `read_some`：类型擦除（`any_stream&`） | 17.8 | 0 |
-| task 等待子 task（对称转移 + 一个子帧） | 15.2 | 1（默认 `new_delete`；`recycling` 为 0） |
-| `io_context` post 一跳 | 12.8 | 0 |
-| strand post 一跳 | 58.1 | 0 |
-| `thread_pool` post 一跳（池线程内） | 87.0 | 0 |
-| `run_async` + `run()` 往返 | 49.5 | 2 |
-| `when_all` 两个就绪 task | 137.0 | 6 |
-| 85 帧 task 树：`recycling_memory_resource` | 1594 | 0 |
-| 85 帧 task 树：`new_delete_resource` | 1433 | 85 |
+| `read_some`：原生（具体类型） | 2.5 | 0 |
+| `read_some`：抽象（对 `Stream` 的模板） | 2.5 | 0 |
+| `read_some`：类型擦除（`any_stream&`） | 19.0 | 0 |
+| task 等待子 task（对称转移 + 一个子帧） | 14.7 | 1（默认 `new_delete`；`recycling` 为 0） |
+| `io_context` post 一跳 | 13.0 | 0 |
+| strand post 一跳 | 54.7 | 0 |
+| `thread_pool` post 一跳（池线程内） | 23.5 | 0 |
+| `run_async` + `run()` 往返 | 49.9 | 2 |
+| `when_all` 两个就绪 task | 131.7 | 6 |
+| 85 帧 task 树：`recycling_memory_resource` | 1449 | 0 |
+| 85 帧 task 树：`new_delete_resource` | 1393 | 85 |
 
 对照 P4088R1 §1.1 的表（原生 31.4 / 抽象 32.1 / 类型擦除 36.4 ns，均 0 分配）：类型擦除的
 `any_stream` 同样是零每操作分配，代价是一次 vtable 派发加就地构造 awaitable。
@@ -226,22 +232,25 @@ i7-13700KF、GCC 13 -O3、Linux 7.0，单线程：
 
 | 后端回环（`bench_net`） | epoll | poll | select | io_uring |
 | --- | --- | --- | --- | --- |
-| TCP 回显往返 64 B（µs） | 4.18 | 4.54 | 5.28 | 4.03 |
-| TCP 回显往返 4 KiB（µs） | 4.60 | 5.01 | 5.71 | 4.49 |
-| TCP 吞吐，64 KiB 写（MiB/s，3 次运行） | 9874–10442 | ≈10000 | ≈9800 | 10192–10847 |
-| 定时器到期 + 恢复（µs） | 1.53 | 1.56 | 1.90 | 1.38 |
+| TCP 回显往返 64 B（µs，0 allocs） | 3.12 | 3.48 | 4.23 | 3.06 |
+| TCP 回显往返 4 KiB（µs） | 3.54 | 3.91 | 4.63 | 3.47 |
+| TCP 吞吐，64 KiB 写（MiB/s） | 11102 | 11099 | 11137 | 11340 |
+| TCP connect + accept（µs） | 8.51 | 8.30 | 8.62 | 7.12 |
+| 定时器到期 + 恢复（µs） | 1.54 | 1.58 | 1.93 | 1.39 |
 
-吞吐行的差别在噪声内（单次运行波动 ±5%，瓶颈是内核回环路径的两次拷贝）；往返与定时器行
+吞吐行的差别在噪声内（瓶颈是内核回环路径的两次拷贝）；往返、connect+accept 与定时器行
 io_uring 领先，是把它按 Corosio（参考实现）的做法对齐之后的结果，`strace -c` 可验证
-（`bench_net --backend io_uring`）：同一 quick 基准全程 epoll 133k 次系统调用，io_uring 92k。
+（`bench_net --backend io_uring`）：5 101 趟 64 B 往返 epoll 4.1 万次系统调用，io_uring 2.1 万。
 对齐的五点见 `docs/backends.md`——提交推迟到 `run()` 与等待合并成一次 `io_uring_enter`、
-自适应投机（连续 EAGAIN 后不再白跑 `read`，直接走完成型路径）、`net::single_thread_hint` 下
+自适应投机（连续 EAGAIN 后不再白跑 `recv`，直接走完成型路径）、`net::single_thread_hint` 下
 的 `SINGLE_ISSUER | DEFER_TASKRUN`、多发 POLL_ADD 唤醒、多发 accept（`listen()` 武装一个
-`IORING_ACCEPT_MULTISHOT` SQE，连接先于 `accept()` 到达时停在 parked 队列里）。顺带修了两处影响所有后端的浪费：
+`IORING_ACCEPT_MULTISHOT` SQE，连接先于 `accept()` 到达时停在 parked 队列里）；注册文件表对套接字懒注册
+（提交过 32 个 SQE 才进表，短连接不为进表 / 出表的两次 `io_uring_register` 付费）。顺带修过两处影响所有后端的浪费：
 `io_context` 在 `run()` 线程自己 post 续体时会向自己写 eventfd（每次完成多 1 写 2 读），
 以及就绪型后端的定时器把到期向上取整到毫秒、又被这次自打断掩盖——现在最早到期经
-timerfd（hrtimer，不受 50 µs timer slack 影响）送进解复用器。io_uring 尚未使用的：多发
-recv、注册缓冲区、零拷贝发送。TLS 的数字（OpenSSL 与 BoringSSL 对照）见 `docs/tls.md`。
+timerfd（hrtimer，不受 50 µs timer slack 影响）送进解复用器。已知问题：4 个线程 `run()` 同一个就绪型
+`io_context` 对 32 条连接的 ping-pong 没有加速（单反应器 + 条件变量交接，每个续体只有 ~0.5 µs 工作），要吞吐得每线程
+一个 `io_context`。io_uring 尚未使用的：多发 recv 只在 `receive_source`、零拷贝发送。TLS 的数字见 `docs/tls.md`。
 
 ## 目录
 
@@ -254,15 +263,21 @@ src/detail/posix/       POSIX 系统调用封装（套接字与文件）
 src/detail/reactor/     就绪型后端族：reactor_backend + epoll / poll / select 解复用器；文件同步回退
 src/detail/io_uring/    完成型后端：裸系统调用的 io_uring 环、提交/取消/收割、套接字 / 文件 / 定时器实现
 src/detail/iocp/        完成型后端（Windows）：完成端口、WSARecv / WSASend / AcceptEx / ConnectEx、ReadFile / WriteFile 重叠 I/O
-src/tls/                TLS 引擎（OpenSSL API 子集，OpenSSL / BoringSSL 共用）与驱动协程
-benchmarks/             bench_core / bench_net / bench_tls / bench_asio（Boost.Asio 对照）与 harness
-docs/                   architecture.md（分层、决策、审查记录）、backends.md（后端设计与 io_uring / IOCP 接入）、tls.md、benchmarks.md（与 Asio 对照）
+src/tls/                TLS 引擎（OpenSSL API 子集，OpenSSL / BoringSSL / wolfSSL 共用）与驱动协程
+benchmarks/             bench_core / bench_net / bench_tls / bench_asio（Boost.Asio 对照）/ bench_libuv（libuv 对照）与 harness
+docs/                   architecture.md（分层、决策、审查记录）、backends.md（后端设计与 io_uring / IOCP 接入）、tls.md、benchmarks.md（与 Asio / libuv 对照）
 tests/  examples/  .github/workflows/ci.yml
 ```
 
 ## 尚未提供
 
-`system_context`、与 `std::execution` 的桥（P4092/P4093）、kqueue 后端（接缝已就位）、Windows 上的
-Unix 域套接字（afunix.h）与 IOCP 的投机路径（`FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`）、wolfSSL 提供者与
-TLS 的 PKCS#12 / CRL / SNI 服务端回调 / 会话复用（见 `docs/tls.md`）、文件操作的取消在就绪型后端上
-不可用（同步完成）、io_uring 文件读写不使用固定缓冲区 / 注册文件。
+对照 P4100R1 的 14 篇与 Corosio / Capy 的清单（2026-09）：
+
+- 提案形态：`system_context`（Paper 2）；`timer::cancel_one()`（Paper 8）；`signal_set` 的信号标志
+  `flags_t`（Paper 9）；`circular_dynamic_buffer`（Paper 5）；字节粒度的缓冲区切片 API（Paper 4，Capy 的
+  `buffer_slice` / `consuming_buffers`）；与 `std::execution` 的桥（P4092 / P4093）；P4100R1 §5.1 的 Asio 适配器。
+- 平台：kqueue 后端（接缝已就位，无 macOS CI）；Windows 上的 Unix 域数据报套接字与抽象命名空间；文件操作
+  的取消在就绪型后端上不可用（同步完成）；IOCP 的 `release()` 只在没有在飞操作时解除端口关联。
+- TLS：PKCS#12；`shutdown()` 与挂起读的重叠；验证回调只暴露 `native_handle()`（见 `docs/tls.md`）。
+- Corosio / Capy 有的便利层：`timeout()` / `delay()`、范围 `connect(socket, endpoints)`、`tcp_server`、
+  `local_connect_pair`、`message_flags`、公开的测试替身、`async_mutex` / `async_event` / `work_guard`、内联完成预算。

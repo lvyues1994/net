@@ -62,7 +62,8 @@ struct stream {
     // 再次调用等价于先 reset() 再握手。
     virtual task<io_result<>> handshake(role r) = 0;
 
-    // 发送 close_notify 并等待对端的 close_notify。可与一个挂起的读重叠。
+    // 发送 close_notify 并等待对端的 close_notify。它也要读底层流，所以不能与一个挂起的读重叠
+    //（Corosio 允许；这里先让读以 eof 结束再 shutdown，或只在写侧调用并让对端先关）。
     virtual task<io_result<>> shutdown() = 0;
 
     // 释放会话状态，回到可以再次 handshake() 的状态。前置条件：没有操作在进行。

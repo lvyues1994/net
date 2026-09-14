@@ -230,6 +230,20 @@ io_uring 378k → 92k。多发 accept：`tcp_tests_io_uring` 的 42 次成功 ac
   都在环锁内；普通操作的完成仍在锁外。锁序是环锁 → acceptor 锁 → io_context 锁，`accept()`
   一侧只拿 acceptor 锁，退回一次性提交时用 `submit_locked`（已持环锁）。
 
+### 注册文件表与固定缓冲表
+
+环创建时注册一张 4096 项的稀疏文件表（`IORING_REGISTER_FILES2`）和一张稀疏缓冲表
+（`IORING_REGISTER_BUFFERS2`）；老内核不支持就不用，读写照常走裸 fd / 普通缓冲区。
+
+- **文件表**：SQE 以 `IOSQE_FIXED_FILE` + 槽位号引用描述符，省掉每个请求的 `fdget` / `fdput`。进表、出表
+  各一次 `io_uring_register(FILES_UPDATE2)`，每次约 1 µs——比省下的每 SQE 几十 ns 贵得多，所以**套接字懒注册**：
+  提交过 32 个 SQE 才进表（`uring_socket::lazy_registration_threshold`），短连接从不进表（connect + accept
+  基准上原先每条连接 4 次 register 占该场景 24% 内核时间，改后每连接快 7%），长连接照旧受益（64 B 往返约
+  快 25 ns）。监听套接字（多发 accept）与多发接收流一开始就注册；文件（`uring_file`）在打开时注册。
+- **缓冲表**：`io_context::register_buffer(region)` 把一块用户内存放进表；之后完全落在区域内的单缓冲
+  `read_some` / `write_some` / 文件读写走 `READ_FIXED` / `WRITE_FIXED`，省掉每次操作的页钉扎。这是优化提示：
+  不支持的后端返回 `not_supported`。
+
 ### 文件（Paper 10）与 Unix 域套接字
 
 - `file_impl` 是第二条接缝：`begin_read(offset, buffers)` / `begin_write(offset, buffers)` +
@@ -263,11 +277,12 @@ src/detail/iocp/
 
 与 io_uring 后端的差异：
 
-- **没有提交环**：发起就是系统调用，完成一定经端口到达——包括 `closesocket` / `CancelIoEx` 之后的
+- **没有提交环**：发起就是系统调用，完成经端口到达——包括 `closesocket` / `CancelIoEx` 之后的
   `ERROR_OPERATION_ABORTED`（995）。所以没有"提交前取消"的窗口要关；`suspend()` 在 WSA 调用返回
-  成功或 `WSA_IO_PENDING` 之后不再碰 op / env / this。同步完成的调用也会投完成包（没开
-  `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`），路径统一。发起立刻失败（其它错误码）时同步以错误恢复，
-  工作计数先加后减。
+  `WSA_IO_PENDING` 之后不再碰 op / env / this。关联端口后对 IFS 提供者开
+  `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`（libuv / Chromium 的做法，Asio 与 Corosio 不开）：同步返回 0 的
+  读写不投完成包，`issue()` 直接以结果完成，省一次端口往返；非 IFS 的 LSP 上不开，路径退回统一经端口。
+  发起立刻失败（其它错误码）时同步以错误恢复，工作计数先加后减。
 - **只有 accept 做投机**：监听套接字在第一次 `accept()` 时设为非阻塞（不影响重叠调用），`ready()` 里
   同步 `accept()`，队列里已有连接就不经过端口——与就绪型后端的 `accept4` 投机对齐，否则多个协程在
   同一接受器上"connect 完就 accept"会让第二个 `begin_accept` 撞上 one-op-per-direction 契约（Linux 上
@@ -285,8 +300,11 @@ src/detail/iocp/
 - **accept**：`begin_accept` 预建对端套接字（`WSASocketW(..., WSA_FLAG_OVERLAPPED)`），`AcceptEx` 带
   `sizeof(sockaddr_storage) + 16` 的地址缓冲，完成后 `SO_UPDATE_ACCEPT_CONTEXT`；对端在 `adopt` 时才挂到
   端口。没有多发 accept。
-- **取消**：`CancelIoEx(handle, &overlapped)`（stop_token）或 `CancelIoEx(handle, nullptr)`（`cancel()`）；
-  `release()` 后句柄仍挂在端口上（Windows 不允许解除关联）。
+- **取消**：`CancelIoEx(handle, &overlapped)`（stop_token）或 `CancelIoEx(handle, nullptr)`（`cancel()`）。
+- **`release()` 与端口关联**：公开 API 不能解除句柄与完成端口的关联；`iocp_backend::dissociate` 用
+  `NtSetInformationFile(FileReplaceCompletionInformation)` 把端口换成空（Corosio 的 `win_dissociate` 同一招），
+  之后句柄可以 `adopt` 进别的 `io_context`。只在没有在飞操作时做：摘下之后完成（包括取消的完成）不再投到
+  端口，等它的协程永远不恢复——有在飞操作的 `release()` 保持原样（仍挂在端口上，取消完成照常到达）。
 - **文件**：`ReadFile` 一次只有一个缓冲区，取序列里第一个非空的；越过文件尾的读同步返回
   `ERROR_HANDLE_EOF` → `eof`；`append` 用"只有 `FILE_APPEND_DATA` 没有 `FILE_WRITE_DATA`"的访问权限，
   内核忽略写偏移总是追加。

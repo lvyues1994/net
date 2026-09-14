@@ -128,11 +128,16 @@ tcache malloc 比任何带原子操作的回收器都快，所以 Linux 上默�
 `is_executor<E>` 以 SFINAE 检查 P4003R3 §4.3 的七条要求。`executor_ref` 是两指针的
 非拥有视图（`detail::executor_vtable_for<E>`），`any_executor` 是拥有型的。
 
-- `io_context`：互斥锁保护的侵入式 `continuation` 队列 + 工作计数 + 反应器。`run()`
+- `io_context`：互斥锁保护的侵入式 `continuation` 队列 + 原子工作计数 + 反应器。`run()`
   循环：有队列元素就 `safe_resume`；无工作则返回；否则一个线程进反应器
   （`epoll_wait`），其它线程等条件变量。`post` 叫醒空闲线程或（唯一的线程在
   `epoll_wait` 里时）写 eventfd 打断它。`dispatch` 在本线程正 `run()` 本上下文时直接
   返回 `c.h`。线程与上下文的关系用线程局部的调用栈记录（允许嵌套 `run()`）。
+  两处不进锁：`on_work_started` / `on_work_finished` 是原子加减，只有归零那一次进锁叫醒等待者；
+  线程在 `backend.run()` 里时后端 post 的续体进线程私有队列（不加锁、不叫醒——本线程回到 `do_one`
+  就会看到），`run()` 返回后在已持有的锁内整批接到全局队列（Asio 的 `private_op_queue`）。私有队列里的
+  续体预借一份工作计数，接入时归还，别的线程不会在它们可见之前看到"无工作"而返回。实测这两处对单线程
+  回环往返是中性的（不到 1%）——真正的差距在系统调用形态与组合算法的帧，见 `docs/benchmarks.md`。
 - `thread_pool`：固定线程数，同一份队列/工作计数模型；池自身持有一份初始工作直到
   `join()`。
 - `strand<Ex>`：互斥锁 + 侵入式队列 + 一个派发帧（completion_frame）。首个到达的续体
@@ -213,6 +218,19 @@ stop_callback（回调 `cancel_op`）、`start_op`；排队后复查 `stop_reque
 
 锁序：反应器锁 → 解复用器锁；反应器锁 → 信号状态锁 → io_context 队列锁。
 
+## 组合算法 read / write：没有帧的 awaiter
+
+`net::read(stream, buffers)` / `net::write` 不是协程。它们返回 `detail::transfer_awaitable`：
+`await_ready` 反复发起 `*_some`，就绪就取结果继续（推测成功的写、数据已到的读在这里整个完成，零挂起、
+零分配）；某一段要等待时，把一个 `completion_frame` 交给它当续体，完成后 `on_step` 取结果、发起下一段
+或对称转移回父协程。异常记进 `exception_ptr` 在 `await_resume` 重抛，与协程版本语义一致。
+
+awaiter 住在父协程帧的 awaiter 槽里。co2 的槽默认 64 字节，放不下就堆分配——所以 net 把
+`CO2_AWAIT_STORAGE_SIZE` 提到 192（`NET_AWAIT_STORAGE_SIZE`，PUBLIC 定义随 `net::net` 传播，co2 是纯头文件库，
+所有翻译单元一致即可）：单缓冲区的 `read` / `write`、`run()`、`when_all` 的 awaiter 全部内联。效果：64 B 回环
+往返从每趟 4 次帧分配到 0，用户态 CPU 少约 200 ns（`bench_net` 的 "read_some/write_some" 行给出无组合算法的下界，
+两行现在相差不到 50 ns）。`read_until` 仍是协程（要动态缓冲区与查找状态）。
+
 ## 流概念的第二族：源与汇（Paper 6）
 
 `stream.hpp` 是调用方拥有缓冲区的原语族（`read_some` / `write_some`）。`source_sink.hpp` 补上另外两组：
@@ -237,7 +255,7 @@ stop_callback（回调 `cancel_op`）、`start_op`；排队后复查 `stop_reque
 `await_ready` 时才构造（构造出来却没 `co_await` 的 awaitable 不花任何东西）。每个操作的表达式用
 `s()` / `args()` 写一次，既出现在 `decltype` 里（类作用域的静态函数声明）也出现在构造函数里（局部
 lambda）。涉及整个序列的 `read` / `write` / `write_eof(buffers)` 按 `max_iovec` 一窗穿过擦除边界
-（任意长的序列都覆盖，代价是一个组合协程帧，与 `net::read` 相同）。`any_buffer_source` 另外提供
+（任意长的序列都覆盖，代价是一个组合协程帧）。`any_buffer_source` 另外提供
 `read_some` / `read`，`any_buffer_sink` 另外提供 `write_some` / `write` / `write_eof`：被包装类型自己
 满足对应概念（vtable 槽位非空）就转发，否则用 `pull` / `consume` 或 `prepare` / `commit` 合成一次拷贝。
 
