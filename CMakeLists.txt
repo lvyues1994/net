@@ -281,3 +281,19 @@ install(TARGETS net EXPORT netTargets
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(EXPORT netTargets FILE netTargets.cmake NAMESPACE net::
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/net)
+
+# find_package(net CONFIG) 用的包配置：找齐依赖（Threads、co2、OpenSSL 提供者时的 OpenSSL）再导入目标。
+# 0.x 阶段不承诺跨 minor 兼容，版本文件只接受精确版本（与 co2 一致）。
+include(CMakePackageConfigHelpers)
+configure_package_config_file(
+    cmake/netConfig.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/netConfig.cmake
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/net)
+write_basic_package_version_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/netConfigVersion.cmake
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY ExactVersion)
+install(FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/netConfig.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/netConfigVersion.cmake
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/net)

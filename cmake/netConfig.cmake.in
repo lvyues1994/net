@@ -1,0 +1,16 @@
+@PACKAGE_INIT@
+
+# find_package(net CONFIG)：导入 net::net 及其依赖。co2 是纯头文件库，须已安装（find_package(co2) 能找到）；
+# TLS 只有 OpenSSL 提供者可以从安装树消费——BoringSSL / wolfSSL 经 FetchContent 构建，只在 net 自己的构建树里链接。
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+find_dependency(co2)
+
+set(NET_TLS_PROVIDER "@NET_TLS_PROVIDER@")
+if(NET_TLS_PROVIDER STREQUAL "OpenSSL")
+    find_dependency(OpenSSL)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/netTargets.cmake")
+
+check_required_components(net)
