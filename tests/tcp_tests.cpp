@@ -12,6 +12,8 @@
 
 #include "net/any_source_sink.hpp"
 #include "net/any_stream.hpp"
+#include "net/config.hpp"
+#include "net/continuation.hpp"
 #include "net/error.hpp"
 #include "net/io_context.hpp"
 #include "net/ip.hpp"
@@ -834,6 +836,63 @@ void endpoints_and_options() {
     CHECK_EQ(net::ip::to_string(remote), "127.0.0.1:" + std::to_string(remote.port()));
 }
 
+// ---- 内联完成预算 ----
+
+struct hop_awaitable {
+    net::continuation cont;
+    bool await_ready() const noexcept { return false; }
+    net::coroutine_handle<> await_suspend(net::coroutine_handle<> const h, net::io_env const* const env) noexcept {
+        cont.h = h;
+        env->executor.post(cont);
+        return net::noop_coroutine();
+    }
+    void await_resume() const noexcept {}
+};
+
+// 一字节一字节地读：对端已经把数据全塞进来，每次 read_some 推测成功、同步完成。
+auto read_one_byte_at_a_time(net::tcp_socket* sock, std::size_t count, std::size_t* progress)
+    CO2_BEG(net::task<>, (sock, count, progress), char c{}; net::io_result<std::size_t> r;) {
+    while (*progress != count) {
+        CO2_AWAIT_SET(r, sock->read_some(net::buffer(&c, 1)));
+        CHECK(not r.ec);
+        ++*progress;
+    }
+}
+CO2_END
+
+// 只经执行器跳一次：恢复时记下读协程读到了哪里。
+auto observe_after_hop(std::size_t const* progress, std::size_t* seen) CO2_BEG(net::task<>, (progress, seen)) {
+    CO2_AWAIT(hop_awaitable{});
+    *seen = *progress;
+}
+CO2_END
+
+auto write_block(net::tcp_socket* sock, std::vector<char> const* data) CO2_BEG(net::task<>, (sock, data), net::io_result<std::size_t> w;) {
+    CO2_AWAIT_SET(w, net::write(*sock, net::buffer(*data)));
+    CHECK(not w.ec);
+}
+CO2_END
+
+// 一条总是就绪的连接不能独占线程：读协程每同步完成 NET_INLINE_COMPLETION_BUDGET 次就得让别的续体
+// 插进来。观察协程要两个调度器回合（启动、跳转），所以它看到的进度不超过两份预算；没有预算它要等到
+// 4096 字节全读完。
+void inline_completion_budget_yields_to_other_coroutines() {
+    connected_pair pair;
+    std::vector<char> const data(4096, 'x');
+    net::run_async(pair.ctx.get_executor())(write_block(&pair.server, &data));
+    pair.ctx.run(); // 数据已在客户端的接收队列里
+    pair.ctx.restart();
+    auto progress = std::size_t{};
+    auto seen = static_cast<std::size_t>(-1);
+    net::run_async(pair.ctx.get_executor())(read_one_byte_at_a_time(&pair.client, data.size(), &progress));
+    net::run_async(pair.ctx.get_executor())(observe_after_hop(&progress, &seen));
+    pair.ctx.run();
+    CHECK_EQ(progress, data.size());
+    CHECK(seen != static_cast<std::size_t>(-1));
+    CHECK(seen <= 2U * NET_INLINE_COMPLETION_BUDGET + 2U); // 读协程在预算用完处让出
+    CHECK(seen >= NET_INLINE_COMPLETION_BUDGET);            // 而不是每次读都让
+}
+
 } // namespace
 
 int main() {
@@ -861,6 +920,7 @@ int main() {
     receive_source_pull_is_cancellable();
     receive_source_composes_with_transfer();
     endpoints_and_options();
+    inline_completion_budget_yields_to_other_coroutines();
     std::cout << "tcp tests passed\n";
     return 0;
 }

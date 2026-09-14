@@ -25,3 +25,10 @@
 #ifndef NET_MAX_IOVEC
 #define NET_MAX_IOVEC 16
 #endif
+
+// 内联完成预算：执行循环每恢复一个协程，允许其中同步完成（不经调度器）的传输操作次数。用完之后
+// 下一次本可同步完成的操作改为把续体 post 给执行器，同一上下文的其它协程得以运行——一条永远就绪的
+// 连接（或内存流、就绪型后端上的文件）不能把线程独占。0 关闭预算。
+#ifndef NET_INLINE_COMPLETION_BUDGET
+#define NET_INLINE_COMPLETION_BUDGET 64
+#endif

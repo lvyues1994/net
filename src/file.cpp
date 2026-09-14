@@ -2,6 +2,7 @@
 
 #include "co2/contract.hpp"
 
+#include "net/detail/inline_budget.hpp"
 #include "net/error.hpp"
 #include "net/io_context.hpp"
 
@@ -12,9 +13,17 @@ namespace net {
 
 // ---- awaiter ----
 
-bool file_read_awaitable::await_ready() noexcept { return impl->ready(detail::op_direction::read); }
+// 就绪型后端上的文件总是同步完成：没有内联完成预算，一个读文件的循环会独占线程直到读完。见
+// net/detail/inline_budget.hpp 与 socket_base.cpp。
+bool file_read_awaitable::await_ready() noexcept {
+    if (not impl->ready(detail::op_direction::read)) return false;
+    if (detail::try_consume_inline_budget()) return true;
+    impl->deferred.arm(detail::op_direction::read);
+    return false;
+}
 
 coroutine_handle<> file_read_awaitable::await_suspend(coroutine_handle<> const h, io_env const* const env) noexcept {
+    if (impl->deferred.post_if_armed(detail::op_direction::read, h, env)) return noop_coroutine();
     return impl->suspend(detail::op_direction::read, h, env);
 }
 
@@ -24,9 +33,15 @@ io_result<std::size_t> file_read_awaitable::await_resume() noexcept {
     return r;
 }
 
-bool file_write_awaitable::await_ready() noexcept { return impl->ready(detail::op_direction::write); }
+bool file_write_awaitable::await_ready() noexcept {
+    if (not impl->ready(detail::op_direction::write)) return false;
+    if (detail::try_consume_inline_budget()) return true;
+    impl->deferred.arm(detail::op_direction::write);
+    return false;
+}
 
 coroutine_handle<> file_write_awaitable::await_suspend(coroutine_handle<> const h, io_env const* const env) noexcept {
+    if (impl->deferred.post_if_armed(detail::op_direction::write, h, env)) return noop_coroutine();
     return impl->suspend(detail::op_direction::write, h, env);
 }
 

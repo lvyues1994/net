@@ -6,6 +6,7 @@
 #include <memory>
 
 #include "net/coroutine.hpp"
+#include "net/detail/inline_budget.hpp"
 
 // 帧分配器（P4003R3 §3.5 / §4.5，P4172R1 §6.3 / §8）。
 //
@@ -139,12 +140,14 @@ inline void set_cached_frame_allocator(memory_resource* const resource) noexcept
 }
 
 // 恢复一个协程句柄，前后保存/恢复线程局部的帧分配器槽位（P4172R1 §8.3）。执行循环
-// （执行器的事件循环、strand 的派发循环）必须经由它恢复协程。
+// （执行器的事件循环、strand 的派发循环）必须经由它恢复协程。每次恢复也重置内联完成预算
+//（net/detail/inline_budget.hpp）：从这里起同步完成的传输不超过预算，之后回到调度器。
 inline void safe_resume(coroutine_handle<> const handle) {
     struct restore {
         memory_resource* saved;
         ~restore() { set_cached_frame_allocator(saved); }
     } guard{get_cached_frame_allocator()};
+    detail::reset_inline_budget();
     handle.resume();
 }
 

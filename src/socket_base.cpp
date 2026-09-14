@@ -9,6 +9,7 @@
 
 #include "co2/contract.hpp"
 
+#include "net/detail/inline_budget.hpp"
 #include "net/error.hpp"
 #include "net/io_context.hpp"
 
@@ -63,10 +64,19 @@ void ensure_networking_initialized() noexcept {
 
 // ---- awaiter：一个指针宽，定义在库内 ----
 
-bool socket_read_awaitable::await_ready() noexcept { return impl->ready(detail::op_direction::read); }
+// 传输 awaiter 的三步带内联完成预算（net/detail/inline_budget.hpp）：ready() 同步完成但本线程预算用完时
+// 不直接继续，改为把续体 post 给执行器——结果不变，只是让同一上下文的其它协程插进来。connect 与 accept
+// 不走预算：accept 的同步完成是多个协程共用一个接受器时不撞契约的前提。
+bool socket_read_awaitable::await_ready() noexcept {
+    if (not impl->ready(detail::op_direction::read)) return false;
+    if (detail::try_consume_inline_budget()) return true;
+    impl->deferred.arm(detail::op_direction::read);
+    return false;
+}
 
 coroutine_handle<> socket_read_awaitable::await_suspend(coroutine_handle<> const h,
                                                         io_env const* const env) noexcept {
+    if (impl->deferred.post_if_armed(detail::op_direction::read, h, env)) return noop_coroutine();
     return impl->suspend(detail::op_direction::read, h, env);
 }
 
@@ -74,10 +84,16 @@ io_result<std::size_t> socket_read_awaitable::await_resume() noexcept {
     return impl->finish_transfer(detail::op_direction::read);
 }
 
-bool socket_write_awaitable::await_ready() noexcept { return impl->ready(detail::op_direction::write); }
+bool socket_write_awaitable::await_ready() noexcept {
+    if (not impl->ready(detail::op_direction::write)) return false;
+    if (detail::try_consume_inline_budget()) return true;
+    impl->deferred.arm(detail::op_direction::write);
+    return false;
+}
 
 coroutine_handle<> socket_write_awaitable::await_suspend(coroutine_handle<> const h,
                                                          io_env const* const env) noexcept {
+    if (impl->deferred.post_if_armed(detail::op_direction::write, h, env)) return noop_coroutine();
     return impl->suspend(detail::op_direction::write, h, env);
 }
 

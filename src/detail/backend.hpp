@@ -7,6 +7,7 @@
 #include <system_error>
 
 #include "net/buffers.hpp"
+#include "net/continuation.hpp"
 #include "net/detail/socket_types.hpp"
 #include "net/coroutine.hpp"
 #include "net/io_env.hpp"
@@ -44,6 +45,25 @@ struct socket_base;
 namespace detail {
 
 enum class op_direction : unsigned char { read = 0, write = 1 };
+
+// 内联完成预算用完时推迟恢复的续体（每方向一个）。awaiter 的三步：ready() 为真但预算用完 → arm(direction)
+// 并返回"未就绪"；await_suspend 看到 armed → post 续体、返回 noop；finish_* 照常取已存好的结果。
+struct deferred_resume {
+    continuation cont[2];
+    bool armed[2] = {false, false};
+
+    void arm(op_direction const direction) noexcept { armed[static_cast<unsigned>(direction)] = true; }
+
+    // armed 时把 h 经执行器 post 并返回 true（调用方返回 noop_coroutine()）。
+    bool post_if_armed(op_direction const direction, coroutine_handle<> const h, io_env const* const env) noexcept {
+        auto const index = static_cast<unsigned>(direction);
+        if (not armed[index]) return false;
+        armed[index] = false;
+        cont[index].h = h;
+        env->executor.post(cont[index]);
+        return true;
+    }
+};
 
 // 被调方拥有缓冲区的接收流（receive_source 的后端实现）：内核 / 后端往它自己的缓冲池里收数据，
 // pull 交出已到达的块，consume 归还。io_uring 用常驻的多发 RECV + 提供缓冲环实现；没有专门实现的
@@ -129,6 +149,10 @@ struct socket_impl {
         static_cast<void>(buffer_size);
         return nullptr;
     }
+
+    // 内联完成预算（net/detail/inline_budget.hpp）：ready() 已同步完成、但本线程预算用完时，awaiter 在这里
+    // 记下方向，await_suspend 把续体 post 给执行器而不是继续；结果照常由 finish_* 取。每方向一个槽。
+    deferred_resume deferred;
 };
 
 // 文件的实现（Paper 10）。两种公共类型（顺序的 stream_file、按偏移的 random_access_file）都建立在同一
@@ -157,6 +181,9 @@ struct file_impl {
     virtual io_result<std::size_t> finish_transfer(op_direction direction) noexcept = 0;
 
     virtual bool has_pending() const noexcept = 0;
+
+    // 同 socket_impl::deferred（就绪型后端上的文件总是同步完成，预算在这里最常起作用）。
+    deferred_resume deferred;
 };
 
 struct timer_impl {
