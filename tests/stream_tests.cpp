@@ -15,6 +15,10 @@
 #include "net/run_async.hpp"
 #include "net/stream.hpp"
 #include "net/task.hpp"
+#include "net/test/bufgrind.hpp"
+#include "net/test/fuse.hpp"
+#include "net/test/memory_stream.hpp"
+#include "net/test/run_blocking.hpp"
 
 #include "check.hpp"
 
@@ -257,6 +261,96 @@ void algorithms_work_on_any_read_stream() {
     CHECK_EQ(std::string(out, 6), "abcdef");
 }
 
+// ---- 公开的测试替身（net/test/） ----
+
+// fuse：同一段代码跑到每条错误路径都被走一遍。write 三段（max_write_size = 2）→ 三个失效点 + 一遍全过。
+auto write_all(net::test::memory_stream& s, std::string const* data)
+    CO2_BEG((net::task<net::io_result<std::size_t>>), (s, data), net::io_result<std::size_t> r;) {
+    CO2_AWAIT_SET(r, net::write(s, net::buffer(*data)));
+    CO2_RETURN(r);
+}
+CO2_END
+
+void fuse_walks_every_failure_point() {
+    std::string const payload = "abcdef";
+    auto passes = 0U;
+    auto failures = 0U;
+    net::io_context ctx;
+    for (net::test::fuse f; f.next();) {
+        net::test::memory_stream s{"", &f};
+        s.max_write_size = 2;
+        auto const r = net::test::run_blocking(ctx, write_all(s, &payload));
+        ++passes;
+        if (f.triggered()) {
+            ++failures;
+            CHECK(r.ec == f.error());
+            CHECK_EQ(r.value, f.point() * 2U); // 第 k 个点失败：前 k 段已写
+            CHECK_EQ(s.output.size(), f.point() * 2U);
+        } else {
+            CHECK(not r.ec);
+            CHECK_EQ(r.value, 6U);
+            CHECK_EQ(s.output, payload);
+        }
+    }
+    CHECK_EQ(failures, 3U);
+    CHECK_EQ(passes, 4U);
+}
+
+// bufgrind：net::read 对序列的任何切分都读到同样的字节。
+auto read_two_halves(net::test::memory_stream& s, std::vector<net::mutable_buffer> const* halves)
+    CO2_BEG((net::task<net::io_result<std::size_t>>), (s, halves), net::io_result<std::size_t> r;) {
+    CO2_AWAIT_SET(r, net::read(s, *halves));
+    CO2_RETURN(r);
+}
+CO2_END
+
+void bufgrind_splits_do_not_change_what_read_delivers() {
+    char out[9];
+    net::mutable_buffer const whole{out, sizeof(out)};
+    net::io_context ctx;
+    for (net::test::bufgrind<net::mutable_buffer> grinder{whole}; grinder.has_next();) {
+        auto const split = grinder.next();
+        std::vector<net::mutable_buffer> const halves{split.head, split.tail};
+        std::memset(out, 0, sizeof(out));
+        net::test::memory_stream s{"123456789"};
+        s.max_read_size = 4;
+        auto const r = net::test::run_blocking(ctx, read_two_halves(s, &halves));
+        CHECK(not r.ec);
+        CHECK_EQ(r.value, 9U);
+        CHECK_EQ(std::string(out, 9), "123456789");
+    }
+}
+
+// read_until 在环形缓冲上：分隔符跨过存储末尾也能找到。
+auto read_line_ring(net::test::memory_stream& s, net::circular_dynamic_buffer* ring)
+    CO2_BEG((net::task<net::io_result<std::size_t>>), (s, ring), net::io_result<std::size_t> r;) {
+    CO2_AWAIT_SET(r, net::read_until(s, *ring, "\r\n"));
+    CO2_RETURN(r);
+}
+CO2_END
+
+void read_until_spans_the_ring_wrap() {
+    unsigned char storage[8];
+    net::circular_dynamic_buffer ring{storage};
+    ring.commit(net::buffer_size(ring.prepare(6))); // 读指针推到 6：接下来的数据必然绕过末尾
+    ring.consume(6);
+    net::test::memory_stream s{"ab\r\ncd\r\n"};
+    s.max_read_size = 5; // 第一次读进 "ab\r\nc"：分隔符正好跨段
+    net::io_context ctx;
+    auto r = net::test::run_blocking(ctx, read_line_ring(s, &ring));
+    CHECK(not r.ec);
+    CHECK_EQ(r.value, 4U);
+    {
+        std::string line;
+        for (auto const& b : ring.data()) line.append(static_cast<char const*>(b.data()), b.size());
+        CHECK_EQ(line.substr(0, 4), "ab\r\n");
+    }
+    ring.consume(4);
+    r = net::test::run_blocking(ctx, read_line_ring(s, &ring));
+    CHECK(not r.ec);
+    CHECK_EQ(r.value, 4U);
+}
+
 } // namespace
 
 void* operator new(std::size_t const size) {
@@ -278,6 +372,9 @@ int main() {
     read_until_reports_eof();
     any_stream_erases_without_per_operation_allocation();
     algorithms_work_on_any_read_stream();
+    fuse_walks_every_failure_point();
+    bufgrind_splits_do_not_change_what_read_delivers();
+    read_until_spans_the_ring_wrap();
     std::cout << "stream tests passed\n";
     return 0;
 }

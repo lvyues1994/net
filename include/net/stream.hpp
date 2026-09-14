@@ -212,15 +212,42 @@ detail::transfer_awaitable<Stream, ConstBufferSequence, detail::write_transfer> 
 
 namespace detail {
 
-// 在 [data, data + size) 中从 from 起查找 delimiter；找到返回分隔符结束位置，否则返回 npos。
-inline std::size_t find_delimiter(char const* const data, std::size_t const size,
-                                  std::size_t const from, std::string const& delimiter) noexcept {
-    if (size < delimiter.size()) return static_cast<std::size_t>(-1);
-    auto const last = size - delimiter.size();
-    for (auto index = from; index <= last; ++index)
-        if (std::memcmp(data + index, delimiter.data(), delimiter.size()) == 0)
-            return index + delimiter.size();
-    return static_cast<std::size_t>(-1);
+// 在缓冲区序列（按字节看成一段）里从 from 起查找 delimiter，匹配可以跨段（环形缓冲的可读区绕过末尾时
+// 是两段）；找到返回分隔符结束位置，否则返回 npos。位置用（段号，段内偏移）游标表示，逐字节推进。
+inline std::size_t find_delimiter(const_buffer_array<> const& parts, std::size_t const from,
+                                  std::string const& delimiter) noexcept {
+    constexpr auto npos = static_cast<std::size_t>(-1);
+    auto const total = parts.total_size();
+    auto const length = delimiter.size();
+    if (length == 0U) return from <= total ? from : npos; // 空分隔符立即匹配（与 Asio 一致）
+    if (total < length || from + length > total) return npos;
+    struct cursor {
+        std::size_t part;
+        std::size_t offset;
+        void step(const_buffer_array<> const& in) noexcept { // 前进一字节（buffer_array 里没有空段）
+            if (++offset == in[part].size()) {
+                ++part;
+                offset = 0U;
+            }
+        }
+        char at(const_buffer_array<> const& in) const noexcept { return static_cast<char const*>(in[part].data())[offset]; }
+    };
+    cursor start{0U, from};
+    while (start.offset >= parts[start.part].size()) {
+        start.offset -= parts[start.part].size();
+        ++start.part;
+    }
+    for (auto position = from; position + length <= total; ++position) {
+        auto probe = start;
+        auto matched = std::size_t{};
+        while (matched != length && probe.at(parts) == delimiter[matched]) {
+            ++matched;
+            probe.step(parts);
+        }
+        if (matched == length) return position + length;
+        start.step(parts);
+    }
+    return npos;
 }
 
 } // namespace detail
@@ -234,13 +261,12 @@ auto read_until(Stream& stream, DynamicBuffer& buffer, std::string delimiter)
     static_assert(is_read_stream<Stream>::value, "net::read_until requires a ReadStream");
     for (;;) {
         {
-            auto const readable = buffer.data();
-            found = detail::find_delimiter(static_cast<char const*>(readable.data()),
-                                           readable.size(), search_from, delimiter);
+            auto const readable = const_buffer_array<>{buffer.data()}; // 平面缓冲一段，环形缓冲最多两段
+            found = detail::find_delimiter(readable, search_from, delimiter);
             if (found != static_cast<std::size_t>(-1))
                 CO2_RETURN((io_result<std::size_t>{std::error_code{}, found}));
             // 下次只需从"可能跨越新旧边界"的位置开始找。
-            search_from = readable.size() >= delimiter.size() ? readable.size() - delimiter.size() + 1U : 0U;
+            search_from = readable.total_size() >= delimiter.size() ? readable.total_size() - delimiter.size() + 1U : 0U;
             if (buffer.size() >= buffer.max_size())
                 CO2_RETURN((io_result<std::size_t>{make_error_code(std::errc::no_buffer_space), 0U}));
             chunk = buffer.max_size() - buffer.size();

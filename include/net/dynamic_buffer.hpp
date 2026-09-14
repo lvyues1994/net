@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -73,6 +74,87 @@ struct flat_dynamic_buffer {
     std::size_t capacity_ = 0U;
     std::size_t in_offset_ = 0U;
     std::size_t in_size_ = 0U;
+    std::size_t out_size_ = 0U;
+};
+
+// 至多两段的缓冲区序列：环形缓冲的可读区 / 可写区绕过末尾时分成两段。第二段为空时只遍历一段。
+template <class Buffer> struct buffer_pair {
+    using value_type = Buffer;
+    using const_iterator = Buffer const*;
+
+    buffer_pair() noexcept = default;
+    buffer_pair(Buffer const first, Buffer const second) noexcept : buffers_{first, second} {}
+
+    const_iterator begin() const noexcept { return buffers_; }
+    const_iterator end() const noexcept { return buffers_ + (buffers_[1].size() != 0U ? 2 : 1); }
+    Buffer const& operator[](std::size_t const index) const noexcept { return buffers_[index]; }
+    std::size_t size() const noexcept { return buffers_[1].size() != 0U ? 2U : 1U; }
+
+  private:
+    Buffer buffers_[2];
+};
+
+using const_buffer_pair = buffer_pair<const_buffer>;
+using mutable_buffer_pair = buffer_pair<mutable_buffer>;
+
+// 调用方拥有存储的环形缓冲（Paper 5 的第二种调用方拥有存储的形态）：consume 从不搬数据，只推进读指针
+// 模容量；可读区与可写区绕过存储末尾时以两段给出，所以 data() / prepare() 的类型是 buffer_pair。
+// 与 flat_dynamic_buffer 相比：FIFO 稳态下没有 memmove；代价是每次 data() 可能是两段（read_until 处理
+// 跨段的分隔符）。
+struct circular_dynamic_buffer {
+    using const_buffers_type = const_buffer_pair;
+    using mutable_buffers_type = mutable_buffer_pair;
+
+    circular_dynamic_buffer() noexcept = default;
+
+    circular_dynamic_buffer(void* const storage, std::size_t const capacity) noexcept
+        : begin_{static_cast<unsigned char*>(storage)}, capacity_{capacity} {}
+
+    template <std::size_t N>
+    explicit circular_dynamic_buffer(unsigned char (&storage)[N]) noexcept : begin_{storage}, capacity_{N} {}
+
+    template <std::size_t N>
+    explicit circular_dynamic_buffer(char (&storage)[N]) noexcept
+        : begin_{reinterpret_cast<unsigned char*>(storage)}, capacity_{N} {}
+
+    std::size_t size() const noexcept { return in_size_; }
+    std::size_t max_size() const noexcept { return capacity_; }
+    std::size_t capacity() const noexcept { return capacity_; }
+
+    const_buffers_type data() const noexcept {
+        auto const first = capacity_ - in_pos_ < in_size_ ? capacity_ - in_pos_ : in_size_;
+        return const_buffers_type{const_buffer{begin_ + in_pos_, first}, const_buffer{begin_, in_size_ - first}};
+    }
+
+    // 至少 n 字节可写空间（可能分两段）；空间不足抛 std::length_error。
+    mutable_buffers_type prepare(std::size_t const n) {
+        if (n > capacity_ - in_size_) throw std::length_error{"circular_dynamic_buffer too small"};
+        out_size_ = n;
+        auto const start = wrap(in_pos_ + in_size_);
+        auto const first = capacity_ - start < n ? capacity_ - start : n;
+        return mutable_buffers_type{mutable_buffer{begin_ + start, first}, mutable_buffer{begin_, n - first}};
+    }
+
+    void commit(std::size_t const n) noexcept {
+        auto const committed = n < out_size_ ? n : out_size_;
+        in_size_ += committed;
+        out_size_ = 0U;
+    }
+
+    void consume(std::size_t const n) noexcept {
+        auto const consumed = n < in_size_ ? n : in_size_;
+        in_pos_ = wrap(in_pos_ + consumed);
+        in_size_ -= consumed;
+        if (in_size_ == 0U) in_pos_ = 0U;
+    }
+
+  private:
+    std::size_t wrap(std::size_t const index) const noexcept { return index < capacity_ ? index : index - capacity_; }
+
+    unsigned char* begin_ = nullptr;
+    std::size_t capacity_ = 0U;
+    std::size_t in_pos_ = 0U;  // 可读区起点
+    std::size_t in_size_ = 0U; // 可读字节数
     std::size_t out_size_ = 0U;
 };
 
