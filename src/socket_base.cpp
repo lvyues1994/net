@@ -77,7 +77,7 @@ bool socket_read_awaitable::await_ready() noexcept {
 coroutine_handle<> socket_read_awaitable::await_suspend(coroutine_handle<> const h,
                                                         io_env const* const env) noexcept {
     if (impl->deferred.post_if_armed(detail::op_direction::read, h, env)) return noop_coroutine();
-    return impl->suspend(detail::op_direction::read, h, env);
+    return detail::suspend_within_budget(*impl, detail::op_direction::read, h, env);
 }
 
 io_result<std::size_t> socket_read_awaitable::await_resume() noexcept {
@@ -94,7 +94,7 @@ bool socket_write_awaitable::await_ready() noexcept {
 coroutine_handle<> socket_write_awaitable::await_suspend(coroutine_handle<> const h,
                                                          io_env const* const env) noexcept {
     if (impl->deferred.post_if_armed(detail::op_direction::write, h, env)) return noop_coroutine();
-    return impl->suspend(detail::op_direction::write, h, env);
+    return detail::suspend_within_budget(*impl, detail::op_direction::write, h, env);
 }
 
 io_result<std::size_t> socket_write_awaitable::await_resume() noexcept {

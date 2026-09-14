@@ -8,6 +8,7 @@
 
 #include "net/buffers.hpp"
 #include "net/continuation.hpp"
+#include "net/detail/inline_budget.hpp"
 #include "net/detail/socket_types.hpp"
 #include "net/coroutine.hpp"
 #include "net/io_env.hpp"
@@ -64,6 +65,22 @@ struct deferred_resume {
         return true;
     }
 };
+
+// suspend() 直接返回 h 也是同步完成（完成型后端：IOCP 的 FILE_SKIP、io_uring 提交前取消……），同样消耗一份
+// 预算；用完则改经执行器恢复。ready() 为真的那条路在 awaiter 的 await_ready 里消耗。
+// 发布规则：suspend() 返回不是 h 就是已发布——之后不再碰 impl（awaiter 与 I/O 对象都住在可能已被别的线程
+// 销毁的帧里）；返回 h 表示同步完成、没有发布，impl 仍然是我们的。调用方把 *impl 作为引用传进来，不要在
+// 调用之后再读 awaiter 的成员。
+template <class Impl>
+coroutine_handle<> suspend_within_budget(Impl& impl, op_direction const direction, coroutine_handle<> const h,
+                                         io_env const* const env) noexcept {
+    auto const next = impl.suspend(direction, h, env);
+    if (next != h) return next;
+    if (try_consume_inline_budget()) return h;
+    impl.deferred.arm(direction);
+    impl.deferred.post_if_armed(direction, h, env);
+    return noop_coroutine();
+}
 
 // 被调方拥有缓冲区的接收流（receive_source 的后端实现）：内核 / 后端往它自己的缓冲池里收数据，
 // pull 交出已到达的块，consume 归还。io_uring 用常驻的多发 RECV + 提供缓冲环实现；没有专门实现的
