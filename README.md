@@ -62,7 +62,8 @@ coroutine_handle<> await_suspend(coroutine_handle<> h, io_env const* env);
 | `run_async(ex[, on_value, on_error])(task)`, `run(ex / token / mr)(task)` | 同名，两段调用 | `run_async.hpp`, `run.hpp` |
 | `io_result<Ts...>` | 同名聚合体，tuple 协议（C++17 可结构化绑定） | `io_result.hpp` |
 | `mutable_buffer`, `const_buffer`, `*BufferSequence`, `buffer_copy` | 同名；`is_*_buffer_sequence<T>` | `buffers.hpp`, `span.hpp` |
-| `DynamicBuffer` | `flat_dynamic_buffer`, `dynamic_buffer(vector/string)` | `dynamic_buffer.hpp` |
+| 字节粒度切片（Paper 4；Capy `buffer_slice` / `consuming_buffers` / `front`） | `buffer_slice`（单缓冲区返回值，序列返回借用视图 `slice_of`）、`consuming_buffers`、`buffer_front` | `buffer_slice.hpp` |
+| `DynamicBuffer` | `flat_dynamic_buffer`、`circular_dynamic_buffer`（环形，`data()` / `prepare()` 可能是两段 `buffer_pair`）、`dynamic_buffer(vector/string)` | `dynamic_buffer.hpp` |
 | `ReadStream` / `WriteStream` / `Stream` | `is_read_stream` / `is_write_stream` / `is_stream`；`read` / `write` / `read_until` | `stream.hpp` |
 | `any_read_stream`, `any_write_stream`, `any_stream` | 同名，零每操作分配 | `any_stream.hpp` |
 | `ReadSource` / `WriteSink`（读满 / 写完 + `write_eof`）、`BufferSource` / `BufferSink`（被调方拥有缓冲区：`pull` / `consume`，`prepare` / `commit` / `commit_eof`）（Paper 6） | `is_read_source` / `is_write_sink` / `is_buffer_source` / `is_buffer_sink`；模型 `memory_source`、`dynamic_buffer_source` / `dynamic_buffer_sink`；适配器 `as_read_source` / `as_write_sink` / `as_buffer_source` / `as_buffer_sink`；`transfer_to_stream` / `transfer_to_sink` | `source_sink.hpp` |
@@ -71,6 +72,9 @@ coroutine_handle<> await_suspend(coroutine_handle<> h, io_env const* env);
 | `local::stream_protocol` / `datagram_protocol`，Unix 域套接字（Paper 11） | `local_stream_socket`, `local_stream_acceptor`, `local_datagram_socket`；端点支持 Linux 抽象命名空间 | `local.hpp` |
 | `ip::multicast::{join_group, leave_group, outbound_interface, hops, enable_loopback}`, `ip::unicast::hops` | 同名，v4 / v6 同一类型 | `multicast.hpp` |
 | `when_all`, `when_any` | 同名，I/O 感知（P4124R0 §2 的表） | `when_all.hpp`, `when_any.hpp` |
+| `timeout(op, dur)`, `delay(dur)`（Corosio 同形） | 同名；专用 awaiter，不建 runner 帧，操作先完成撤定时器、到期取消操作给 `error::timed_out` | `timeout.hpp` |
+| 可移植错误条件（Capy `cond`） | `net::cond::{eof, canceled, stream_truncated, timeout}`：任何来源的 `error_code`（本库、`errno`、`std::errc`）都可比较 | `error.hpp` |
+| 测试替身（Capy `test/*`） | `test::memory_stream`、`test::fuse`（失效注入）、`test::bufgrind`（切分枚举）、`test::run_blocking` | `test/*.hpp` |
 | `thread_pool`, `strand`, `any_executor` | 同名 | `thread_pool.hpp`, `strand.hpp`, `any_executor.hpp` |
 | `io_context`, `steady_timer`, `signal_set`, `tcp_socket`, `tcp_acceptor`, `udp_socket`, `resolver`, `ip::*` | 同名（Networking TS 形态去掉 `async_` 与完成令牌） | `io_context.hpp`, `timer.hpp`, `signal_set.hpp`, `tcp.hpp`, `udp.hpp`, `resolver.hpp`, `ip.hpp` |
 | `corosio::epoll` / `select` / `io_uring` / `iocp` 后端标签，`io_context(backend)` | `net::epoll` / `net::poll` / `net::select` / `net::io_uring` / `net::iocp`（Windows 默认），`io_context{net::io_uring}`，`backend_available()` | `backend.hpp` |
@@ -140,6 +144,7 @@ ctest --test-dir build --output-on-failure
 | `NET_BORINGSSL_ROOT` | 空 | 现成的 BoringSSL 安装根（`include/`、`lib/`）；为空则 FetchContent 从源码构建（`NET_BORINGSSL_GIT_TAG`，无需 Go / Perl） |
 | `NET_WOLFSSL_GIT_TAG` | `v5.8.2-stable` | wolfSSL 经 FetchContent 从源码构建（要 OpenSSL 兼容层那组开关，发行版的包不带） |
 | `NET_DEFAULT_FRAME_ALLOCATOR` | `new_delete` | 上下文默认帧分配器：`new_delete` 或 `recycling`（见下文"性能"） |
+| `NET_INLINE_COMPLETION_BUDGET`（宏） | `64` | 执行循环每恢复一个协程允许同步完成的传输次数，用完后改为经执行器恢复（公平性）；0 关闭 |
 | `NET_AWAIT_STORAGE_SIZE` | `192` | 协程帧里内联 awaiter 槽的字节数（co2 的 `CO2_AWAIT_STORAGE_SIZE`）；`read` / `write` / `run` / `when_all` 的 awaiter 都在此内，放不下的由 co2 堆分配。PUBLIC 定义，随 `net::net` 传给消费方 |
 | `NET_BUILD_TESTS` / `NET_BUILD_EXAMPLES` / `NET_BUILD_BENCHMARKS` | ON / ON / OFF | 作为子项目时测试与示例默认关闭 |
 
@@ -164,8 +169,18 @@ add_subdirectory(path/to/net)
 target_link_libraries(my-target PRIVATE net::net)
 ```
 
+或者安装后 `find_package`（`cmake --install build --prefix <prefix>`，co2 也要先装到同一 prefix；0.x 阶段版本文件只接受
+精确版本；TLS 只有 OpenSSL 提供者可以从安装树消费，BoringSSL / wolfSSL 是 FetchContent 构建的，只在 net 自己的构建树里链接）：
+
+```cmake
+find_package(net 0.1.0 CONFIG REQUIRED)   # 连带找到 co2、Threads、OpenSSL；PUBLIC 编译选项与定义随目标带出
+target_link_libraries(my-target PRIVATE net::net)
+```
+
 测试覆盖：task / 环境传播 / 帧分配器（含多线程回收器）、执行器（多线程 `run()`、strand
-串行化、服务、后端选择）、缓冲区、流与 `any_stream`（零分配断言）、源 / 汇（概念判定、模型、
+串行化、服务、后端选择）、缓冲区（含字节切片、环形缓冲、切分枚举）、流与 `any_stream`（零分配断言；`read_until`
+跨环形缓冲的段边界；用 `fuse` 走遍每条错误路径）、`timeout` / `delay` 与 `cond`（到期取消、操作先到、已就绪不建定时器、
+父停止不是超时、异常透传、绝对截止）、内联完成预算（总是就绪的连接让出线程）、源 / 汇（概念判定、模型、
 适配器、`transfer`、四个 `any_*` 的零分配 / 40 缓冲区窗口化 / 转发与合成两条路径）、组合子（错误传播、取消、
 异常）、定时器、TCP 回环（取消、EOF、超时、多线程、接受器：连接先到后取 / 取消 / 关闭丢弃排队连接 / assign
 已监听的描述符、`write_eof` / `commit_eof` → `shutdown(send)`）、UDP（含组播加入 / 发送 / 收到 / 离开与
@@ -180,13 +195,14 @@ DNS、信号、TLS（握手 / 回显 /
 `stop()` / `restart()` / `run_for` 带着在飞操作、UDP `when_any`（`stress_tests <名字>` 单跑，
 `NET_TEST_REPEAT=n` 重复）。平台测试为 epoll / poll / select / io_uring 各编译一个变体
 （`<name>`、`<name>_poll`、`<name>_select`、`<name>_io_uring`），后端不可用时以退出码 77 跳过；
-共 47 个，全部在 ASan+UBSan+LSan 与 TSan 下（含 `taskset -c 0,1` 模拟 CI 的 2 核调度反复运行）、
+共 51 个，全部在 ASan+UBSan+LSan 与 TSan 下（含 `taskset -c 0,1` 模拟 CI 的 2 核调度反复运行）、
 OpenSSL 与 BoringSSL 两个提供者下通过。TSan 只抑制未插桩的 libcrypto / libssl 内部
 （`tests/tsan.supp`）。
 
 CI（`.github/workflows/ci.yml`）：GCC / Clang × Debug / Release × 两种默认帧分配器的构建与
 测试、ASan+UBSan 与 TSan 全量运行、BoringSSL 与 wolfSSL 提供者作业（FetchContent 构建并缓存）、quick 模式
-基准（结果写入 step summary 并上传 artifact），以及 MSVC × Debug / Release 的 IOCP 作业
+基准（结果写入 step summary 并上传 artifact；与 main 上一次成功运行的 artifact 逐行比较，ns/op 退化超过 15% 发
+warning 注解）、gcovr 覆盖率（GCC Debug，`include/` 与 `src/`，报告上传 artifact），以及 MSVC × Debug / Release 的 IOCP 作业
 （windows-latest，runner 自带的 OpenSSL 3；cl 的诊断经 `.github/matchers/msvc.json`、ctest 失败经
 `.github/scripts/annotate_ctest.py` 变成注解，公开仓库匿名可读）。
 
@@ -255,7 +271,8 @@ timerfd（hrtimer，不受 50 µs timer slack 影响）送进解复用器。已�
 ## 目录
 
 ```
-include/net/            公共头：协议核心、执行器、缓冲区、流 / 源 / 汇与类型擦除、组合子（仅头文件）；平台层的具体层接口（套接字、文件、Unix 域、组播选项）
+include/net/            公共头：协议核心、执行器、缓冲区（含字节切片、环形缓冲）、流 / 源 / 汇与类型擦除、组合子、timeout / delay（仅头文件）；平台层的具体层接口（套接字、文件、Unix 域、组播选项）
+include/net/test/       公开的测试替身：memory_stream / fuse / bufgrind / run_blocking
 include/net/tls/        TLS：context / stream / error（公共头不含 OpenSSL 头）
 src/                    具体层：io_context 调度器、套接字/文件/定时器/DNS/信号/Unix 域（只依赖 detail/backend.hpp）
 src/detail/backend.hpp  后端接缝：io_backend / socket_impl / file_impl / timer_impl（抽象）；timer_heap / heap_timer 是 reactor 与 iocp 共用的定时器堆
@@ -266,7 +283,8 @@ src/detail/iocp/        完成型后端（Windows）：完成端口、WSARecv / 
 src/tls/                TLS 引擎（OpenSSL API 子集，OpenSSL / BoringSSL / wolfSSL 共用）与驱动协程
 benchmarks/             bench_core / bench_net / bench_tls / bench_asio（Boost.Asio 对照）/ bench_libuv（libuv 对照）与 harness
 docs/                   architecture.md（分层、决策、审查记录）、backends.md（后端设计与 io_uring / IOCP 接入）、tls.md、benchmarks.md（与 Asio / libuv 对照）
-tests/  examples/  .github/workflows/ci.yml
+cmake/                  netConfig.cmake.in（find_package(net CONFIG) 的包配置）
+tests/  examples/  .github/workflows/ci.yml  .github/scripts/（ctest 注解、基准回归比较）
 ```
 
 ## 尚未提供
@@ -274,10 +292,9 @@ tests/  examples/  .github/workflows/ci.yml
 对照 P4100R1 的 14 篇与 Corosio / Capy 的清单（2026-09）：
 
 - 提案形态：`system_context`（Paper 2）；`timer::cancel_one()`（Paper 8）；`signal_set` 的信号标志
-  `flags_t`（Paper 9）；`circular_dynamic_buffer`（Paper 5）；字节粒度的缓冲区切片 API（Paper 4，Capy 的
-  `buffer_slice` / `consuming_buffers`）；与 `std::execution` 的桥（P4092 / P4093）；P4100R1 §5.1 的 Asio 适配器。
+  `flags_t`（Paper 9）；与 `std::execution` 的桥（P4092 / P4093）；P4100R1 §5.1 的 Asio 适配器。
 - 平台：kqueue 后端（接缝已就位，无 macOS CI）；Windows 上的 Unix 域数据报套接字与抽象命名空间；文件操作
   的取消在就绪型后端上不可用（同步完成）；IOCP 的 `release()` 只在没有在飞操作时解除端口关联。
 - TLS：PKCS#12；`shutdown()` 与挂起读的重叠；验证回调只暴露 `native_handle()`（见 `docs/tls.md`）。
-- Corosio / Capy 有的便利层：`timeout()` / `delay()`、范围 `connect(socket, endpoints)`、`tcp_server`、
-  `local_connect_pair`、`message_flags`、公开的测试替身、`async_mutex` / `async_event` / `work_guard`、内联完成预算。
+- Corosio / Capy 有的便利层：范围 `connect(socket, endpoints)`、`tcp_server`、`local_connect_pair`、`message_flags`、
+  `async_mutex` / `async_event` / `work_guard`。

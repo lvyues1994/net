@@ -6,6 +6,7 @@
 #include "net/any_executor.hpp"
 #include "net/any_source_sink.hpp"
 #include "net/any_stream.hpp"
+#include "net/buffer_slice.hpp"
 #include "net/buffers.hpp"
 #include "net/continuation.hpp"
 #include "net/coroutine.hpp"
@@ -42,6 +43,7 @@
 #include "net/signal_set.hpp"
 #include "net/socket_base.hpp"
 #include "net/tcp.hpp"
+#include "net/timeout.hpp"
 #include "net/timer.hpp"
 #include "net/udp.hpp"
 

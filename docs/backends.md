@@ -211,7 +211,9 @@ seccomp 可能禁用它）。`posix::*` 的同步部分（`create_socket`、`set
    1 ms，只是被上面的自打断掩盖了（`epoll_wait` 立即返回，1 µs 早已过去）。去掉自打断后暴露；
    换成纳秒超时（`epoll_pwait2` / `ppoll` / `pselect`）又撞上线程的 timer slack（默认 50 µs，
    poll/select/epoll 的超时都受它影响，定时器变成 56 µs）。最终照 Asio 的做法：一个 timerfd
-   （hrtimer，不受 slack 影响）武装到堆顶到期、注册进解复用器；只在堆顶变化时 `timerfd_settime`。
+   （hrtimer，不受 slack 影响）武装到堆顶到期、注册进解复用器；只在堆顶变得**更早**时 `timerfd_settime`——
+   已武装在不晚于堆顶的时刻就不动它（过早醒来一次是空转，重武装是一次系统调用），堆空也不解除武装。
+   每次读都套一个时限的服务器里堆顶每趟往返都往后挪：原先每趟一次 settime，现在每个超时周期一次。
    定时器从 2.9 µs 降到 1.5 µs。
 
 效果（`bench_net`，同一台机器）：往返 epoll 4.85 → 4.18 µs，io_uring 4.95 → 4.03 µs；定时器

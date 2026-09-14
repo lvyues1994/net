@@ -195,6 +195,13 @@ I/O 对象**（契约违规；移动是安全的，实现对象地址不变）�
 stop_callback（回调 `cancel_op`）、`start_op`；排队后复查 `stop_requested()` 关闭"注册
 回调与排队之间停止到达"的窗口。`finish_*` 销毁 stop_callback、清 pending、交出结果。
 
+**内联完成预算**（`net/detail/inline_budget.hpp`，Corosio 的 `try_consume_inline_budget`）：推测成功让协程不经
+调度器就继续，一条永远就绪的连接因此可以独占线程。预算是线程局部计数，`safe_resume` 每恢复一个协程重置为
+`NET_INLINE_COMPLETION_BUDGET`（默认 64），套接字与文件的传输 awaiter 每次同步完成消耗一份；用完后 `await_ready`
+对本已完成的操作返回"未就绪"、在 `socket_impl::deferred` 里记下方向，`await_suspend` 把续体 post 给执行器——
+结果照常由 `finish_*` 取，只多一次调度器往返，其它续体得以插进来。connect 与 accept 不走预算：accept 的同步完成是
+多个协程共用一个接受器时不撞一操作契约的前提。单连接 ping-pong 每次恢复只消耗一两份，永远用不完。
+
 ### 其它 I/O 对象
 
 - `steady_timer`：`reactor_timer` 即 `timer_op`；`expires_*` / `cancel` 取消挂起的 wait。
@@ -273,6 +280,38 @@ lambda）。涉及整个序列的 `read` / `write` / `write_eof(buffers)` 按 `m
 否则 `std::tuple<载荷...>`（全空为 void）。`when_any` 同构载荷给出
 `when_any_result<P>`，异构给出 `when_any_result<std::tuple<P...>>`（只有赢家下标处有意义
 ——C++14 没有 `std::variant`）。
+
+### timeout / delay
+
+`when_any(op, timer.wait())` 是最常见的 `when_any` 用法，也是最贵的写法（两个 runner 帧、awaiter 盒、stop 状态）。
+`net::timeout(op, dur)`（`timeout.hpp`，Corosio 同形）是专用 awaiter：`await_ready` 先试操作——不用等就完成时连
+定时器都不建；要等时给操作一个插入的 `stop_token`、从 `io_context_of(env->executor.context())` 拿到的上下文建一个
+`steady_timer`，两个参与者各挂一个 `completion_frame`，谁先到 CAS 成赢家并向对方请求停止，最后一个到达者恢复父协程。
+定时器赢而操作以 `operation_aborted` 结束 → `error::timed_out`；操作到期后仍以别的结果结束（数据恰好到了、真的出错了）
+→ 那个结果，不丢数据、不掩盖错误。异常穿过；父 `stop_token` 转发给两者，父方停止得到的是 `operation_aborted` 而不是
+超时。`delay(dur)` 是只有定时器的一半。`io_context_of` 靠 io_context 在服务表里登记的标记服务认回自己
+（`execution_context` 没有虚函数，不能 dynamic_cast）。
+
+可移植错误条件 `net::cond`（`error.hpp`，Capy 的 `cond` 同形）：`eof` / `canceled` / `stream_truncated` / `timeout`。
+`net_category` 的 `default_error_condition` 映射到它们，`cond_category::equivalent` 认 net 自己的码、平台码
+（`ECANCELED` / `ETIMEDOUT`、Windows 的 995 / `WSAETIMEDOUT`）与 `std::errc`；`ec == std::errc::operation_canceled`
+这类比较仍然成立。
+
+## 缓冲区：字节粒度切片与环形缓冲
+
+- `buffer_slice(seq, offset, length)`（`buffer_slice.hpp`，Paper 4 强调的按字节、跨元素切）：单个缓冲区切出来还是
+  缓冲区（值）；其它序列切出 `slice_of<Seq>`——存序列的迭代器加首尾两端的字节偏移，双向迭代时把首尾两个元素
+  裁掉相应字节，不拷贝描述符，序列必须比视图活得久（右值重载删除，切临时对象编译不过；单个缓冲区例外）。
+  `consuming_buffers<Seq>` 是写循环的游标（`data()` / `consume(n)`），`buffer_front` 取第一个非空缓冲区。
+- `circular_dynamic_buffer`（Paper 5 的第二种调用方拥有存储的形态）：`consume` 从不搬数据，只推进读指针模容量；
+  可读区 / 可写区绕过存储末尾时是两段，所以 `data()` / `prepare()` 返回 `buffer_pair`（至多两个元素的序列）。
+  `read_until` 的分隔符查找因此改为在缓冲区序列上按（段号，段内偏移）游标进行，跨段的分隔符也能找到。
+
+## 测试替身（`net/test/`）
+
+公开给用户测试自己的 `any_stream&` 逻辑（Capy 的 `test/*` 同形）：`memory_stream`（输入串 / 输出串、每次传输
+上限、可挂 `fuse`）、`fuse`（失效注入：同一段代码跑到每条错误路径都被走一遍）、`bufgrind`（把序列在每个字节位置
+切成两半，验证算法对任意切分一致）、`run_blocking`（把一个 task 跑到完成并交出结果，异常重抛）。
 
 ## 与提案的有意偏离
 
