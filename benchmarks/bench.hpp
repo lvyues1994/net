@@ -9,8 +9,14 @@
 #include <string>
 #include <vector>
 
+#ifndef _WIN32
+#include <sys/resource.h>
+#endif
+
 // 最小基准 harness（无第三方依赖）：多轮取中位数，报告 ns/op 与 allocs/op（全局 operator
-// new 计数，见 bench_alloc.cpp）。`--quick` 把迭代数缩到 1/20，供 CI 用。
+// new 计数，见 bench_alloc.cpp），POSIX 上另给每操作的用户态 / 内核态 CPU 时间（getrusage，
+// 进程全部线程之和；把"系统调用贵"和"用户态贵"分开看，perf 不可用时的替代）。`--quick` 把
+// 迭代数缩到 1/20，供 CI 用。
 
 namespace bench {
 
@@ -18,12 +24,30 @@ std::atomic<long>& allocation_counter() noexcept;
 
 inline long allocations() noexcept { return allocation_counter().load(std::memory_order_relaxed); }
 
+struct cpu_times {
+    double user_ns = 0.0;
+    double system_ns = 0.0;
+};
+
+inline cpu_times process_cpu_times() noexcept {
+#ifndef _WIN32
+    rusage usage{};
+    ::getrusage(RUSAGE_SELF, &usage);
+    auto const to_ns = [](timeval const& tv) { return static_cast<double>(tv.tv_sec) * 1e9 + static_cast<double>(tv.tv_usec) * 1e3; };
+    return cpu_times{to_ns(usage.ru_utime), to_ns(usage.ru_stime)};
+#else
+    return cpu_times{};
+#endif
+}
+
 struct result {
     std::string name;
     double ns_per_op;
     double allocs_per_op;
     std::size_t iterations;
     std::string note;
+    double user_ns_per_op = 0.0;   // 用户态 CPU / op（全轮平均）
+    double system_ns_per_op = 0.0; // 内核态 CPU / op
 };
 
 struct options {
@@ -53,6 +77,7 @@ result run(options const& o, std::string name, std::size_t const iterations, Bod
     body(iterations / 10U + 1U); // 预热（帧分配器缓存、页）
     std::vector<double> samples;
     auto total_allocs = 0.0;
+    auto const cpu_before = process_cpu_times();
     for (auto round = std::size_t{}; round != o.rounds; ++round) {
         auto const allocs_before = allocations();
         auto const start = std::chrono::steady_clock::now();
@@ -62,20 +87,24 @@ result run(options const& o, std::string name, std::size_t const iterations, Bod
         samples.push_back(static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()) /
                           static_cast<double>(iterations));
     }
+    auto const cpu_after = process_cpu_times();
     std::sort(samples.begin(), samples.end());
     auto const median = samples[samples.size() / 2U];
-    return result{std::move(name), median, total_allocs / static_cast<double>(o.rounds * iterations), iterations,
-                  std::move(note)};
+    auto const ops = static_cast<double>(o.rounds * iterations);
+    result r{std::move(name), median, total_allocs / ops, iterations, std::move(note)};
+    r.user_ns_per_op = (cpu_after.user_ns - cpu_before.user_ns) / ops;
+    r.system_ns_per_op = (cpu_after.system_ns - cpu_before.system_ns) / ops;
+    return r;
 }
 
 inline void print_table(char const* const title, std::vector<result> const& results) {
     std::printf("\n%s\n", title);
-    std::printf("%-46s %12s %10s %10s  %s\n", "benchmark", "ns/op", "allocs/op", "iters", "note");
-    std::printf("%-46s %12s %10s %10s  %s\n", "---------", "-----", "---------", "-----", "----");
+    std::printf("%-46s %12s %10s %9s %9s %10s  %s\n", "benchmark", "ns/op", "allocs/op", "usr ns", "sys ns", "iters", "note");
+    std::printf("%-46s %12s %10s %9s %9s %10s  %s\n", "---------", "-----", "---------", "------", "------", "-----", "----");
     for (auto const& r : results) {
         if (r.iterations == 0U) continue; // --only 过滤掉的
-        std::printf("%-46s %12.1f %10.3f %10zu  %s\n", r.name.c_str(), r.ns_per_op, r.allocs_per_op, r.iterations,
-                    r.note.c_str());
+        std::printf("%-46s %12.1f %10.3f %9.0f %9.0f %10zu  %s\n", r.name.c_str(), r.ns_per_op, r.allocs_per_op,
+                    r.user_ns_per_op, r.system_ns_per_op, r.iterations, r.note.c_str());
     }
     std::fflush(stdout);
 }

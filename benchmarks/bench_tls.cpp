@@ -235,6 +235,8 @@ int main(int argc, char** argv) {
         auto const seconds = r.ns_per_op / 1e9;
         r.note = std::to_string(static_cast<long>(static_cast<double>(total) / (1024.0 * 1024.0) / seconds)) + " MiB/s";
         r.ns_per_op = r.ns_per_op / static_cast<double>(total / chunk);
+        r.user_ns_per_op /= static_cast<double>(total / chunk);
+        r.system_ns_per_op /= static_cast<double>(total / chunk);
         r.iterations = total / chunk;
         results.push_back(std::move(r));
     }

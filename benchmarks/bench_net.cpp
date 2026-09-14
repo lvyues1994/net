@@ -6,7 +6,9 @@
 #include <sys/socket.h>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "net/backend.hpp"
@@ -57,6 +59,27 @@ struct connected_pair {
     }
 };
 
+// 同一个 io_context 上的多条连接（多线程 run() 的场景）。
+struct connected_pairs {
+    net::io_context ctx;
+    net::tcp_acceptor acceptor{ctx, net::ip::tcp::endpoint{net::ip::address_v4::loopback(), 0}};
+    std::vector<std::unique_ptr<net::tcp_socket>> clients;
+    std::vector<std::unique_ptr<net::tcp_socket>> servers;
+
+    connected_pairs(net::backend_kind const kind, std::size_t const count) : ctx{kind, 4} {
+        for (auto i = std::size_t{}; i != count; ++i) {
+            clients.emplace_back(new net::tcp_socket{ctx});
+            servers.emplace_back(new net::tcp_socket{});
+            net::run_async(ctx.get_executor())(accept_into(&acceptor, servers.back().get()));
+            net::run_async(ctx.get_executor())(connect_to(clients.back().get(), loopback_endpoint(acceptor)));
+            ctx.run();
+            ctx.restart();
+            clients.back()->set_option(net::socket_option::no_delay{true});
+            servers.back()->set_option(net::socket_option::no_delay{true});
+        }
+    }
+};
+
 // 回显 n 条固定长度消息。
 auto echo_n(net::tcp_socket* sock, std::size_t size, std::size_t n)
     CO2_BEG(net::task<>, (sock, size, n), std::vector<char> buf; std::size_t i{}; net::io_result<std::size_t> r;
@@ -81,6 +104,34 @@ auto ping_n(net::tcp_socket* sock, std::size_t size, std::size_t n)
         if (w.ec) break;
         CO2_AWAIT_SET(r, net::read(*sock, net::buffer(buf)));
         if (r.ec) break;
+    }
+}
+CO2_END
+
+// 同一往返，但直接用 read_some / write_some（回环上 64 B 一次就到）：与上面两行的差就是 net::read /
+// net::write 组合算法每次一个 task 帧的代价。
+auto echo_some_n(net::tcp_socket* sock, std::size_t size, std::size_t n)
+    CO2_BEG(net::task<>, (sock, size, n), std::vector<char> buf; std::size_t i{}; net::io_result<std::size_t> r;
+            net::io_result<std::size_t> w;) {
+    buf.resize(size);
+    for (i = 0; i != n; ++i) {
+        CO2_AWAIT_SET(r, sock->read_some(net::buffer(buf)));
+        if (r.ec || r.value != size) break;
+        CO2_AWAIT_SET(w, sock->write_some(net::buffer(buf)));
+        if (w.ec || w.value != size) break;
+    }
+}
+CO2_END
+
+auto ping_some_n(net::tcp_socket* sock, std::size_t size, std::size_t n)
+    CO2_BEG(net::task<>, (sock, size, n), std::vector<char> buf; std::size_t i{}; net::io_result<std::size_t> r;
+            net::io_result<std::size_t> w;) {
+    buf.assign(size, 'x');
+    for (i = 0; i != n; ++i) {
+        CO2_AWAIT_SET(w, sock->write_some(net::buffer(buf)));
+        if (w.ec || w.value != size) break;
+        CO2_AWAIT_SET(r, sock->read_some(net::buffer(buf)));
+        if (r.ec || r.value != size) break;
     }
 }
 CO2_END
@@ -162,6 +213,36 @@ void bench_backend(bench::options const& o, net::backend_kind const kind, std::v
 
     {
         connected_pair pair{kind};
+        results.push_back(bench::run(o, name + ": tcp echo round trip, 64 B, read_some/write_some", o.scale(20000U),
+                                     [&](std::size_t n) {
+                                         net::run_async(pair.ctx.get_executor())(echo_some_n(&pair.server, 64U, n));
+                                         net::run_async(pair.ctx.get_executor())(ping_some_n(&pair.client, 64U, n));
+                                         pair.ctx.run();
+                                     },
+                                     "no composed-op frames: the gap to the row above is net::read / net::write"));
+    }
+
+    {
+        // 32 条连接同时 ping-pong，4 个线程 run() 同一个 io_context：调度器交接（队列、锁、唤醒）的成本在这里。
+        constexpr std::size_t connections = 32U;
+        constexpr unsigned threads = 4U;
+        connected_pairs pairs{kind, connections};
+        results.push_back(bench::run(o, name + ": tcp echo 64 B, 32 conns x 4 threads", o.scale(4000U),
+                                     [&](std::size_t n) {
+                                         for (auto i = std::size_t{}; i != connections; ++i) {
+                                             net::run_async(pairs.ctx.get_executor())(echo_n(pairs.servers[i].get(), 64U, n));
+                                             net::run_async(pairs.ctx.get_executor())(ping_n(pairs.clients[i].get(), 64U, n));
+                                         }
+                                         std::vector<std::thread> workers;
+                                         for (auto t = 0U; t != threads; ++t) workers.emplace_back([&] { pairs.ctx.run(); });
+                                         for (auto& w : workers) w.join();
+                                         pairs.ctx.restart();
+                                     },
+                                     "ns per round trip per connection (wall / n)"));
+    }
+
+    {
+        connected_pair pair{kind};
         constexpr std::size_t chunk = 64U * 1024U;
         auto const total = o.scale(64U) * 1024U * 1024U; // 64 MiB（quick: 3 MiB）
         auto r = bench::run(o, name + ": tcp throughput, 64 KiB writes", 1U, [&](std::size_t) {
@@ -172,6 +253,8 @@ void bench_backend(bench::options const& o, net::backend_kind const kind, std::v
         auto const seconds = r.ns_per_op / 1e9;
         r.note = std::to_string(static_cast<long>(static_cast<double>(total) / (1024.0 * 1024.0) / seconds)) + " MiB/s";
         r.ns_per_op = r.ns_per_op / static_cast<double>(total / chunk); // ns per 64 KiB chunk
+        r.user_ns_per_op /= static_cast<double>(total / chunk);
+        r.system_ns_per_op /= static_cast<double>(total / chunk);
         r.iterations = total / chunk;
         results.push_back(std::move(r));
     }
