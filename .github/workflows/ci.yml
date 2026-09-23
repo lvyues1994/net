@@ -318,25 +318,37 @@ jobs:
       - name: Build
         run: cmake --build build
 
+      # 结果文件开头记下提交号与 CPU 型号（比较脚本据此判断同一提交 / 同一机型）；整套跑三遍，比较时同名行
+      # 取最小值——单遍时同一颗核上 TCP 往返行两次运行能差 17%，三遍取最小压到 3% 左右。
       - name: Run
         run: |
           cd build/benchmarks
           {
-            ./bench_core --quick
-            ./bench_net --quick
-            ./bench_tls --quick
-            [ -x ./bench_asio ] && ./bench_asio --quick
-            [ -x ./bench_libuv ] && ./bench_libuv --quick
+            echo "# sha=${GITHUB_SHA}"
+            echo "# cpu=$(LC_ALL=C lscpu | sed -n 's/^Model name:[[:space:]]*//p' | head -1)"
+            echo "# nproc=$(nproc)"
+            for pass in 1 2 3; do
+              echo "# pass=${pass}"
+              ./bench_core --quick
+              ./bench_net --quick
+              ./bench_tls --quick
+              if [ -x ./bench_asio ]; then ./bench_asio --quick; fi
+              if [ -x ./bench_libuv ]; then ./bench_libuv --quick; fi
+            done
           } | tee ../../benchmark-results.txt
           {
-            echo '## Benchmarks (quick mode, shared CI runner: numbers are indicative only)'
+            echo '## Benchmarks (quick mode, 3 passes, shared CI runner: numbers are indicative only)'
+            echo '<details><summary>raw output</summary>'
+            echo
             echo '```'
             cat ../../benchmark-results.txt
             echo '```'
+            echo '</details>'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # 回归门：与 main 上最近一次成功运行的 artifact 逐行比，ns/op 退化超过 15% 发 warning 注解（不让作业失败：
-      # 共享 runner 的噪声就有 ±10%，连续两次超阈值才值得追）。
+      # 回归门：与 main 上最近一次成功运行的 artifact 逐行比（warning 注解，不让作业失败）。共享 runner 每次可能是
+      # 不同机型，所以按同一次运行里 Asio / libuv 参照行的变化扣掉机器快慢再判断；同一提交重跑不报警。
+      # 规则与验证见 .github/scripts/compare_benchmarks.py 开头。
       - name: Fetch previous results
         env:
           GH_TOKEN: ${{ github.token }}
@@ -349,7 +361,9 @@ jobs:
           fi
 
       - name: Compare with previous
-        run: python3 .github/scripts/compare_benchmarks.py previous/benchmark-results.txt benchmark-results.txt --threshold 0.15 >> "$GITHUB_STEP_SUMMARY"
+        run: >
+          python3 .github/scripts/compare_benchmarks.py previous/benchmark-results.txt benchmark-results.txt
+          --threshold 0.15 --cross-machine-threshold 0.25 >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         with:
