@@ -79,12 +79,21 @@ bool tcp_accept_awaitable::await_ready() noexcept {
     return acceptor->impl()->ready(detail::op_direction::read);
 }
 
+bool tcp_accept_awaitable::await_ready(io_env const* const env) noexcept {
+    if (env->stop_token.stop_requested()) {
+        stopped = true;
+        return true;
+    }
+    return await_ready();
+}
+
 coroutine_handle<> tcp_accept_awaitable::await_suspend(coroutine_handle<> const h,
                                                        io_env const* const env) noexcept {
     return acceptor->impl()->suspend(detail::op_direction::read, h, env);
 }
 
 io_result<tcp_socket> tcp_accept_awaitable::await_resume() noexcept {
+    if (stopped) return io_result<tcp_socket>{make_error_code(error::operation_aborted), tcp_socket{}};
     auto* const impl = acceptor->impl();
     auto fd = invalid_socket;
     auto family = 0;

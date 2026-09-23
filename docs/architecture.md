@@ -73,6 +73,17 @@ co2 的 `CO2_AWAIT(e)` 展开为标准的 `co_await` 序列：`promise.await_tra
 `set_cached_frame_allocator(env->frame_allocator)` 再转发。`Inner` 没有双参数
 `await_suspend` 时 `static_assert` 给出清晰的诊断。
 
+**内部扩展 `await_ready(io_env const*)`**（不属于协议，外部 awaiter 不必提供）：协议只在 `await_suspend` 里交出环境，
+而本库的传输操作在 `await_ready` 里就推测执行——数据已就绪时根本走不到 `await_suspend`，stop_token 被绕过：停止已
+请求时，一个读循环在对端持续发数据的连接上永远不会因取消而退出。`env_awaiter::await_ready` 于是先看内层有没有
+`await_ready(io_env const*)`（`await_ready_with`），有就调它：套接字 / 文件 / accept / 定时器 / 信号 / `receive_source`
+的 awaiter 在推测之前查 `stop_requested()`，已请求就记 `stopped`、直接就绪，`await_resume` 返回 `operation_aborted`，
+不碰后端（`begin_*` 只记录参数，跳过 `ready()` 不留半截状态）。组合 awaiter 把环境转下去：`net::read` / `net::write`
+每一段、`timeout()` 的内层操作、`delay()`、`any_stream` 与源 / 汇的类型擦除（vtable 的 ready 多一个 env 参数）。
+TLS 读写在驱动协程开头查一次（明文已解密缓存时 `SSL_read` 不碰底层流）。语义只针对"开始前已请求"：已经完成的
+操作照实返回——Corosio 在 `await_resume` 看到停止就把已读到的字节改报 canceled、字节数 0，在流上会丢数据，这里不学。
+每个操作多一次 `stop_requested()` 原子读，64 B 往返的差异在噪声内（< 1%）。
+
 一个实现细节：基类模板里对 `Derived` 成员的访问必须是依赖名（`template <class A,
 class D = Derived>`），否则 GCC 在基类实例化时就检查它，而此时 `Derived` 不完整——
 co2 的 D9 宽松规则会把 SFINAE 失败当成"没有 await_transform"静默回落到原始 awaitable。

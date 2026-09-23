@@ -2,6 +2,7 @@
 
 #include "co2/contract.hpp"
 
+#include "net/error.hpp"
 #include "net/io_context.hpp"
 
 #include "detail/backend.hpp"
@@ -14,12 +15,23 @@ namespace net {
 
 bool timer_wait_awaitable::await_ready() noexcept { return impl->ready(); }
 
+bool timer_wait_awaitable::await_ready(io_env const* const env) noexcept {
+    if (env->stop_token.stop_requested()) {
+        stopped = true;
+        return true;
+    }
+    return await_ready();
+}
+
 coroutine_handle<> timer_wait_awaitable::await_suspend(coroutine_handle<> const h,
                                                        io_env const* const env) noexcept {
     return impl->suspend(h, env);
 }
 
-io_result<> timer_wait_awaitable::await_resume() noexcept { return impl->finish(); }
+io_result<> timer_wait_awaitable::await_resume() noexcept {
+    if (stopped) return io_result<>{make_error_code(error::operation_aborted)};
+    return impl->finish();
+}
 
 // ---- steady_timer ----
 

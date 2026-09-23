@@ -126,8 +126,13 @@ template <class Stream, class Sequence, class Direction> struct transfer_awaitab
     transfer_awaitable& operator=(transfer_awaitable const&) = delete;
     transfer_awaitable& operator=(transfer_awaitable&&) = delete;
 
-    // 同步推进到"完成"（真）或"这一段需要等待"（假；inner 已构造并已发起）。
+    // 同步推进到"完成"（真）或"这一段需要等待"（假；inner 已构造并已发起）。带环境的版本把 env 转给每一段，
+    // 停止已请求时下一段以 operation_aborted 结束，整个操作返回 {aborted, 已传输的字节}。
     bool await_ready() { return advance(); }
+    bool await_ready(io_env const* const e) {
+        env = e;
+        return advance();
+    }
 
     coroutine_handle<> await_suspend(coroutine_handle<> const h, io_env const* const e) {
         parent = h;
@@ -147,7 +152,7 @@ template <class Stream, class Sequence, class Direction> struct transfer_awaitab
             if (total >= buffer_size(buffers)) return true;
             inner.emplace(co2::detail::getAwaiter(
                 Direction::start(*stream, window_of<buffer_type>(buffers, total, single{}))));
-            if (not inner.get().await_ready()) return false;
+            if (not await_ready_with(inner.get(), env)) return false;
             auto const partial = inner.get().await_resume();
             inner.reset();
             total += partial.value;

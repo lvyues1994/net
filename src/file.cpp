@@ -22,12 +22,21 @@ bool file_read_awaitable::await_ready() noexcept {
     return false;
 }
 
+bool file_read_awaitable::await_ready(io_env const* const env) noexcept {
+    if (env->stop_token.stop_requested()) {
+        stopped = true;
+        return true;
+    }
+    return await_ready();
+}
+
 coroutine_handle<> file_read_awaitable::await_suspend(coroutine_handle<> const h, io_env const* const env) noexcept {
     if (impl->deferred.post_if_armed(detail::op_direction::read, h, env)) return noop_coroutine();
     return detail::suspend_within_budget(*impl, detail::op_direction::read, h, env);
 }
 
 io_result<std::size_t> file_read_awaitable::await_resume() noexcept {
+    if (stopped) return io_result<std::size_t>{make_error_code(error::operation_aborted), 0U};
     auto const r = impl->finish_transfer(detail::op_direction::read);
     if (advance != nullptr && not r.ec) *advance += r.value;
     return r;
@@ -40,12 +49,21 @@ bool file_write_awaitable::await_ready() noexcept {
     return false;
 }
 
+bool file_write_awaitable::await_ready(io_env const* const env) noexcept {
+    if (env->stop_token.stop_requested()) {
+        stopped = true;
+        return true;
+    }
+    return await_ready();
+}
+
 coroutine_handle<> file_write_awaitable::await_suspend(coroutine_handle<> const h, io_env const* const env) noexcept {
     if (impl->deferred.post_if_armed(detail::op_direction::write, h, env)) return noop_coroutine();
     return detail::suspend_within_budget(*impl, detail::op_direction::write, h, env);
 }
 
 io_result<std::size_t> file_write_awaitable::await_resume() noexcept {
+    if (stopped) return io_result<std::size_t>{make_error_code(error::operation_aborted), 0U};
     auto const r = impl->finish_transfer(detail::op_direction::write);
     if (advance != nullptr && not r.ec) *advance += r.value;
     return r;

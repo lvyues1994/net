@@ -34,7 +34,7 @@ namespace detail {
 
 template <class Buffer, class IoResult> struct any_stream_vtable {
     void (*construct_awaitable)(void* stream, void* storage, span<Buffer const> buffers);
-    bool (*await_ready)(void* awaitable);
+    bool (*await_ready)(void* awaitable, io_env const* env); // env 可空：见 await_ready_with
     coroutine_handle<> (*await_suspend)(void* awaitable, coroutine_handle<> h, io_env const* env);
     IoResult (*await_resume)(void* awaitable);
     void (*destroy_awaitable)(void* awaitable) noexcept;
@@ -102,7 +102,11 @@ template <class Buffer, class Direction> struct any_stream_base {
     struct awaitable {
         any_stream_base* self;
 
-        bool await_ready() {
+        bool await_ready() { return start(nullptr); }
+        // 把环境穿过类型擦除边界交给具体流的 awaiter：停止已请求时它不推测、直接 operation_aborted。
+        bool await_ready(io_env const* const env) { return start(env); }
+
+        bool start(io_env const* const env) {
             CO2_CONTRACT_CHECK(not self->awaitable_active_);
             self->vt_->construct_awaitable(self->stream_, self->awaitable_storage_,
                                            self->pending_.to_span());
@@ -117,7 +121,7 @@ template <class Buffer, class Direction> struct any_stream_base {
                     }
                 }
             } guard{self, true};
-            auto const ready = self->vt_->await_ready(self->awaitable_storage_);
+            auto const ready = self->vt_->await_ready(self->awaitable_storage_, env);
             guard.armed = false;
             return ready;
         }
@@ -167,7 +171,9 @@ template <class Buffer, class Direction> struct any_stream_base {
             auto& s = *static_cast<S*>(stream);
             ::new (storage) awaitable_type(co2::detail::getAwaiter(Direction::start(s, buffers)));
         }
-        static bool ready(void* const p) { return static_cast<awaitable_type*>(p)->await_ready(); }
+        static bool ready(void* const p, io_env const* const env) {
+            return await_ready_with(*static_cast<awaitable_type*>(p), env);
+        }
         static coroutine_handle<> suspend(void* const p, coroutine_handle<> const h,
                                           io_env const* const env) {
             return static_cast<awaitable_type*>(p)->await_suspend(h, env);

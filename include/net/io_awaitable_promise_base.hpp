@@ -41,6 +41,27 @@ struct is_io_awaitable_impl<
                                                         std::declval<io_env const*>()))>>
     : std::true_type {};
 
+// 内部扩展（不属于 IoAwaitable 协议）：awaiter 可以额外提供 await_ready(io_env const*)，env_awaiter 优先调它。
+// 协议只在 await_suspend 里交出 io_env，而本库的传输操作在 await_ready 里就推测执行——数据已就绪时根本
+// 走不到 await_suspend，stop_token 就被绕过了。有了环境，awaiter 能在推测之前看到"停止已请求"，让尚未开始的
+// 操作直接以 operation_aborted 完成；已经完成的操作照实返回。外部的 awaiter 不需要提供它；组合 awaiter
+//（read / write、timeout、any_stream）自己提供并把 env 转给内层。
+template <class A, class = void> struct has_env_await_ready : std::false_type {};
+
+template <class A>
+struct has_env_await_ready<A, void_t<decltype(std::declval<A&>().await_ready(std::declval<io_env const*>()))>>
+    : std::true_type {};
+
+template <class A> bool await_ready_with(A& awaiter, io_env const* const env, std::true_type) {
+    return env != nullptr ? awaiter.await_ready(env) : awaiter.await_ready();
+}
+
+template <class A> bool await_ready_with(A& awaiter, io_env const*, std::false_type) { return awaiter.await_ready(); }
+
+template <class A> bool await_ready_with(A& awaiter, io_env const* const env) {
+    return await_ready_with(awaiter, env, has_env_await_ready<A>{});
+}
+
 // 不挂起、直接交出一个值的 awaiter（this_coro 标签用）。
 template <class T> struct immediate_value {
     T value;
@@ -66,7 +87,7 @@ template <class Inner> struct env_awaiter {
     env_awaiter& operator=(env_awaiter const&) = delete;
     env_awaiter& operator=(env_awaiter&&) = delete;
 
-    bool await_ready() { return inner.await_ready(); }
+    bool await_ready() { return await_ready_with(inner, env); }
 
     template <class Promise>
     auto await_suspend(coroutine_handle<Promise> const awaiting)

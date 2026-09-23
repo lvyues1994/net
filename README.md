@@ -96,8 +96,11 @@ coroutine_handle<> await_suspend(coroutine_handle<> h, io_env const* env);
 帧分配器。
 
 **取消**是协作式的：`stop_token` 请求停止 → 未完成的 I/O 以 `error::operation_aborted`
-完成 → 协程照常恢复、走到 `final_suspend` → 拥有者销毁。`when_all` 任一子任务返回 `ec`
-或抛出即向兄弟请求停止；`when_any` 第一个成功者胜出后取消其余。
+完成 → 协程照常恢复、走到 `final_suspend` → 拥有者销毁。停止在操作开始前就已请求时，操作不执行、直接以
+`operation_aborted` 完成——包括数据已就绪、本可同步完成的读写（套接字、文件、accept、定时器、`net::read` /
+`net::write` 的每一段、`any_stream`、TLS 读写）；已经完成的操作照实返回，不会把读到的字节改报成取消。connect
+例外：它在发起时就调用了 `connect()`。`when_all` 任一子任务返回 `ec` 或抛出即向兄弟请求停止；`when_any`
+第一个成功者胜出后取消其余。
 
 **后端**：`net::io_context ctx{net::io_uring};` 选择事件机制（默认 epoll；poll / select
 是电平触发的就绪型，select 受 `FD_SETSIZE` 限制；io_uring 是完成型，裸系统调用实现、不依赖

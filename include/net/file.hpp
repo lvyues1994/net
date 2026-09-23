@@ -67,7 +67,10 @@ struct file_read_awaitable {
     detail::file_impl* impl;
     std::uint64_t* advance; // stream_file：完成后把位置前进 n；random_access_file：空
 
+    bool stopped = false; // 停止在操作开始前已请求：不执行，以 operation_aborted 完成
+
     bool await_ready() noexcept;
+    bool await_ready(io_env const* env) noexcept; // 见 io_awaitable_promise_base.hpp 的 await_ready_with
     coroutine_handle<> await_suspend(coroutine_handle<> h, io_env const* env) noexcept;
     io_result<std::size_t> await_resume() noexcept;
 };
@@ -76,7 +79,10 @@ struct file_write_awaitable {
     detail::file_impl* impl;
     std::uint64_t* advance;
 
+    bool stopped = false; // 停止在操作开始前已请求：不执行，以 operation_aborted 完成
+
     bool await_ready() noexcept;
+    bool await_ready(io_env const* env) noexcept; // 见 io_awaitable_promise_base.hpp 的 await_ready_with
     coroutine_handle<> await_suspend(coroutine_handle<> h, io_env const* env) noexcept;
     io_result<std::size_t> await_resume() noexcept;
 };

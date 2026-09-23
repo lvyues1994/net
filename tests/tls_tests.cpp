@@ -23,6 +23,7 @@
 #include "net/timer.hpp"
 #include "net/tls/context.hpp"
 #include "net/tls/error.hpp"
+#include "net/test/run_blocking.hpp"
 #include "net/tls/stream.hpp"
 #include "net/when_all.hpp"
 #include "net/when_any.hpp"
@@ -911,6 +912,50 @@ void ocsp_stapling_is_requested_and_verified() {
     }
 }
 
+// 停止在读开始前已请求：TLS 读不执行（明文已缓存时 SSL_read 不碰底层流，底层的检查管不到它）。
+auto tls_write_text(net::tls::stream* tls, std::string const* text)
+    CO2_BEG((net::task<net::io_result<std::size_t>>), (tls, text), net::io_result<std::size_t> w;) {
+    CO2_AWAIT_SET(w, net::write(*tls, net::buffer(*text)));
+    CO2_RETURN(w);
+}
+CO2_END
+
+auto tls_read_once(net::tls::stream* tls, std::string* out, std::size_t limit)
+    CO2_BEG((net::task<net::io_result<std::size_t>>), (tls, out, limit), char buf[64]; net::io_result<std::size_t> r;) {
+    CO2_AWAIT_SET(r, tls->read_some(net::buffer(buf, limit)));
+    if (not r.ec) out->assign(buf, r.value);
+    CO2_RETURN(r);
+}
+CO2_END
+
+void stopped_token_skips_a_tls_read() {
+    connected_pair pair;
+    auto server_ctx = server_context();
+    auto client_ctx = client_context();
+    net::tls::openssl_stream server{&pair.server, server_ctx};
+    net::tls::openssl_stream client{&pair.client, client_ctx};
+    client.set_hostname("localhost");
+    std::error_code server_ec;
+    std::error_code client_ec;
+    net::run_async(pair.ctx.get_executor(), [&](std::error_code e) { server_ec = e; }, [](std::exception_ptr) { CHECK(false); })(server_handshake_only(&server));
+    net::run_async(pair.ctx.get_executor(), [&](std::error_code e) { client_ec = e; }, [](std::exception_ptr) { CHECK(false); })(client_handshake_only(&client));
+    pair.ctx.run();
+    CHECK(not server_ec);
+    CHECK(not client_ec);
+    std::string const text = "hello";
+    CHECK(not net::test::run_blocking(pair.ctx, tls_write_text(&server, &text)).ec);
+    // 先读 2 字节：整条记录已解密，剩下的 3 字节留在 SSL 的明文缓存里，下一次读不需要碰底层流。
+    std::string got;
+    auto const head = net::test::run_blocking(pair.ctx, tls_read_once(&client, &got, 2U));
+    CHECK(not head.ec);
+    CHECK_EQ(got, "he");
+    auto const aborted = net::test::run_blocking(pair.ctx, net::test::stopped_token(), tls_read_once(&client, &got, 64U));
+    CHECK(aborted.ec == net::error::operation_aborted);
+    auto const r = net::test::run_blocking(pair.ctx, tls_read_once(&client, &got, 64U));
+    CHECK(not r.ec);
+    CHECK_EQ(got, "llo");
+}
+
 } // namespace
 
 int main() {
@@ -934,6 +979,7 @@ int main() {
     sni_callback_switches_the_server_context();
     crl_revocation_is_enforced();
     ocsp_stapling_is_requested_and_verified();
+    stopped_token_skips_a_tls_read();
     std::cout << "tls tests passed (" << net::tls::provider_name() << ")\n";
     return 0;
 }

@@ -321,6 +321,14 @@ bool signal_wait_awaitable::await_ready() noexcept {
     return true;
 }
 
+bool signal_wait_awaitable::await_ready(io_env const* const env) noexcept {
+    if (env->stop_token.stop_requested()) {
+        stopped = true;
+        return true;
+    }
+    return await_ready();
+}
+
 coroutine_handle<> signal_wait_awaitable::await_suspend(coroutine_handle<> const h,
                                                         io_env const* const env) noexcept {
     impl->cont.h = h;
@@ -353,6 +361,7 @@ coroutine_handle<> signal_wait_awaitable::await_suspend(coroutine_handle<> const
 }
 
 io_result<int> signal_wait_awaitable::await_resume() noexcept {
+    if (stopped) return io_result<int>{make_error_code(error::operation_aborted), 0}; // 排队的信号留给下一次 wait
     impl->stop_cb.reset(); // 之后不再有取消回调
     impl->cancel_requested = false; // 交付后、恢复前到达的取消留下的过期标记
     impl->pending = false;

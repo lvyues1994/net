@@ -131,6 +131,18 @@ void already_stopped_token_completes_without_waiting() {
     CHECK(ec == net::error::operation_aborted);
 }
 
+// 已到期的定时器本可在 await_ready 里直接完成，但停止在先：operation_aborted。
+void expired_timer_with_stopped_token_is_aborted() {
+    test_context ctx;
+    net::stop_source source;
+    source.request_stop();
+    std::error_code ec;
+    net::run_async(ctx.get_executor(), source.get_token(), nullptr, [&](std::error_code e) { ec = e; },
+                   [](std::exception_ptr) { CHECK(false); })(wait_for(&ctx, milliseconds{0}));
+    ctx.run();
+    CHECK(ec == net::error::operation_aborted);
+}
+
 auto record_order(net::io_context* ctx, milliseconds d, int id, std::vector<int>* order)
     CO2_BEG(net::task<>, (ctx, d, id, order), net::steady_timer timer{*ctx}; net::io_result<> r;) {
     timer.expires_after(d);
@@ -179,6 +191,7 @@ int main() {
     expires_after_cancels_a_pending_wait();
     stop_token_cancels_the_wait();
     already_stopped_token_completes_without_waiting();
+    expired_timer_with_stopped_token_is_aborted();
     timers_fire_in_expiry_order();
     many_timers_via_when_all();
     std::cout << "timer tests passed\n";

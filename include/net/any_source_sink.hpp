@@ -34,14 +34,14 @@ namespace detail {
 // ---- 就地构造的类型擦除 awaiter ----
 
 template <class Result> struct erased_ops {
-    bool (*ready)(void* awaiter);
+    bool (*ready)(void* awaiter, io_env const* env); // env 可空：见 await_ready_with
     coroutine_handle<> (*suspend)(void* awaiter, coroutine_handle<> h, io_env const* env);
     Result (*resume)(void* awaiter);
     void (*destroy)(void* awaiter) noexcept;
 };
 
 template <class Awaiter, class Result> struct erased_ops_for {
-    static bool ready(void* const p) { return static_cast<Awaiter*>(p)->await_ready(); }
+    static bool ready(void* const p, io_env const* const env) { return await_ready_with(*static_cast<Awaiter*>(p), env); }
     static coroutine_handle<> suspend(void* const p, coroutine_handle<> const h, io_env const* const env) {
         return static_cast<Awaiter*>(p)->await_suspend(h, env);
     }
@@ -99,7 +99,10 @@ template <class Result> struct erased_awaitable {
     construct_fn construct;
     erased_ops<Result> const* ops = nullptr;
 
-    bool await_ready() {
+    bool await_ready() { return start(nullptr); }
+    bool await_ready(io_env const* const env) { return start(env); }
+
+    bool start(io_env const* const env) {
         CO2_CONTRACT_CHECK(construct != nullptr);
         CO2_CONTRACT_CHECK(not slot->active); // 同一对象同时只能有一个操作
         ops = construct(object, args, slot->storage);
@@ -114,7 +117,7 @@ template <class Result> struct erased_awaitable {
                 }
             }
         } guard{this, true};
-        auto const ready = ops->ready(slot->storage);
+        auto const ready = ops->ready(slot->storage, env);
         guard.armed = false;
         return ready;
     }

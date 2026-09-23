@@ -29,7 +29,10 @@ struct signal_set_impl;
 struct signal_wait_awaitable {
     detail::signal_set_impl* impl;
 
+    bool stopped = false; // 停止在操作开始前已请求：不执行，以 operation_aborted 完成
+
     bool await_ready() noexcept;
+    bool await_ready(io_env const* env) noexcept; // 见 io_awaitable_promise_base.hpp 的 await_ready_with
     coroutine_handle<> await_suspend(coroutine_handle<> h, io_env const* env) noexcept;
     io_result<int> await_resume() noexcept;
 };

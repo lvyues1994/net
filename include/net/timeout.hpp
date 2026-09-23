@@ -84,14 +84,9 @@ template <class A> struct timeout_awaitable {
     timeout_awaitable& operator=(timeout_awaitable const&) = delete;
     timeout_awaitable& operator=(timeout_awaitable&&) = delete;
 
-    // 操作不用等就完成：不建定时器。
-    bool await_ready() {
-        inner.emplace(co2::detail::getAwaiter(std::move(awaitable)));
-        if (not inner.get().await_ready()) return false;
-        winner.store(inner_won, std::memory_order_relaxed);
-        capture_inner();
-        return true;
-    }
+    // 操作不用等就完成：不建定时器。带环境的版本把父环境转给操作（停止已请求时它以 operation_aborted 结束）。
+    bool await_ready() { return start(nullptr); }
+    bool await_ready(io_env const* const env) { return start(env); }
 
     coroutine_handle<> await_suspend(coroutine_handle<> const h, io_env const* const env) {
         parent.h = h;
@@ -143,6 +138,14 @@ template <class A> struct timeout_awaitable {
     static constexpr unsigned none = 0U;
     static constexpr unsigned inner_won = 1U;
     static constexpr unsigned timer_won = 2U;
+
+    bool start(io_env const* const env) {
+        inner.emplace(co2::detail::getAwaiter(std::move(awaitable)));
+        if (not await_ready_with(inner.get(), env)) return false;
+        winner.store(inner_won, std::memory_order_relaxed);
+        capture_inner();
+        return true;
+    }
 
     bool claim(unsigned const who) noexcept {
         auto expected = none;
@@ -220,8 +223,8 @@ struct delay_awaitable {
         timer.emplace(*context);
         timer.get().expires_at(deadline.resolve());
         wait.emplace(timer.get().wait());
-        if (wait.get().await_ready()) return h;
-        return wait.get().await_suspend(h, env); // 定时器直接恢复父协程；stop_token 由它处理
+        if (await_ready_with(wait.get(), env)) return h; // 停止已请求：不等，operation_aborted
+        return wait.get().await_suspend(h, env);          // 定时器直接恢复父协程；stop_token 由它处理
     }
 
     io_result<> await_resume() noexcept {

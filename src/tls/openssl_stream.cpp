@@ -15,6 +15,7 @@
 #include "net/io_env.hpp"
 #include "net/ip.hpp"
 #include "net/stream.hpp"
+#include "net/this_coro.hpp"
 #include "net/tls/error.hpp"
 
 #include "tls/context_impl.hpp"
@@ -341,10 +342,15 @@ struct openssl_stream_impl final : detail::stream_hooks {
 namespace {
 
 // 驱动协程：调用引擎 → 冲输出 → 需要时读输入 → 重复到完成。
+// 读写开始前查一次停止：明文已解密缓存时 SSL_read 不碰底层流，底层 awaiter 的检查管不到它。
 auto run_op(openssl_stream_impl* self, op_kind kind, mutable_buffer_array<> read_buffers,
             const_buffer_array<> write_buffers)
     CO2_BEG((task<io_result<std::size_t>>), (self, kind, read_buffers, write_buffers), engine_step step;
-            io_result<std::size_t> io; std::size_t chunk{};) {
+            io_result<std::size_t> io; std::size_t chunk{}; stop_token token;) {
+    if (kind == op_kind::read || kind == op_kind::write) {
+        CO2_AWAIT_SET(token, this_coro::stop_token);
+        if (token.stop_requested()) CO2_RETURN((io_result<std::size_t>{make_error_code(error::operation_aborted), 0U}));
+    }
     for (;;) {
         step = self->run_engine(kind, read_buffers, write_buffers);
         if (self->pending_output() != 0U) {

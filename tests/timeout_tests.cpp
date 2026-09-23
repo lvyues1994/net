@@ -215,6 +215,23 @@ void delay_waits_and_is_cancellable() {
     CHECK(steady_clock::now() - before < seconds{5});
 }
 
+// 停止在开始前已请求：delay 不等、timeout 里的操作不执行（数据已就绪也一样），都是 operation_aborted。
+void stopped_before_start() {
+    test_context ctx;
+    auto const d = net::test::run_blocking(ctx, net::test::stopped_token(), sleep_for(milliseconds{0}));
+    CHECK(d.ec == net::error::operation_aborted);
+
+    connected_pair pair;
+    std::string payload = "ready";
+    CHECK(not net::test::run_blocking(pair.ctx, write_once(&pair.server, &payload)).ec);
+    auto const r = net::test::run_blocking(pair.ctx, net::test::stopped_token(), timed_read(&pair.client, seconds{1}));
+    CHECK(r.ec == net::error::operation_aborted);
+    CHECK(not(r.ec == net::cond::timeout));
+    auto const again = net::test::run_blocking(pair.ctx, timed_read(&pair.client, seconds{1}));
+    CHECK(not again.ec);
+    CHECK_EQ(again.value, 5U);
+}
+
 // cond 与各来源错误码的等价关系。
 void portable_conditions() {
     CHECK(make_error_code(net::error::eof) == net::cond::eof);
@@ -247,6 +264,7 @@ int main() {
     exception_propagates_through_timeout();
     absolute_deadline();
     delay_waits_and_is_cancellable();
+    stopped_before_start();
     std::cout << "timeout tests passed\n";
     return 0;
 }

@@ -23,6 +23,7 @@
 #include "net/stream.hpp"
 #include "net/task.hpp"
 #include "net/tcp.hpp"
+#include "net/test/run_blocking.hpp"
 #include "net/timer.hpp"
 #include "net/when_all.hpp"
 #include "net/when_any.hpp"
@@ -893,6 +894,88 @@ void inline_completion_budget_yields_to_other_coroutines() {
     CHECK(seen >= NET_INLINE_COMPLETION_BUDGET);            // 而不是每次读都让
 }
 
+// ---- 停止在操作开始前已请求：不执行，operation_aborted（推测本可同步完成也一样） ----
+
+auto read_once(net::tcp_socket* sock, std::string* out)
+    CO2_BEG((net::task<net::io_result<std::size_t>>), (sock, out), char buf[64]; net::io_result<std::size_t> r;) {
+    CO2_AWAIT_SET(r, sock->read_some(net::buffer(buf)));
+    if (not r.ec) out->assign(buf, r.value);
+    CO2_RETURN(r);
+}
+CO2_END
+
+auto write_string(net::tcp_socket* sock, std::string const* data)
+    CO2_BEG((net::task<net::io_result<std::size_t>>), (sock, data), net::io_result<std::size_t> w;) {
+    CO2_AWAIT_SET(w, net::write(*sock, net::buffer(*data)));
+    CO2_RETURN(w);
+}
+CO2_END
+
+auto read_erased_once(net::any_stream* stream) CO2_BEG((net::task<net::io_result<std::size_t>>), (stream), char buf[64];
+                                                       net::io_result<std::size_t> r;) {
+    CO2_AWAIT_SET(r, stream->read_some(net::buffer(buf)));
+    CO2_RETURN(r);
+}
+CO2_END
+
+auto accept_once(net::tcp_acceptor* acceptor, net::tcp_socket* out)
+    CO2_BEG((net::task<std::error_code>), (acceptor, out), net::io_result<net::tcp_socket> accepted;) {
+    CO2_AWAIT_SET(accepted, acceptor->accept());
+    if (not accepted.ec) *out = std::move(accepted.value);
+    CO2_RETURN(accepted.ec);
+}
+CO2_END
+
+void stop_requested_before_start_aborts_even_when_ready() {
+    connected_pair pair;
+    std::vector<char> const greeting{'b', 'u', 'f', 'f', 'e', 'r', 'e', 'd'};
+    net::run_async(pair.ctx.get_executor())(write_block(&pair.server, &greeting));
+    pair.ctx.run();
+    pair.ctx.restart();
+
+    // 数据已在接收队列里：推测读本可立刻成功，但停止在先。
+    std::string got;
+    auto const aborted_read = net::test::run_blocking(pair.ctx, net::test::stopped_token(), read_once(&pair.client, &got));
+    CHECK(aborted_read.ec == net::error::operation_aborted);
+    CHECK_EQ(aborted_read.value, 0U);
+    // 数据没有被那次读消费。
+    auto const read = net::test::run_blocking(pair.ctx, read_once(&pair.client, &got));
+    CHECK(not read.ec);
+    CHECK_EQ(got, "buffered");
+
+    // 组合写：一个字节都不发。
+    std::string const lost = "lost";
+    auto const aborted_write = net::test::run_blocking(pair.ctx, net::test::stopped_token(), write_string(&pair.client, &lost));
+    CHECK(aborted_write.ec == net::error::operation_aborted);
+    CHECK_EQ(aborted_write.value, 0U);
+    std::string const marker = "x";
+    CHECK(not net::test::run_blocking(pair.ctx, write_string(&pair.client, &marker)).ec);
+    auto const echoed = net::test::run_blocking(pair.ctx, read_once(&pair.server, &got));
+    CHECK(not echoed.ec);
+    CHECK_EQ(got, "x");
+
+    // 穿过类型擦除边界也一样。
+    CHECK(not net::test::run_blocking(pair.ctx, write_string(&pair.server, &marker)).ec);
+    net::any_stream erased{&pair.client};
+    CHECK(net::test::run_blocking(pair.ctx, net::test::stopped_token(), read_erased_once(&erased)).ec ==
+          net::error::operation_aborted);
+    auto const erased_read = net::test::run_blocking(pair.ctx, read_erased_once(&erased));
+    CHECK(not erased_read.ec);
+    CHECK_EQ(erased_read.value, 1U);
+
+    // accept：连接已在队列里，停止在先 → 不接受；之后正常 accept 拿到它。
+    net::tcp_socket late{pair.ctx};
+    net::run_async(pair.ctx.get_executor())(connect_only(&late, loopback_endpoint(pair.acceptor)));
+    pair.ctx.run();
+    pair.ctx.restart();
+    net::tcp_socket accepted;
+    CHECK(net::test::run_blocking(pair.ctx, net::test::stopped_token(), accept_once(&pair.acceptor, &accepted)) ==
+          net::error::operation_aborted);
+    CHECK(not accepted.is_open());
+    CHECK(not net::test::run_blocking(pair.ctx, accept_once(&pair.acceptor, &accepted)));
+    CHECK(accepted.is_open());
+}
+
 } // namespace
 
 int main() {
@@ -921,6 +1004,7 @@ int main() {
     receive_source_composes_with_transfer();
     endpoints_and_options();
     inline_completion_budget_yields_to_other_coroutines();
+    stop_requested_before_start_aborts_even_when_ready();
     std::cout << "tcp tests passed\n";
     return 0;
 }

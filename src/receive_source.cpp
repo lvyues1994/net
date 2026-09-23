@@ -140,10 +140,21 @@ void receive_source::cancel() noexcept { impl_->cancel(); }
 
 bool receive_pull_awaitable::await_ready() noexcept { return self->impl_->pull_ready(); }
 
+bool receive_pull_awaitable::await_ready(io_env const* const env) noexcept {
+    if (env->stop_token.stop_requested()) {
+        stopped = true;
+        return true;
+    }
+    return await_ready();
+}
+
 coroutine_handle<> receive_pull_awaitable::await_suspend(coroutine_handle<> const h, io_env const* const env) noexcept {
     return self->impl_->pull_suspend(h, env);
 }
 
-io_result<const_buffer_span> receive_pull_awaitable::await_resume() noexcept { return self->impl_->pull_finish(dest); }
+io_result<const_buffer_span> receive_pull_awaitable::await_resume() noexcept {
+    if (stopped) return io_result<const_buffer_span>{make_error_code(error::operation_aborted), const_buffer_span{}};
+    return self->impl_->pull_finish(dest);
+}
 
 } // namespace net

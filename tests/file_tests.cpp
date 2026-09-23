@@ -20,6 +20,7 @@
 #include "net/stream.hpp"
 #include "net/task.hpp"
 #include "net/tcp.hpp"
+#include "net/test/run_blocking.hpp"
 #include "net/when_all.hpp"
 
 #include "check.hpp"
@@ -432,6 +433,34 @@ void open_flags_and_errors() {
     CHECK(not src.is_open());
 }
 
+// 停止在开始前已请求：就绪型后端上本会同步 preadv 的读不执行，位置不动；之后照常读。
+auto read_chunk(net::stream_file* file, std::string* out)
+    CO2_BEG((net::task<net::io_result<std::size_t>>), (file, out), char buf[16]; net::io_result<std::size_t> r;) {
+    CO2_AWAIT_SET(r, file->read_some(net::buffer(buf)));
+    if (not r.ec) out->assign(buf, r.value);
+    CO2_RETURN(r);
+}
+CO2_END
+
+void stopped_token_skips_the_file_read() {
+    test_context ctx;
+    temp_path tmp;
+    auto const payload = std::string{"file payload"};
+    {
+        net::stream_file out{ctx, tmp.path, net::file_base::write_only | net::file_base::truncate};
+        CHECK(not run_task(ctx, write_all(&out, &payload)).ec);
+    }
+    net::stream_file in{ctx, tmp.path, net::file_base::read_only};
+    std::string got;
+    auto const aborted = net::test::run_blocking(ctx, net::test::stopped_token(), read_chunk(&in, &got));
+    CHECK(aborted.ec == net::error::operation_aborted);
+    CHECK_EQ(aborted.value, 0U);
+    CHECK_EQ(in.position(), 0U);
+    auto const r = net::test::run_blocking(ctx, read_chunk(&in, &got));
+    CHECK(not r.ec);
+    CHECK_EQ(got, payload);
+}
+
 } // namespace
 
 int main() {
@@ -442,6 +471,7 @@ int main() {
     two_handles_read_concurrently();
     registered_buffer_file_io();
     open_flags_and_errors();
+    stopped_token_skips_the_file_read();
     std::cout << "file tests passed\n";
     return 0;
 }
