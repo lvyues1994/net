@@ -284,12 +284,16 @@ lambda）。涉及整个序列的 `read` / `write` / `write_eof(buffers)` 按 `m
 
 ## 组合子
 
-`when_all` / `when_any` 的每个子 awaitable 由一个 runner 协程（`task<void>`）
-`co_await`：runner 的 promise 把组合子的 `child_env`（父执行器、组合子自己的
-`stop_source` 的 token、父帧分配器）注入子 awaitable，并捕获异常。runner 的续体是嵌在
-组合子里的 `completion_frame`；子完成时记录结果、必要时请求兄弟停止，最后一个到达者
-经父执行器 `dispatch` 恢复父协程。计数初值 N + 1，启动方放下自己那一份时若归零则不
-挂起。
+`when_all` / `when_any` 直接驱动每个子 awaiter（`detail::child<A>`），不经 runner 协程：把组合子的 `child_env`
+（父执行器、组合子自己的 `stop_source` 的 token、父帧分配器）交给子 awaiter 的 `await_ready(env)` /
+`await_suspend`，续体是嵌在 child 里的 `completion_frame`。`await_suspend` 的三种返回（void / bool / 句柄）
+分别处理；返回要求转移过去的句柄（task 的帧）时由启动方恢复它、跑到第一个挂起点——这正是 runner 原来做的事。
+子完成时取走结果（`await_resume` 抛出的、`await_suspend` 抛出的都当作这个子任务的异常）、必要时请求兄弟停止，
+最后一个到达者经父执行器 `dispatch` 恢复父协程。计数初值 N + 1，启动方放下自己那一份时若归零则不挂起。
+依次发起：已同步完成的子任务报错（或 `when_any` 的赢家）先撤兄弟，后发起的看到停止已请求就不执行。
+
+原来每个子任务一个 runner 协程帧（`task<void>`）：`when_all` 两个已就绪的 task 6 次分配、135 ns，现在 4 次、101 ns
+（剩下两个是子 task 自己的帧，一个 stop 状态，一个 awaiter 盒——两个子任务的完成帧加共享状态超过 192 字节的槽位）。
 
 结果类型（P4124R0 §2.3）：`io_result<T>` 载荷 T、`io_result<>` 与 void 不占位、
 `io_result<T, U..>` 载荷 `tuple<T, U..>`；有 io 子任务时结果是 `io_result<载荷...>`，
@@ -299,7 +303,7 @@ lambda）。涉及整个序列的 `read` / `write` / `write_eof(buffers)` 按 `m
 
 ### timeout / delay
 
-`when_any(op, timer.wait())` 是最常见的 `when_any` 用法，也是最贵的写法（两个 runner 帧、awaiter 盒、stop 状态）。
+`when_any(op, timer.wait())` 是最常见的 `when_any` 用法，也是较贵的写法（stop 状态、awaiter 盒，外加调用方自己的定时器）。
 `net::timeout(op, dur)`（`timeout.hpp`，Corosio 同形）是专用 awaiter：`await_ready` 先试操作——不用等就完成时什么都
 不建；要等时给操作一个插入的 `stop_token`、武装一个定时器，两个参与者各挂一个 `completion_frame`，谁先到 CAS 成赢家，
 最后一个到达者恢复父协程。被限时的可以是 task：它的 `await_suspend` 返回子协程句柄，`timeout` 武装定时器之后把它当作
@@ -370,7 +374,7 @@ token，操作先到时直接 `request_timer_cancel`（后端的取消，与 sto
 | io_uring | 多发 accept 终止错误（EMFILE）立刻重武装 → 内核原地打转 100% CPU；没人等时错误被丢 | fd 用尽 | 终止错误不重武装，记下交给下一次 `accept()`，由它重新武装 |
 | io_uring | `broken`（退回一次性）锁外读：EINVAL 退回路径与取消竞争会丢掉取消 | 老内核 | `broken` 原子；`cancel_op` 在 acceptor 锁内看 `waiting`，否则交给后端取消 |
 | io_uring | `IORING_ENTER_EXT_ARG` 在 5.5–5.10 上 `-EINVAL` | 老内核的 `run_for` | `uring_available()` 要求 `IORING_FEAT_EXT_ARG` |
-| 组合子 | `when_all` / `when_any` 逐个"建 runner + 启动"，第 k 个建 runner 抛出时前 k-1 个已在飞 → 析构在飞的 task 是契约违规 | `bad_alloc` | 两阶段：先建全部 runner（唯一会抛的步骤），再一次性启动 |
+| 组合子 | `when_all` / `when_any` 逐个"建 runner + 启动"，第 k 个建 runner 抛出时前 k-1 个已在飞 → 析构在飞的 task 是契约违规 | `bad_alloc` | 两阶段：先建全部 runner（唯一会抛的步骤），再一次性启动。后来去掉了 runner：发起不再分配，子 awaiter 取出 / 挂起时抛出的异常算作该子任务的异常 |
 | run(ex) | 子帧用目标上下文的分配器，但子帧活到父协程从 co_await 返回；目标上下文可能先析构 | `recycling` 默认 + `pool.join()` 后父协程才恢复 | 换执行器不换分配器（显式 `run(mr)` 除外） |
 | run_async | 工作计数在状态（帧）释放之前归还 | — | 守卫先于状态声明 |
 | any_stream | `start()` 不检查上一个操作是否还在；`await_ready` 抛出时标志泄漏；`new S` 裸指针在 `adopt` 抛出时泄漏 | 误用 / OOM | 契约检查前移；守卫；`unique_ptr` |

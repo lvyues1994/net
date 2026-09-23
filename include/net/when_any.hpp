@@ -101,12 +101,12 @@ template <class Result, class R, std::size_t I> struct store_winner_at<Result, R
 
 // ---- 子任务完成：赢家判定与错误记录 ----
 
+// 一个子任务结束（结果已取走）：返回 true 表示它是最后一个。
 template <class R>
-bool when_any_child_done(combinator_state& state, task<void>& runner, result_storage<R>& storage,
+bool when_any_child_done(combinator_state& state, std::exception_ptr error, result_storage<R>& storage,
                          std::size_t const index) noexcept {
-    auto const error = task_access::exception(runner);
     if (error) {
-        state.record_exception(error);
+        state.record_exception(std::move(error));
         state.source.request_stop();
     } else {
         auto const ec = error_of<R>::apply(storage);
@@ -126,10 +126,11 @@ template <class... As> struct when_any_awaitable {
     using traits = when_any_result_of<awaitable_result_t<As>...>;
     using result_type = typename traits::type;
 
-    explicit when_any_awaitable(As... awaitables_) : awaitables(std::move(awaitables_)...) {}
+    explicit when_any_awaitable(As... awaitables_) : children(std::move(awaitables_)...) {}
 
+    // 只在启动前移动（进父帧的 awaiter 槽）。
     when_any_awaitable(when_any_awaitable&& other) noexcept
-        : awaitables(std::move(other.awaitables)), state(std::move(other.state)) {}
+        : children(std::move(other.children)), state(std::move(other.state)) {}
 
     when_any_awaitable(when_any_awaitable const&) = delete;
     when_any_awaitable& operator=(when_any_awaitable const&) = delete;
@@ -139,10 +140,7 @@ template <class... As> struct when_any_awaitable {
 
     coroutine_handle<> await_suspend(coroutine_handle<> const awaiting, io_env const* const env) {
         state.begin(awaiting, env, count);
-        // 两阶段启动：先为全部子任务建好 runner（唯一可能抛出的步骤：帧分配、移动 awaitable），
-        // 再一次性武装并启动。若在第 k 个子任务处抛出，此前建好的 runner 都还没启动，销毁它们是
-        // 合法的；否则已经在飞的兄弟会带着指向本对象的续体被析构。
-        prepare_all(std::make_index_sequence<count>{});
+        // 依次发起；已同步完成的赢家会先撤兄弟，后发起的看到停止已请求就不执行。
         launch_all(std::make_index_sequence<count>{});
         if (state.finish_start()) return awaiting;
         return noop_coroutine();
@@ -164,39 +162,26 @@ template <class... As> struct when_any_awaitable {
     }
 
   private:
-    template <std::size_t I>
-    using result_at = awaitable_result_t<typename std::tuple_element<I, std::tuple<As...>>::type>;
-
-    template <std::size_t... I> void prepare_all(std::index_sequence<I...>) {
-        int const ordered[] = {0, (prepare_one<I>(), 0)...};
-        static_cast<void>(ordered);
-    }
+    template <std::size_t I> using child_at = typename std::tuple_element<I, std::tuple<child<As>...>>::type;
+    template <std::size_t I> using result_at = typename child_at<I>::result_type;
 
     template <std::size_t... I> void launch_all(std::index_sequence<I...>) noexcept {
         int const ordered[] = {0, (launch_one<I>(), 0)...};
         static_cast<void>(ordered);
     }
 
-    template <std::size_t I> void prepare_one() {
-        auto& slot = children[I];
-        slot.owner = this;
-        slot.index = I;
-        slot.frame.set(&on_child_done<I>, &slot);
-        slot.runner = make_runner(std::move(std::get<I>(awaitables)), &std::get<I>(results),
-                                  std::is_void<result_at<I>>{});
-    }
-
     template <std::size_t I> void launch_one() noexcept {
-        auto& slot = children[I];
-        task_access::arm(slot.runner, slot.frame.handle(), &state.child_env);
-        slot.runner.handle().resume();
+        auto& c = std::get<I>(children);
+        c.frame.set(&on_child_done<I>, this);
+        std::exception_ptr error;
+        if (c.launch(&state.child_env, error))
+            static_cast<void>(when_any_child_done(state, std::move(error), c.storage, I));
     }
 
     template <std::size_t I> static coroutine_handle<> on_child_done(void* const user) {
-        auto* const slot = static_cast<child_slot*>(user);
-        auto* const self = static_cast<when_any_awaitable*>(slot->owner);
-        if (when_any_child_done(self->state, slot->runner, std::get<I>(self->results), I))
-            return self->state.resume_parent();
+        auto* const self = static_cast<when_any_awaitable*>(user);
+        auto& c = std::get<I>(self->children);
+        if (when_any_child_done(self->state, c.capture(), c.storage, I)) return self->state.resume_parent();
         return nullptr;
     }
 
@@ -204,7 +189,7 @@ template <class... As> struct when_any_awaitable {
     void store(result_type& out, std::size_t const winner, std::index_sequence<I...>, std::true_type) {
         int const ordered[] = {
             0, (I == winner ? (store_winner<result_type, result_at<I>, typename traits::payload>::apply(
-                                   out, std::get<I>(results)),
+                                   out, std::get<I>(children).storage),
                                0)
                             : 0)...};
         static_cast<void>(ordered);
@@ -213,14 +198,12 @@ template <class... As> struct when_any_awaitable {
     template <std::size_t... I>
     void store(result_type& out, std::size_t const winner, std::index_sequence<I...>, std::false_type) {
         int const ordered[] = {
-            0, (I == winner ? (store_winner_at<result_type, result_at<I>, I>::apply(out, std::get<I>(results)), 0)
+            0, (I == winner ? (store_winner_at<result_type, result_at<I>, I>::apply(out, std::get<I>(children).storage), 0)
                             : 0)...};
         static_cast<void>(ordered);
     }
 
-    std::tuple<As...> awaitables;
-    std::tuple<result_storage<awaitable_result_t<As>>...> results;
-    std::array<child_slot, count> children;
+    std::tuple<child<As>...> children;
     combinator_state state;
 };
 
@@ -228,34 +211,32 @@ template <class A> struct when_any_range_awaitable {
     using child_result = awaitable_result_t<A>;
     using result_type = when_any_result<payload_t<child_result>>;
 
-    explicit when_any_range_awaitable(std::vector<A> awaitables_)
-        : awaitables(std::move(awaitables_)), results(awaitables.size()), children(awaitables.size()) {}
+    explicit when_any_range_awaitable(std::vector<A> awaitables) {
+        children.reserve(awaitables.size());
+        for (auto& awaitable : awaitables)
+            children.emplace_back(std::move(awaitable));
+    }
 
+    // 只在启动前移动；vector 的移动不搬元素，续体帧的地址不变。
     when_any_range_awaitable(when_any_range_awaitable&& other) noexcept
-        : awaitables(std::move(other.awaitables)), results(std::move(other.results)),
-          children(std::move(other.children)), state(std::move(other.state)) {}
+        : children(std::move(other.children)), state(std::move(other.state)) {}
 
     when_any_range_awaitable(when_any_range_awaitable const&) = delete;
     when_any_range_awaitable& operator=(when_any_range_awaitable const&) = delete;
     when_any_range_awaitable& operator=(when_any_range_awaitable&&) = delete;
 
-    bool await_ready() const noexcept { return awaitables.empty(); }
+    bool await_ready() const noexcept { return children.empty(); }
 
     coroutine_handle<> await_suspend(coroutine_handle<> const awaiting, io_env const* const env) {
-        state.begin(awaiting, env, awaitables.size());
-        // 两阶段启动（见定长版本）：先建全部 runner，再启动。
-        for (auto index = std::size_t{}; index != awaitables.size(); ++index) {
-            auto& slot = *children[index].slot;
-            slot.owner = this;
-            slot.index = index;
-            slot.frame.set(&on_child_done, &slot);
-            slot.runner = make_runner(std::move(awaitables[index]), &results[index],
-                                      std::is_void<child_result>{});
-        }
-        for (auto index = std::size_t{}; index != awaitables.size(); ++index) {
-            auto& slot = *children[index].slot;
-            task_access::arm(slot.runner, slot.frame.handle(), &state.child_env);
-            slot.runner.handle().resume();
+        state.begin(awaiting, env, children.size());
+        for (auto index = std::size_t{}; index != children.size(); ++index) {
+            auto& entry = children[index];
+            entry.owner = this;
+            entry.index = index;
+            entry.c.frame.set(&on_child_done, &entry);
+            std::exception_ptr error;
+            if (entry.c.launch(&state.child_env, error))
+                static_cast<void>(when_any_child_done(state, std::move(error), entry.c.storage, index));
         }
         if (state.finish_start()) return awaiting;
         return noop_coroutine();
@@ -271,29 +252,29 @@ template <class A> struct when_any_range_awaitable {
             return result;
         }
         result.index = winner;
-        store_winner<result_type, child_result, payload_t<child_result>>::apply(result, results[winner]);
+        store_winner<result_type, child_result, payload_t<child_result>>::apply(result, children[winner].c.storage);
         return result;
     }
 
   private:
-    struct slot_box {
-        slot_box() : slot{new child_slot} {}
-        slot_box(slot_box&&) noexcept = default;
-        slot_box& operator=(slot_box&&) noexcept = default;
-        std::unique_ptr<child_slot> slot;
+    struct entry_type {
+        explicit entry_type(A awaitable) : c(std::move(awaitable)) {}
+        entry_type(entry_type&& other) noexcept(std::is_nothrow_move_constructible<A>::value) : c(std::move(other.c)) {}
+
+        child<A> c;
+        when_any_range_awaitable* owner = nullptr;
+        std::size_t index = 0U;
     };
 
     static coroutine_handle<> on_child_done(void* const user) {
-        auto* const slot = static_cast<child_slot*>(user);
-        auto* const self = static_cast<when_any_range_awaitable*>(slot->owner);
-        if (when_any_child_done(self->state, slot->runner, self->results[slot->index], slot->index))
+        auto& entry = *static_cast<entry_type*>(user);
+        auto* const self = entry.owner;
+        if (when_any_child_done(self->state, entry.c.capture(), entry.c.storage, entry.index))
             return self->state.resume_parent();
         return nullptr;
     }
 
-    std::vector<A> awaitables;
-    std::vector<result_storage<child_result>> results;
-    std::vector<slot_box> children;
+    std::vector<entry_type> children;
     combinator_state state;
 };
 

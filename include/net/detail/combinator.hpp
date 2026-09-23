@@ -22,10 +22,11 @@
 
 // when_all / when_any 的公共骨架。
 //
-// 每个子 awaitable 由一个小的 runner 协程（task<void>）co_await：runner 的 promise 把组合子
-// 的 child_env（父执行器、组合子自己的 stop_token、父帧分配器）注入子 awaitable，并捕获它
-// 抛出的异常。runner 的续体是嵌在组合子里的 completion_frame：子完成时对称转移到它，组合
-// 子记录结果、必要时向兄弟请求停止，最后一个到达者把父协程经父执行器 dispatch 恢复。
+// 子 awaitable 由组合子直接驱动（child<A>），不经 runner 协程：组合子把 child_env（父执行器、组合子
+// 自己的 stop_token、父帧分配器）交给子 awaiter 的 await_ready(env) / await_suspend，续体是嵌在
+// child 里的 completion_frame——子完成时对称转移到它，组合子取走结果（捕获 await_resume 抛出的异常）、
+// 必要时向兄弟请求停止，最后一个到达者把父协程经父执行器 dispatch 恢复。子 awaiter 的 await_suspend
+// 要求转移过去的句柄（task 的帧）由启动方恢复，跑到第一个挂起点为止。
 //
 // 计数初值 N + 1：启动方放下自己那一份时若已归零，说明全部子任务同步完成，await_suspend
 // 直接返回父句柄（不挂起）。
@@ -142,7 +143,7 @@ template <bool... Bs> struct any_true : std::false_type {};
 template <bool... Bs> struct any_true<true, Bs...> : std::true_type {};
 template <bool... Bs> struct any_true<false, Bs...> : any_true<Bs...> {};
 
-// ---- 被驱动的 awaiter ----
+// ---- 直接驱动的子任务 ----
 
 // 一个 awaitable 与它的 awaiter：本身就是 awaiter（套接字操作、task、ready()）时只存一份；否则先存
 // awaitable，开始时就地取出 awaiter。
@@ -175,30 +176,103 @@ template <class A> struct awaiter_holder<A, false> {
     late_init<inner_type> inner;
 };
 
-// ---- runner 协程 ----
+template <class R> struct capture_result {
+    template <class Awaiter> static void apply(Awaiter& awaiter, result_storage<R>& out) {
+        out.emplace(awaiter.await_resume());
+    }
+};
 
-template <class A, class R>
-auto run_child(A awaitable, result_storage<R>* out) CO2_BEG(task<void>, (awaitable, out)) {
-    CO2_AWAIT_SET(*out, std::move(awaitable));
-}
-CO2_END
+template <> struct capture_result<void> {
+    template <class Awaiter> static void apply(Awaiter& awaiter, result_storage<void>& out) {
+        awaiter.await_resume();
+        out.emplace();
+    }
+};
 
-template <class A>
-auto run_child_void(A awaitable, result_storage<void>* out) CO2_BEG(task<void>, (awaitable, out)) {
-    CO2_AWAIT(std::move(awaitable));
-    out->emplace();
+// 按 await_suspend 的返回类型挂起一个子 awaiter；返回 true 表示它其实已同步完成。它要求转移过去的句柄
+//（task 的帧）放进 *next，由调用方恢复。
+template <class Awaiter>
+bool suspend_child(Awaiter& awaiter, coroutine_handle<> const self, io_env const* const env, coroutine_handle<>* const next,
+                   coroutine_handle<>) {
+    auto const target = awaiter.await_suspend(self, env);
+    if (target == self) return true;
+    if (target && target != noop_coroutine()) *next = target;
+    return false;
 }
-CO2_END
 
-template <class A, class R>
-task<void> make_runner(A&& awaitable, result_storage<R>* const out, std::false_type) {
-    return run_child<typename std::decay<A>::type, R>(std::forward<A>(awaitable), out);
+template <class Awaiter>
+bool suspend_child(Awaiter& awaiter, coroutine_handle<> const self, io_env const* const env, coroutine_handle<>*, bool) {
+    return not awaiter.await_suspend(self, env);
 }
 
-template <class A>
-task<void> make_runner(A&& awaitable, result_storage<void>* const out, std::true_type) {
-    return run_child_void<typename std::decay<A>::type>(std::forward<A>(awaitable), out);
+template <class Awaiter>
+bool suspend_child(Awaiter& awaiter, coroutine_handle<> const self, io_env const* const env, coroutine_handle<>*, int) {
+    awaiter.await_suspend(self, env);
+    return false;
 }
+
+// void → int、bool → bool，其余（coroutine_handle<>、带 promise 类型的句柄）→ coroutine_handle<>。
+template <class T> struct suspend_tag {
+    using type = typename std::conditional<std::is_same<T, bool>::value, bool, coroutine_handle<>>::type;
+};
+template <> struct suspend_tag<void> {
+    using type = int;
+};
+
+template <class Awaiter>
+using suspend_tag_t = typename suspend_tag<decltype(std::declval<Awaiter&>().await_suspend(
+    std::declval<coroutine_handle<>>(), std::declval<io_env const*>()))>::type;
+
+// 一个子任务：它的 awaiter、结果格与续体帧。只在启动前移动（帧的句柄交出去之后不能动）。
+template <class A> struct child {
+    using result_type = awaitable_result_t<A>;
+
+    explicit child(A awaitable) : holder(std::move(awaitable)) {}
+    child(child&& other) noexcept(std::is_nothrow_move_constructible<A>::value) : holder(std::move(other.holder)) {}
+
+    child(child const&) = delete;
+    child& operator=(child const&) = delete;
+    child& operator=(child&&) = delete;
+
+    // 发起：返回 true 表示已同步完成（*error 是它抛出的异常，没有则空），调用方自己记账；false 表示完成时
+    // frame 的回调会被调用（回调里调 capture）。取出 awaiter、await_ready、await_suspend 抛出都算同步完成。
+    // 要求转移过去的句柄在 try 之外恢复：它跑起来之后抛出什么都不再是"发起失败"（与 runner 协程时一样 terminate）。
+    bool launch(io_env const* const env, std::exception_ptr& error) noexcept {
+        using awaiter_type = typename std::remove_reference<decltype(holder.get())>::type;
+        coroutine_handle<> next;
+        try {
+            holder.start();
+            auto& awaiter = holder.get();
+            if (await_ready_with(awaiter, env) ||
+                suspend_child(awaiter, frame.handle(), env, &next, suspend_tag_t<awaiter_type>{})) {
+                error = capture();
+                return true;
+            }
+        } catch (...) {
+            holder.finish();
+            error = std::current_exception();
+            return true;
+        }
+        if (next) next.resume(); // 跑到它的第一个挂起点；它直接完成时经 frame 的回调记账
+        return false;
+    }
+
+    // 取走结果；返回 await_resume 抛出的异常（没有则空）。之后不再碰 awaiter。
+    std::exception_ptr capture() noexcept {
+        std::exception_ptr error;
+        try {
+            capture_result<result_type>::apply(holder.get(), storage);
+        } catch (...) {
+            error = std::current_exception();
+        }
+        holder.finish();
+        return error;
+    }
+
+    awaiter_holder<A> holder;
+    result_storage<result_type> storage;
+    completion_frame frame;
+};
 
 // ---- 共享状态 ----
 
@@ -277,14 +351,5 @@ struct combinator_state {
     stop_source source;
     late_init<stop_callback<forward_stop>> forwarding; // 晚于 source 构造、先于它析构
 };
-
-// 每个子任务一格：续体帧 + runner。
-struct child_slot {
-    completion_frame frame;
-    task<void> runner;
-    void* owner = nullptr;
-    std::size_t index = 0U;
-};
-
 } // namespace detail
 } // namespace net

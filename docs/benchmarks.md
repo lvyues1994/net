@@ -7,7 +7,7 @@
 
 | 可执行文件 | 内容 |
 | --- | --- |
-| `bench_core` | 协议核心：对称转移、启动、执行器 hop、`when_all`、原生 / 抽象 / 类型擦除 `read_some`、帧分配器 |
+| `bench_core` | 协议核心：对称转移、启动、执行器 hop、`timeout()` 的机制成本（被限时的是一个 post 一跳就完成的操作，没有系统调用）、`when_all`、原生 / 抽象 / 类型擦除 `read_some`、帧分配器 |
 | `bench_net` | 四种后端（`--backend`）的 TCP 回环往返（组合算法与裸 `read_some` 两行）/ 32 连接 × 1、4 线程 / 吞吐 / connect+accept / 定时器 |
 | `bench_tls` | TLS 握手、加密往返、吞吐（提供者由构建决定，见 `docs/tls.md`） |
 | `bench_asio` | **同样的场景用 Boost.Asio 写两遍**：callbacks（Asio 最快的写法）与 C++20 `awaitable`（与 `net::task` 模型最接近）。需要 Boost ≥ 1.75，以 C++20 编译 |
@@ -38,7 +38,7 @@
 | 定时器到期 + 恢复 | 1 543 (0) | **1 394** (0) | 1 886 (0) | 1 930 (0) | 不可比（0 ms） |
 | TCP 回显往返 64 B | 3 124 (0) | 3 058 (0) | **2 994** (0) | 3 167 (0) | 3 277 (0) |
 | 同上，裸 `read_some` / `write_some` | 3 065 (0) | 3 028 (0) | — | — | — |
-| 同上，每次读套 1 s `timeout()` | +200（5） | — | — | — | — |
+| 同上，每次读套 1 s `timeout()` | +200（5）；第四轮 +155（1） | — | — | — | — |
 | 同上，每次读套 `when_any(read, timer.wait())` | +195（4） | — | — | — | — |
 | TCP 回显往返 4 KiB | 3 541 (0) | 3 472 (0) | **3 377** (0) | 3 531 (0) | 4 030 (0) |
 | TCP 吞吐 64 KiB 写 | 11 102 MiB/s | 11 340 MiB/s | — | **12 065 MiB/s** | 10 762 MiB/s |
@@ -87,6 +87,20 @@ Asio callbacks 417 / 2 576，Asio awaitable 564 / 2 602，libuv 508 / 2 771。
 | 就绪型后端派发执行：有空闲线程时，就绪的操作排进执行队列，由取到的线程在反应器锁外做系统调用 | epoll 4 线程 **65–67 → 51–52 µs**，追平 Asio | 插桩：一次 `epoll_wait` 返回约 31 个就绪，反应器线程持锁连做 31 个 `recv`，别的线程这期间拿不到续体、`start_op` 也等这把锁，4 个线程 35% 的时间空闲。Asio 的 epoll_reactor 也是把描述符当任务排队、由取到的线程做 I/O。单线程与单连接往返不变（仍在锁内就地执行）。细节见 `docs/backends.md` 第 3 节 |
 | stop_token 在推测前生效（`await_ready(io_env const*)`） | 64 B 往返 **+10–40 ns**（< 1%） | 每个操作多一次 `stop_requested()`。正确性修复，见 `docs/architecture.md` |
 | 单线程省锁（反应器锁与调度器锁全换空操作的实验，未合入） | 往返 −1–2.5%，裸 `read_some` −2–3% | 这是免锁档的上限；代价是不能跨线程请求停止、解析器不能投递完成，不做 |
+
+第四轮（2026-09-23，同一会话 A/B，三遍取最小，`taskset -c 6`）：限时与组合子的分配。
+
+| 行 | 改动前 | 改动后 | 说明 |
+| --- | --- | --- | --- |
+| `timeout(posted op)` 机制成本（`bench_core`，扣掉 24 ns 的操作本身） | 327 ns，5 allocs | **167 ns，1 alloc** | 逐次定位分配：`stop_source` 在构造和两次移动（进 `env_awaiter`、进 awaiter 槽）时各建一个 `StopState`；awaiter 376 字节、超出 192 字节的槽位要装箱；每次新建 `steady_timer`（`timer_impl`）。现在挂起期间与类型无关的状态按 io_context 复用、stop_source 挂起时建一次、awaiter 136 字节不装箱；定时器等待时不挂 token，操作先到时直接撤它，常见路径上不必 `request_stop`（见 `docs/architecture.md`） |
+| epoll 64 B 往返，每次读套 `timeout()` | 3 387（比裸 `read_some` +305） | **3 243（+153）** | io_uring 3 739 → 3 615：它的定时器是每次一个 `IORING_OP_TIMEOUT`、撤销再一个 `TIMEOUT_REMOVE`，比就绪型后端的用户态定时器堆贵约 400 ns，留作后续 |
+| `when_all`（2 个已就绪的 task） | 135 ns，6 allocs | **101 ns，4 allocs** | 子 awaiter 直接驱动，去掉每个子任务的 runner 协程帧。剩下的是两个子 task 的帧、stop 状态、awaiter 盒 |
+| epoll 64 B 往返，每次读套 `when_any(read, timer)` | 3 359，4 allocs | **3 297，2 allocs** | 同上 |
+| `run_async` + `run()` | 46 ns，2 allocs | 不变 | 第二次分配是启动状态；并进协程帧要让 promise 的 `operator new` 多分尾部空间、交错析构，只为一次 malloc（约 15 ns），而它是每条链一次、不是每次 I/O。不做 |
+
+修 `timeout()` 时发现一个缺陷：被限时的是 task 时，它的 `await_suspend` 返回子协程句柄，旧实现丢掉了它——task 永远不开始，
+父协程永远挂着（`timeout_tests::task_under_timeout`）。其余行在噪声内；`task: await child` 稳定慢 0.7 ns（14.3 → 15.0），
+那条路径的代码没变，归于 `libnet.a` 的布局，`85-frame task tree` 反向快 3.9%。
 
 ## 怎么读
 

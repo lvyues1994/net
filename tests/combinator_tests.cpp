@@ -301,9 +301,83 @@ void parent_stop_token_is_forwarded_to_children() {
     CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds{2});
 }
 
+// 子 awaiter 的各种形态：await_suspend 返回 bool（false = 同步完成）/ void（挂起）、经 operator_co_await
+// 取出 awaiter、await_suspend 抛出。组合子直接驱动它们，没有 runner 协程兜底。
+struct sync_by_bool {
+    int value;
+    bool await_ready() const noexcept { return false; }
+    bool await_suspend(net::coroutine_handle<>, net::io_env const*) const noexcept { return false; }
+    int await_resume() const noexcept { return value; }
+};
+
+struct posted_by_void {
+    int value;
+    net::continuation cont{};
+    bool await_ready() const noexcept { return false; }
+    void await_suspend(net::coroutine_handle<> const h, net::io_env const* const env) noexcept {
+        cont.h = h;
+        env->executor.post(cont);
+    }
+    int await_resume() const noexcept { return value; }
+};
+
+struct via_co_await {
+    int value;
+    sync_by_bool operator_co_await() && noexcept { return sync_by_bool{value}; }
+};
+
+struct throws_in_suspend {
+    bool await_ready() const noexcept { return false; }
+    bool await_suspend(net::coroutine_handle<>, net::io_env const*) const { throw expected_error{}; }
+    int await_resume() const noexcept { return 0; }
+};
+
+auto awaiter_shapes() CO2_BEG((net::task<std::tuple<int, int, int, int>>), (), std::tuple<int, int, int, int> t;) {
+    CO2_AWAIT_SET(t, net::when_all(sync_by_bool{1}, posted_by_void{2}, via_co_await{3}, value(4)));
+    CO2_RETURN(t);
+}
+CO2_END
+
+auto throws_while_suspending(int* sibling) CO2_BEG(net::task<>, (sibling), std::tuple<int, int> t;) {
+    CO2_AWAIT_SET(t, net::when_all(posted_by_void{7}, throws_in_suspend{}));
+    *sibling = std::get<0>(t); // 不该到这里
+}
+CO2_END
+
+auto any_shape() CO2_BEG((net::task<net::when_any_result<int>>), (), net::when_any_result<int> r;) {
+    CO2_AWAIT_SET(r, net::when_any(posted_by_void{5}, sync_by_bool{6}));
+    CO2_RETURN(r);
+}
+CO2_END
+
+void children_of_every_awaiter_shape() {
+    test_context ctx;
+    CHECK((run_task(ctx, awaiter_shapes()) == std::tuple<int, int, int, int>{1, 2, 3, 4}));
+    ctx.restart();
+
+    auto sibling = 0;
+    auto threw = false;
+    net::run_async(ctx.get_executor(), [] {}, [&](std::exception_ptr e) {
+        try {
+            std::rethrow_exception(e);
+        } catch (expected_error const&) {
+            threw = true;
+        }
+    })(throws_while_suspending(&sibling));
+    ctx.run();
+    CHECK(threw);
+    CHECK_EQ(sibling, 0);
+    ctx.restart();
+
+    auto const r = run_task(ctx, any_shape());
+    CHECK_EQ(r.index, 1U); // 同步完成的第二个先到
+    CHECK_EQ(r.value, 6);
+}
+
 } // namespace
 
 int main() {
+    children_of_every_awaiter_shape();
     when_all_concatenates_non_io_values();
     when_all_of_void_tasks_is_void();
     when_all_lifts_error_code_out_of_io_results();
