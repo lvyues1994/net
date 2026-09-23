@@ -2,6 +2,7 @@
 
 #include "co2/contract.hpp"
 
+#include "net/detail/timeout_state.hpp"
 #include "net/error.hpp"
 #include "net/io_context.hpp"
 
@@ -65,6 +66,15 @@ std::size_t steady_timer::cancel() noexcept { return impl_->cancel(); }
 timer_wait_awaitable steady_timer::wait() noexcept {
     CO2_CONTRACT_CHECK(not impl_->has_pending());
     return timer_wait_awaitable{impl_.get()};
+}
+
+// ---- timeout() 的内部入口（net/detail/timeout_state.hpp） ----
+
+void detail::request_timer_cancel(timer_wait_awaitable const& wait) noexcept { wait.impl->request_cancel(); }
+
+std::error_code detail::timer_completion_error(timer_wait_awaitable const& wait) noexcept {
+    if (wait.stopped) return make_error_code(error::operation_aborted);
+    return wait.impl->completion_error();
 }
 
 } // namespace net

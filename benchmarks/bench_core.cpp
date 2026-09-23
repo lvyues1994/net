@@ -17,6 +17,7 @@
 #include "net/stream.hpp"
 #include "net/task.hpp"
 #include "net/thread_pool.hpp"
+#include "net/timeout.hpp"
 #include "net/when_all.hpp"
 
 #include "bench.hpp"
@@ -59,6 +60,45 @@ CO2_END
 // 切到线程池执行 hops：hop 在池线程上完成（池内 post），最后经 io_context 执行器回来。
 auto on_pool(net::thread_pool::executor_type ex, std::size_t n) CO2_BEG(net::task<>, (ex, n)) {
     CO2_AWAIT(net::run(ex)(hops(n)));
+}
+CO2_END
+
+// 经执行器 post 一跳后以 io_result 完成的操作；像套接字操作一样状态放在 I/O 对象里、在环境的 stop_token 上登记
+// 取消回调。没有系统调用，timeout() 自己的成本看得清。
+struct posted_object {
+    struct on_stop {
+        void operator()() const noexcept {}
+    };
+    net::continuation cont;
+    net::detail::late_init<net::stop_callback<on_stop>> stop_cb;
+};
+
+struct posted_op {
+    posted_object* object;
+
+    bool await_ready() const noexcept { return false; }
+    net::coroutine_handle<> await_suspend(net::coroutine_handle<> h, net::io_env const* env) {
+        object->cont.h = h;
+        if (env->stop_token.stop_possible()) object->stop_cb.emplace(env->stop_token, posted_object::on_stop{});
+        env->executor.post(object->cont);
+        return net::noop_coroutine();
+    }
+    net::io_result<std::size_t> await_resume() noexcept {
+        object->stop_cb.reset();
+        return {std::error_code{}, 1U};
+    }
+};
+
+auto posted_ops(std::size_t n) CO2_BEG(net::task<>, (n), std::size_t i{}; posted_object object; net::io_result<std::size_t> r;) {
+    for (i = 0; i != n; ++i)
+        CO2_AWAIT_SET(r, posted_op{&object});
+}
+CO2_END
+
+auto posted_ops_under_timeout(std::size_t n)
+    CO2_BEG(net::task<>, (n), std::size_t i{}; posted_object object; net::io_result<std::size_t> r;) {
+    for (i = 0; i != n; ++i)
+        CO2_AWAIT_SET(r, net::timeout(posted_op{&object}, std::chrono::seconds{1}));
 }
 CO2_END
 
@@ -184,6 +224,12 @@ int main(int argc, char** argv) {
             ctx.run();
         }));
     }
+
+    results.push_back(bench::run(o, "posted op (io_result, stop callback)", o.scale(1000000U),
+                                 [&](std::size_t n) { run_void_on(ctx, posted_ops(n)); }, "one post hop per op"));
+    results.push_back(bench::run(o, "timeout(posted op), never fires", o.scale(300000U),
+                                 [&](std::size_t n) { run_void_on(ctx, posted_ops_under_timeout(n)); },
+                                 "timer armed and cancelled per op; the gap to the row above is timeout()"));
 
     results.push_back(bench::run(o, "when_all(2 ready tasks)", o.scale(300000U),
                                  [&](std::size_t n) { run_on(ctx, when_all_pairs(n)); },

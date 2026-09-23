@@ -72,7 +72,7 @@ coroutine_handle<> await_suspend(coroutine_handle<> h, io_env const* env);
 | `local::stream_protocol` / `datagram_protocol`，Unix 域套接字（Paper 11） | `local_stream_socket`, `local_stream_acceptor`, `local_datagram_socket`；端点支持 Linux 抽象命名空间 | `local.hpp` |
 | `ip::multicast::{join_group, leave_group, outbound_interface, hops, enable_loopback}`, `ip::unicast::hops` | 同名，v4 / v6 同一类型 | `multicast.hpp` |
 | `when_all`, `when_any` | 同名，I/O 感知（P4124R0 §2 的表） | `when_all.hpp`, `when_any.hpp` |
-| `timeout(op, dur)`, `delay(dur)`（Corosio 同形） | 同名；专用 awaiter，不建 runner 帧，操作先完成撤定时器、到期取消操作给 `error::timed_out` | `timeout.hpp` |
+| `timeout(op, dur)`, `delay(dur)`（Corosio 同形） | 同名；专用 awaiter，定时器按 io_context 复用、每次限时 1 次分配，操作先完成撤定时器、到期取消操作给 `error::timed_out`；被限时的可以是 task | `timeout.hpp` |
 | 可移植错误条件（Capy `cond`） | `net::cond::{eof, canceled, stream_truncated, timeout}`：任何来源的 `error_code`（本库、`errno`、`std::errc`）都可比较 | `error.hpp` |
 | 测试替身（Capy `test/*`） | `test::memory_stream`、`test::fuse`（失效注入）、`test::bufgrind`（切分枚举）、`test::run_blocking` | `test/*.hpp` |
 | `thread_pool`, `strand`, `any_executor` | 同名 | `thread_pool.hpp`, `strand.hpp`, `any_executor.hpp` |

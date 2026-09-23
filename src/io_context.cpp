@@ -7,6 +7,7 @@
 
 #include "co2/contract.hpp"
 
+#include "net/detail/timeout_state.hpp"
 #include "net/memory_resource.hpp"
 
 #include "detail/backend.hpp"
@@ -346,6 +347,23 @@ struct io_context::impl {
     bool const concurrent;          // backend.concurrent_run()
     unsigned threads_in_backend = 0U; // 并发模式：在 backend.run() 里的线程数
     bool stopped = false;
+
+    // timeout() / delay() 的状态空闲链（detail/timeout_state.hpp）。有界：突发之后多出来的直接删。
+    static constexpr std::size_t timeout_states_kept = 64U;
+    std::mutex timeout_mutex;
+    detail::timeout_state* timeout_free = nullptr;
+    std::size_t timeout_free_count = 0U;
+
+    void drain_timeout_states() noexcept {
+        auto* state = timeout_free;
+        timeout_free = nullptr;
+        timeout_free_count = 0U;
+        while (state != nullptr) {
+            auto* const next = state->next_free;
+            delete state;
+            state = next;
+        }
+    }
 };
 
 // ---- io_context ----
@@ -371,11 +389,15 @@ io_context::io_context(backend_kind const backend, int const concurrency_hint)
 }
 
 io_context* io_context_of(execution_context& context) noexcept {
+    // 常见情形是本线程正在 run() 它：不查服务表（加锁、逐个比较 type_index）。
+    for (auto* entry = thread_context_top(); entry != nullptr; entry = entry->next)
+        if (static_cast<execution_context const*>(entry->context) == &context) return const_cast<io_context*>(entry->context);
     if (not context.has_service<io_context_marker>()) return nullptr;
     return context.use_service<io_context_marker>().context;
 }
 
 io_context::~io_context() {
+    impl_->drain_timeout_states(); // 定时器要在后端关闭之前销毁
     shutdown();
     destroy();
 }
@@ -490,6 +512,46 @@ detail::io_backend& detail::io_context_access::backend(io_context& context) noex
 
 bool detail::io_context_access::has_idle_threads(io_context& context) noexcept {
     return context.impl_->idle_threads.load(std::memory_order_relaxed) != 0U;
+}
+
+detail::timeout_state* detail::io_context_access::pop_timeout_state(io_context& context) noexcept {
+    auto& impl = *context.impl_;
+    std::lock_guard<std::mutex> lock{impl.timeout_mutex};
+    auto* const state = impl.timeout_free;
+    if (state != nullptr) {
+        impl.timeout_free = state->next_free;
+        --impl.timeout_free_count;
+    }
+    return state;
+}
+
+bool detail::io_context_access::push_timeout_state(io_context& context, timeout_state* const state) noexcept {
+    auto& impl = *context.impl_;
+    std::lock_guard<std::mutex> lock{impl.timeout_mutex};
+    if (impl.timeout_free_count >= io_context::impl::timeout_states_kept) return false;
+    state->next_free = impl.timeout_free;
+    impl.timeout_free = state;
+    ++impl.timeout_free_count;
+    return true;
+}
+
+detail::timeout_state* detail::acquire_timeout_state(io_context& context, bool const with_stop_source) {
+    auto* state = io_context_access::pop_timeout_state(context);
+    if (state == nullptr) state = new timeout_state{context};
+    state->next_free = nullptr;
+    if (with_stop_source) state->source = stop_source{};
+    return state;
+}
+
+void detail::release_timeout_state(timeout_state* const state) noexcept {
+    state->forwarding.reset();
+    state->source = stop_source{nostopstate};
+    if (state->timer_armed) {
+        // 两个参与者都已结束，不再有并发的 request_timer_cancel：收尾 wait，顺带清掉它可能留下的过期标记。
+        static_cast<void>(state->wait.await_resume());
+        state->timer_armed = false;
+    }
+    if (not io_context_access::push_timeout_state(state->timer.context(), state)) delete state;
 }
 
 } // namespace net

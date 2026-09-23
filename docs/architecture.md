@@ -300,13 +300,25 @@ lambda）。涉及整个序列的 `read` / `write` / `write_eof(buffers)` 按 `m
 ### timeout / delay
 
 `when_any(op, timer.wait())` 是最常见的 `when_any` 用法，也是最贵的写法（两个 runner 帧、awaiter 盒、stop 状态）。
-`net::timeout(op, dur)`（`timeout.hpp`，Corosio 同形）是专用 awaiter：`await_ready` 先试操作——不用等就完成时连
-定时器都不建；要等时给操作一个插入的 `stop_token`、从 `io_context_of(env->executor.context())` 拿到的上下文建一个
-`steady_timer`，两个参与者各挂一个 `completion_frame`，谁先到 CAS 成赢家并向对方请求停止，最后一个到达者恢复父协程。
+`net::timeout(op, dur)`（`timeout.hpp`，Corosio 同形）是专用 awaiter：`await_ready` 先试操作——不用等就完成时什么都
+不建；要等时给操作一个插入的 `stop_token`、武装一个定时器，两个参与者各挂一个 `completion_frame`，谁先到 CAS 成赢家，
+最后一个到达者恢复父协程。被限时的可以是 task：它的 `await_suspend` 返回子协程句柄，`timeout` 武装定时器之后把它当作
+自己的 `await_suspend` 返回值转移过去（早先的实现丢掉了这个句柄，task 永远不开始、父协程永远挂着）。
 定时器赢而操作以 `operation_aborted` 结束 → `error::timed_out`；操作到期后仍以别的结果结束（数据恰好到了、真的出错了）
-→ 那个结果，不丢数据、不掩盖错误。异常穿过；父 `stop_token` 转发给两者，父方停止得到的是 `operation_aborted` 而不是
-超时。`delay(dur)` 是只有定时器的一半。`io_context_of` 靠 io_context 在服务表里登记的标记服务认回自己
-（`execution_context` 没有虚函数，不能 dynamic_cast）。
+→ 那个结果，不丢数据、不掩盖错误。异常穿过；父 `stop_token` 转发给操作，父方停止得到的是 `operation_aborted` 而不是
+超时。`delay(dur)` 是只有定时器的一半。
+
+挂起期间与操作类型无关的状态（`detail::timeout_state`：定时器、子环境、定时器的完成帧、计数、stop_source、父 token 的
+转发）按 io_context 复用（有界空闲链，`acquire_timeout_state` / `release_timeout_state`），awaiter 只剩操作、结果与一个
+完成帧，放得进 192 字节的 awaiter 槽。定时器连同后端的 `timer_impl` 留给下一次；stop_source 每次挂起新建——被限时的操作
+可能把 token 交给比它活得久的东西，复用会让那边看到下一个使用者的停止请求。撤定时器不走 stop_token：定时器等待时没有
+token，操作先到时直接 `request_timer_cancel`（后端的取消，与 stop_token 回调同一路径，任意线程可调；尚未武装的武装时
+同步中止）。代价是取消可能晚于定时器自己的完成，留下一个过期标记——所以定时器完成时只看结果（`timer_completion_error`）、
+不 `finish`，`finish`（顺带清掉标记）推迟到归还状态时：那时两个参与者都已结束，不再有并发。`timeout_tests` 的多线程
+用例在去掉这一步时稳定失败。每次限时从 5 次分配降到 1 次（stop 状态），机制成本 327 → 167 ns（`bench_core`，已扣掉被限时操作本身）。
+
+`io_context_of` 先看本线程正在 run() 的上下文（常见情形），否则靠 io_context 在服务表里登记的标记服务认回自己
+（`execution_context` 没有虚函数，不能 dynamic_cast；查表要加锁、逐个比较 `type_index`）。
 
 可移植错误条件 `net::cond`（`error.hpp`，Capy 的 `cond` 同形）：`eof` / `canceled` / `stream_truncated` / `timeout`。
 `net_category` 的 `default_error_condition` 映射到它们，`cond_category::equivalent` 认 net 自己的码、平台码

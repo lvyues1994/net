@@ -33,6 +33,8 @@ std::size_t uring_timer::cancel() noexcept {
     return 1U;
 }
 
+void uring_timer::request_cancel() noexcept { backend_->cancel(*this); }
+
 bool uring_timer::ready() noexcept {
     if (expiry_ <= std::chrono::steady_clock::now()) {
         ec_.clear();

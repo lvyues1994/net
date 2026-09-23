@@ -217,6 +217,12 @@ struct timer_impl {
     virtual std::size_t expires_at(time_point expiry) noexcept = 0;
     virtual std::size_t cancel() noexcept = 0;
     virtual bool has_pending() const noexcept = 0;
+    // 任意线程可调的取消，与 stop_token 回调同一路径：已排队的以 operation_aborted 完成；尚未排队的记标记、
+    // 排队时同步中止；wait 已经结束时标记留下，由之后的 finish() 清掉——所以与 request_cancel 可能并发时
+    // 不能 finish，先用 completion_error() 看结果。
+    virtual void request_cancel() noexcept = 0;
+    // wait 完成后（续体已被恢复）、finish() 之前读它的结果。
+    virtual std::error_code completion_error() const noexcept = 0;
 
     virtual bool ready() noexcept = 0;
     virtual coroutine_handle<> suspend(coroutine_handle<> h, io_env const* env) noexcept = 0;
@@ -263,11 +269,16 @@ struct io_backend {
     virtual char const* name() const noexcept = 0;
 };
 
+struct timeout_state;
+
 // io_context 的私有入口。
 struct io_context_access {
     static io_backend& backend(io_context& context) noexcept;
     // 有线程在 run() 里空等（没有可执行的续体、反应器被别的线程占着）。近似值，只用于调度决策。
     static bool has_idle_threads(io_context& context) noexcept;
+    // timeout() / delay() 状态的空闲链（acquire_timeout_state / release_timeout_state 用）。push 在链满时返回 false。
+    static timeout_state* pop_timeout_state(io_context& context) noexcept;
+    static bool push_timeout_state(io_context& context, timeout_state* state) noexcept;
 };
 
 // socket_base 的私有入口（receive_source 等建立在套接字之上的具体层对象用）。

@@ -5,6 +5,8 @@
 #include <exception>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "net/error.hpp"
 #include "net/immediate.hpp"
@@ -232,6 +234,68 @@ void stopped_before_start() {
     CHECK_EQ(again.value, 5U);
 }
 
+// 被限时的是一个 task：它的 await_suspend 返回子协程句柄，要转移过去它才开始跑。
+auto read_task(net::tcp_socket* sock)
+    CO2_BEG((net::task<net::io_result<std::size_t>>), (sock), char buf[16]; net::io_result<std::size_t> r;) {
+    CO2_AWAIT_SET(r, sock->read_some(net::buffer(buf)));
+    CO2_RETURN(r);
+}
+CO2_END
+
+auto timed_task(net::tcp_socket* sock, milliseconds limit)
+    CO2_BEG((net::task<net::io_result<std::size_t>>), (sock, limit), net::io_result<std::size_t> r;) {
+    CO2_AWAIT_SET(r, net::timeout(read_task(sock), limit));
+    CO2_RETURN(r);
+}
+CO2_END
+
+void task_under_timeout() {
+    connected_pair pair;
+    std::string payload = "task";
+    CHECK(not net::test::run_blocking(pair.ctx, write_once(&pair.server, &payload)).ec);
+    auto const r = net::test::run_blocking(pair.ctx, timed_task(&pair.client, seconds{5}));
+    CHECK(not r.ec);
+    CHECK_EQ(r.value, 4U);
+    // 时限先到：停止经子协程的环境传到它里面的读
+    auto const start = steady_clock::now();
+    auto const late = net::test::run_blocking(pair.ctx, timed_task(&pair.client, milliseconds{20}));
+    CHECK(late.ec == net::cond::timeout);
+    CHECK(steady_clock::now() - start < seconds{5});
+}
+
+// 多线程：被限时的操作（一个 delay）与时限几乎同时到期，两边常在不同线程上完成。操作先到时撤定时器可能晚于
+// 定时器自己收尾，留下的过期取消标记不能让复用这份状态的下一次 timeout 失效。
+struct race_record {
+    int unexpected = 0;
+    net::io_result<> last{};
+};
+
+auto racing_timeouts(int rounds, race_record* out) CO2_BEG(net::task<>, (rounds, out), int i{}; net::io_result<> r;) {
+    for (i = 0; i != rounds; ++i) {
+        CO2_AWAIT_SET(r, net::timeout(net::delay(microseconds{50}), microseconds{50}));
+        if (r.ec && not(r.ec == net::cond::timeout)) ++out->unexpected;
+    }
+    CO2_AWAIT_SET(out->last, net::timeout(net::delay(seconds{2}), milliseconds{20}));
+}
+CO2_END
+
+void racing_timeouts_leave_the_next_deadline_intact() {
+    test_context ctx{4};
+    std::vector<race_record> records(8U);
+    for (auto& record : records)
+        net::run_async(ctx.get_executor())(racing_timeouts(200, &record));
+    std::vector<std::thread> threads;
+    for (auto t = 0; t != 3; ++t)
+        threads.emplace_back([&ctx] { ctx.run(); });
+    ctx.run();
+    for (auto& thread : threads)
+        thread.join();
+    for (auto const& record : records) {
+        CHECK_EQ(record.unexpected, 0);
+        CHECK(record.last.ec == net::cond::timeout);
+    }
+}
+
 // cond 与各来源错误码的等价关系。
 void portable_conditions() {
     CHECK(make_error_code(net::error::eof) == net::cond::eof);
@@ -265,6 +329,8 @@ int main() {
     absolute_deadline();
     delay_waits_and_is_cancellable();
     stopped_before_start();
+    task_under_timeout();
+    racing_timeouts_leave_the_next_deadline_intact();
     std::cout << "timeout tests passed\n";
     return 0;
 }

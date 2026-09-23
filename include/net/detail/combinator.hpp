@@ -8,6 +8,9 @@
 #include <type_traits>
 #include <utility>
 
+#include "co2/contract.hpp"
+#include "co2/detail/awaitable.hpp"
+
 #include "net/continuation.hpp"
 #include "net/coroutine.hpp"
 #include "net/detail/completion_frame.hpp"
@@ -138,6 +141,39 @@ template <> struct tuple_or_void<std::tuple<>> {
 template <bool... Bs> struct any_true : std::false_type {};
 template <bool... Bs> struct any_true<true, Bs...> : std::true_type {};
 template <bool... Bs> struct any_true<false, Bs...> : any_true<Bs...> {};
+
+// ---- 被驱动的 awaiter ----
+
+// 一个 awaitable 与它的 awaiter：本身就是 awaiter（套接字操作、task、ready()）时只存一份；否则先存
+// awaitable，开始时就地取出 awaiter。
+template <class A, bool = std::is_same<co2::detail::AwaiterOf<A>, A>::value> struct awaiter_holder {
+    explicit awaiter_holder(A a) : awaiter(std::move(a)) {}
+    awaiter_holder(awaiter_holder&& other) noexcept(std::is_nothrow_move_constructible<A>::value)
+        : awaiter(std::move(other.awaiter)) {}
+
+    void start() noexcept {}
+    A& get() noexcept { return awaiter; }
+    void finish() noexcept {}
+
+    A awaiter;
+};
+
+template <class A> struct awaiter_holder<A, false> {
+    using inner_type = co2::detail::AwaiterOf<A>;
+
+    explicit awaiter_holder(A a) : awaitable(std::move(a)) {}
+    awaiter_holder(awaiter_holder&& other) noexcept(std::is_nothrow_move_constructible<A>::value)
+        : awaitable(std::move(other.awaitable)) {
+        CO2_CONTRACT_CHECK(not other.inner.hasValue());
+    }
+
+    void start() { inner.emplace(co2::detail::getAwaiter(std::move(awaitable))); }
+    inner_type& get() noexcept { return inner.get(); }
+    void finish() noexcept { inner.reset(); }
+
+    A awaitable;
+    late_init<inner_type> inner;
+};
 
 // ---- runner 协程 ----
 

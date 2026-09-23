@@ -23,7 +23,10 @@ std::size_t heap_timer::expires_at(time_point const expiry) noexcept {
     return cancelled;
 }
 
-std::size_t heap_timer::cancel() noexcept { return scheduler_->cancel_timer(*this, false) ? 1U : 0U; }
+std::size_t heap_timer::cancel() noexcept {
+    if (not pending_) return 0U; // 没有 wait：不必进后端锁（expires_at 每次都先 cancel）
+    return scheduler_->cancel_timer(*this, false) ? 1U : 0U;
+}
 
 bool heap_timer::ready() noexcept {
     if (timer_op::expiry <= std::chrono::steady_clock::now()) {

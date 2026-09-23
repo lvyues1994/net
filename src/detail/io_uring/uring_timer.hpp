@@ -33,6 +33,8 @@ struct uring_timer final : timer_impl, uring_op {
     std::size_t expires_at(time_point expiry) noexcept override;
     std::size_t cancel() noexcept override;
     bool has_pending() const noexcept override { return pending_; }
+    void request_cancel() noexcept override;
+    std::error_code completion_error() const noexcept override { return ec_; }
 
     bool ready() noexcept override;
     coroutine_handle<> suspend(coroutine_handle<> h, io_env const* env) noexcept override;
