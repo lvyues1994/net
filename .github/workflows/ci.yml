@@ -42,10 +42,10 @@ jobs:
             allocator: recycling
             packages: clang
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Check out co2
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ env.CO2_REPOSITORY }}
           ref: ${{ env.CO2_REF }}
@@ -80,10 +80,10 @@ jobs:
       matrix:
         build_type: [Debug, Release]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Check out co2
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ env.CO2_REPOSITORY }}
           ref: ${{ env.CO2_REF }}
@@ -148,10 +148,10 @@ jobs:
             # 新内核的 ASLR 布局与 TSan 的影子内存冲突：关掉本进程的 ASLR。
             prefix: setarch x86_64 -R
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Check out co2
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ env.CO2_REPOSITORY }}
           ref: ${{ env.CO2_REF }}
@@ -203,10 +203,10 @@ jobs:
     env:
       BORINGSSL_TAG: 0.20250701.0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Check out co2
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ env.CO2_REPOSITORY }}
           ref: ${{ env.CO2_REF }}
@@ -219,7 +219,7 @@ jobs:
 
       # BoringSSL 从源码构建（约 400 个目标，不需要 Go / Perl）；按标签缓存构建产物。
       - name: Cache BoringSSL
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             build/_deps/boringssl-src
@@ -248,10 +248,10 @@ jobs:
     env:
       WOLFSSL_TAG: v5.8.2-stable
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Check out co2
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ env.CO2_REPOSITORY }}
           ref: ${{ env.CO2_REF }}
@@ -264,7 +264,7 @@ jobs:
 
       # wolfSSL 从源码构建（要 OpenSSL 兼容层的那组开关，发行版的包不带）；按标签缓存。
       - name: Cache wolfSSL
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             build/_deps/wolfssl-src
@@ -291,10 +291,10 @@ jobs:
     name: Benchmarks (quick)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Check out co2
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ env.CO2_REPOSITORY }}
           ref: ${{ env.CO2_REF }}
@@ -365,7 +365,7 @@ jobs:
           python3 .github/scripts/compare_benchmarks.py previous/benchmark-results.txt benchmark-results.txt
           --threshold 0.15 --cross-machine-threshold 0.25 >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: benchmark-results
           path: benchmark-results.txt
@@ -374,10 +374,10 @@ jobs:
     name: Coverage (gcovr)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Check out co2
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ env.CO2_REPOSITORY }}
           ref: ${{ env.CO2_REF }}
@@ -423,7 +423,7 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: coverage
           path: |
