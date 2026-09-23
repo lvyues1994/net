@@ -12,8 +12,9 @@
     timer       定时器到期 + 恢复     ↔ Asio 的 timer expire（libuv 的 0 ms 定时器是下一圈循环，不可比）
     cpu         协程 / 执行器 / 擦除  ↔ Asio 的 co_await child / co_spawn / post hop
 
-归一化变化 = (current / previous) / 该组参照的中位比值 − 1。两类行只展示不报警：多线程行（4 vCPU 的共享机上
-调度噪声远超阈值）和 TLS 行（主要是 OpenSSL 的加解密，这个作业里没有能扣掉加密速度的参照）。
+归一化变化 = (current / previous) / 该组参照的中位比值 − 1。两类行只展示不报警：跨线程的行（32 连接 × 4 线程、
+thread_pool 的 hop——取决于 runner 的核数与调度，同一份库代码两次运行能差一倍以上）和 TLS 行（主要是 OpenSSL
+的加解密，这个作业里没有能扣掉加密速度的参照）。
 
 报警规则：同一提交不报警（差异全是 runner 噪声，表格就是噪声底）；两次运行 CPU 型号相同时归一化变化超过
 --threshold（默认 15%）报警，型号不同或未知时超过 --cross-machine-threshold（默认 25%）才报警。
@@ -64,7 +65,7 @@ def is_reference(name: str) -> bool:
 
 def group_of(name: str):
     """行所属的场景组；None 表示只展示、不参与报警。"""
-    if "threads" in name or "tls" in name:
+    if "threads" in name or "thread_pool" in name or "tls" in name:
         return None
     if "connect + accept" in name:
         return "connect"
