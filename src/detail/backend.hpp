@@ -266,6 +266,8 @@ struct io_backend {
 // io_context 的私有入口。
 struct io_context_access {
     static io_backend& backend(io_context& context) noexcept;
+    // 有线程在 run() 里空等（没有可执行的续体、反应器被别的线程占着）。近似值，只用于调度决策。
+    static bool has_idle_threads(io_context& context) noexcept;
 };
 
 // socket_base 的私有入口（receive_source 等建立在套接字之上的具体层对象用）。

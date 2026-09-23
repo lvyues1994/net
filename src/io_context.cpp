@@ -340,7 +340,7 @@ struct io_context::impl {
     continuation* head = nullptr;
     continuation* tail = nullptr;
     std::atomic<long> outstanding_work{0};
-    unsigned idle_threads = 0U;
+    std::atomic<unsigned> idle_threads{0U}; // 锁内修改；反应器锁外读（has_idle_threads：决定是否把 I/O 派发出去）
     bool reactor_busy = false;
     std::thread::id reactor_thread; // reactor_busy 为真时：正在 backend.run() 里的线程
     bool const concurrent;          // backend.concurrent_run()
@@ -486,6 +486,10 @@ bool io_context::executor_type::running_in_this_thread() const noexcept {
 
 detail::io_backend& detail::io_context_access::backend(io_context& context) noexcept {
     return context.impl_->backend;
+}
+
+bool detail::io_context_access::has_idle_threads(io_context& context) noexcept {
+    return context.impl_->idle_threads.load(std::memory_order_relaxed) != 0U;
 }
 
 } // namespace net

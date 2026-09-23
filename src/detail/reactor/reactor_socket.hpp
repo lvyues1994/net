@@ -31,8 +31,9 @@ struct reactor_socket_op final : reactor_op {
     reactor_socket_op(reactor_socket& owner_, op_direction const direction_) noexcept
         : owner{&owner_}, direction{direction_} {}
 
-    bool perform() noexcept override;
+    bool perform(int fd) noexcept override;
     void complete() noexcept override;
+    coroutine_handle<> complete_here() noexcept override;
 
     reactor_socket* owner;
     op_direction direction;

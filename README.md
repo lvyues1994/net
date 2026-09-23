@@ -267,9 +267,11 @@ io_uring 领先，是把它按 Corosio（参考实现）的做法对齐之后的
 （提交过 32 个 SQE 才进表，短连接不为进表 / 出表的两次 `io_uring_register` 付费）。顺带修过两处影响所有后端的浪费：
 `io_context` 在 `run()` 线程自己 post 续体时会向自己写 eventfd（每次完成多 1 写 2 读），
 以及就绪型后端的定时器把到期向上取整到毫秒、又被这次自打断掩盖——现在最早到期经
-timerfd（hrtimer，不受 50 µs timer slack 影响）送进解复用器。已知问题：4 个线程 `run()` 同一个就绪型
-`io_context` 对 32 条连接的 ping-pong 没有加速（单反应器 + 条件变量交接，每个续体只有 ~0.5 µs 工作），要吞吐得每线程
-一个 `io_context`。io_uring 尚未使用的：多发 recv 只在 `receive_source`、零拷贝发送。TLS 的数字见 `docs/tls.md`。
+timerfd（hrtimer，不受 50 µs timer slack 影响）送进解复用器。多个线程 `run()` 同一个上下文时，就绪型后端把
+就绪的操作排进执行队列，由取到的线程在反应器锁外做系统调用（Asio epoll_reactor 的做法）：32 条连接 ping-pong，
+4 线程比 1 线程快 1.8×，与 Asio `io_context{4}` 持平（51 vs 49 µs / 轮，`docs/benchmarks.md` 第三轮）。io_uring 只有
+1.4×——内核完成工作跑在进入 `io_uring_enter` 的那一个线程上，还没有 leader / follower；要线性扩展得每线程一个
+`io_context`。io_uring 尚未使用的：多发 recv 只在 `receive_source`、零拷贝发送。TLS 的数字见 `docs/tls.md`。
 
 ## 目录
 

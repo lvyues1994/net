@@ -3,7 +3,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <set>
 #include <string>
 #include <thread>
@@ -976,6 +978,103 @@ void stop_requested_before_start_aborts_even_when_ready() {
     CHECK(accepted.is_open());
 }
 
+#if !NET_PLATFORM_WINDOWS
+// ---- 就绪型后端的派发执行：已派发、尚未执行时被取消 / 被关闭；伪就绪后回到排队 ----
+
+struct pairs_on_one_context {
+    test_context ctx;
+    net::tcp_acceptor acceptor{ctx, net::ip::tcp::endpoint{net::ip::address_v4::loopback(), 0}};
+    std::vector<std::unique_ptr<net::tcp_socket>> clients;
+    std::vector<std::unique_ptr<net::tcp_socket>> servers;
+
+    explicit pairs_on_one_context(std::size_t const count) {
+        for (auto i = std::size_t{}; i != count; ++i) {
+            clients.emplace_back(new net::tcp_socket{ctx});
+            servers.emplace_back(new net::tcp_socket{});
+            net::run_async(ctx.get_executor())(accept_and_hold(&acceptor, servers.back().get()));
+            net::run_async(ctx.get_executor())(connect_only(clients.back().get(), loopback_endpoint(acceptor)));
+            ctx.run();
+            ctx.restart();
+        }
+    }
+};
+
+void send_now(net::tcp_socket& sock, char const* const text) {
+    auto const length = std::strlen(text);
+    CHECK_EQ(::send(sock.native_handle(), text, length, MSG_NOSIGNAL), static_cast<ssize_t>(length));
+}
+
+// NET_REACTOR_FORCE_DISPATCH 让就绪型后端单线程也派发：反应器一次收到几个就绪，全部投进队列，run_one 只执行
+// 第一个——剩下的就停在"已派发、尚未执行"，可以确定地在这个窗口里取消、关闭、偷走数据。io_uring 不经反应器：跳过。
+void dispatched_ops_cancel_close_and_requeue() {
+    ::setenv("NET_REACTOR_FORCE_DISPATCH", "1", 1);
+    struct unset_env {
+        ~unset_env() { ::unsetenv("NET_REACTOR_FORCE_DISPATCH"); }
+    } const guard{};
+    pairs_on_one_context pairs{3};
+    if (pairs.ctx.backend() == net::backend_kind::io_uring) return;
+
+    std::error_code ec[3];
+    bool done[3] = {false, false, false};
+    auto const start_read = [&](std::size_t const i) {
+        done[i] = false;
+        net::run_async(pairs.ctx.get_executor(), [&ec, &done, i](std::error_code const e) {
+            ec[i] = e;
+            done[i] = true;
+        }, [](std::exception_ptr) { CHECK(false); })(blocked_read(pairs.clients[i].get()));
+    };
+    for (auto i = std::size_t{}; i != 3U; ++i) start_read(i);
+    pairs.ctx.poll(); // 三个读都挂起在反应器里
+    for (auto i = std::size_t{}; i != 3U; ++i) CHECK(not done[i]);
+    for (auto i = std::size_t{}; i != 3U; ++i) send_now(*pairs.servers[i], "data");
+
+    CHECK_EQ(pairs.ctx.run_one(), 1U); // 三个就绪一次派发，执行了其中一个
+    std::vector<std::size_t> waiting;
+    auto finished = std::size_t{3};
+    for (auto i = std::size_t{}; i != 3U; ++i) {
+        if (done[i]) finished = i;
+        else waiting.push_back(i);
+    }
+    CHECK(finished != 3U);
+    CHECK(not ec[finished]);
+    CHECK_EQ(waiting.size(), 2U);
+    auto const cancelled = waiting[0];
+    auto const robbed = waiting[1];
+
+    pairs.clients[cancelled]->cancel(); // 已派发：只能记标记，由执行它的线程收尾
+    auto const other_reader = ::dup(pairs.clients[robbed]->native_handle());
+    CHECK(other_reader >= 0);
+    char stolen[16];
+    CHECK_EQ(::recv(other_reader, stolen, sizeof(stolen), MSG_DONTWAIT), 4); // 执行时 EAGAIN：伪就绪
+    pairs.ctx.poll();
+    CHECK(done[cancelled]);
+    CHECK(ec[cancelled] == net::error::operation_aborted);
+    CHECK(not done[robbed]); // 回到排队，等下一次就绪
+    send_now(*pairs.servers[robbed], "more");
+    pairs.ctx.run();
+    pairs.ctx.restart();
+    CHECK(done[robbed]);
+    CHECK(not ec[robbed]);
+    ::close(other_reader);
+
+    // 已派发、尚未执行时关闭：以 operation_aborted 收尾（用两条没有残留数据的连接）。
+    auto const first = finished;
+    auto const second = robbed;
+    start_read(first);
+    start_read(second);
+    pairs.ctx.poll();
+    send_now(*pairs.servers[first], "data");
+    send_now(*pairs.servers[second], "data");
+    CHECK_EQ(pairs.ctx.run_one(), 1U);
+    CHECK(done[first] != done[second]);
+    auto const victim = done[first] ? second : first;
+    CHECK(not pairs.clients[victim]->close());
+    pairs.ctx.poll();
+    CHECK(done[victim]);
+    CHECK(ec[victim] == net::error::operation_aborted);
+}
+#endif
+
 } // namespace
 
 int main() {
@@ -1005,6 +1104,9 @@ int main() {
     endpoints_and_options();
     inline_completion_budget_yields_to_other_coroutines();
     stop_requested_before_start_aborts_even_when_ready();
+#if !NET_PLATFORM_WINDOWS
+    dispatched_ops_cancel_close_and_requeue();
+#endif
     std::cout << "tcp tests passed\n";
     return 0;
 }

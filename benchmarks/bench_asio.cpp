@@ -6,6 +6,7 @@
 
 #include <cstdio>
 #include <memory>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -164,6 +165,36 @@ struct connected_pair {
     }
 };
 
+// 同一个 io_context 上的多条连接（多线程 run() 的场景；与 bench_net 的 connected_pairs 对应）。
+struct connected_pairs {
+    asio::io_context ioc{4};
+    tcp::acceptor acceptor{ioc, tcp::endpoint{asio::ip::address_v4::loopback(), 0}};
+    std::vector<std::unique_ptr<tcp::socket>> clients;
+    std::vector<std::unique_ptr<tcp::socket>> servers;
+
+    explicit connected_pairs(std::size_t const count) {
+        tcp::endpoint const ep{asio::ip::address_v4::loopback(), acceptor.local_endpoint().port()};
+        for (std::size_t i = 0; i != count; ++i) {
+            clients.emplace_back(new tcp::socket{ioc});
+            servers.emplace_back(new tcp::socket{ioc});
+            acceptor.async_accept(*servers.back(), [](boost::system::error_code) {});
+            clients.back()->async_connect(ep, [](boost::system::error_code) {});
+            ioc.run();
+            ioc.restart();
+            clients.back()->set_option(tcp::no_delay{true});
+            servers.back()->set_option(tcp::no_delay{true});
+        }
+    }
+
+    void run_on(unsigned const threads) {
+        std::vector<std::thread> workers;
+        for (unsigned t = 1; t < threads; ++t) workers.emplace_back([this] { ioc.run(); });
+        ioc.run();
+        for (auto& w : workers) w.join();
+        ioc.restart();
+    }
+};
+
 struct abort_on_exception {
     void operator()(std::exception_ptr const e) const {
         if (e) {
@@ -257,6 +288,27 @@ int main(int argc, char** argv) {
         r.system_ns_per_op /= static_cast<double>(total / chunk);
         r.iterations = total / chunk;
         results.push_back(std::move(r));
+    }
+
+    for (auto const threads : {1U, 4U}) {
+        constexpr std::size_t connections = 32U;
+        connected_pairs pairs{connections};
+        results.push_back(bench::run(o, "asio callbacks: tcp echo 64 B, 32 conns x " + std::to_string(threads) + " threads",
+                                     o.scale(4000U), [&](std::size_t n) {
+                                         for (std::size_t i = 0; i != connections; ++i) {
+                                             std::make_shared<echo_server_cb>(*pairs.servers[i], 64U, n)->start();
+                                             std::make_shared<echo_client_cb>(*pairs.clients[i], 64U, n)->start();
+                                         }
+                                         pairs.run_on(threads);
+                                     }, "wall time per round of 32 round trips; io_context{4}"));
+        results.push_back(bench::run(o, "asio awaitable: tcp echo 64 B, 32 conns x " + std::to_string(threads) + " threads",
+                                     o.scale(4000U), [&](std::size_t n) {
+                                         for (std::size_t i = 0; i != connections; ++i) {
+                                             asio::co_spawn(pairs.ioc, echo_n(*pairs.servers[i], 64U, n), detached_or_abort);
+                                             asio::co_spawn(pairs.ioc, ping_n(*pairs.clients[i], 64U, n), detached_or_abort);
+                                         }
+                                         pairs.run_on(threads);
+                                     }, "wall time per round of 32 round trips; io_context{4}"));
     }
 
     {

@@ -114,6 +114,33 @@ src/socket_base.cpp tcp.cpp udp.cpp timer.cpp signal_set.cpp resolver.cpp   具�
 
 解复用器要回答的只有：怎样登记、怎样等、怎样被唤醒。
 
+**谁来执行就绪的操作（派发执行）**。最初反应器线程在锁内对每个就绪的操作调用 `perform()`（`recv` 等系统调用），
+完成后再 post 续体。多个线程 `run()` 同一个上下文时这是串行瓶颈：32 条连接 ping-pong，一次 `epoll_wait` 返回约
+31 个就绪，反应器线程持着全局反应器锁连做 31 个 `recv`（4 线程时每批约 10 µs），这期间别的线程既拿不到续体、
+发起下一个操作（`start_op`）也要等这把锁——每轮 67 µs 里约 28 µs 只有反应器线程在跑。Asio 的 epoll_reactor
+把就绪的描述符作为任务排进调度队列，由取到它的线程做 I/O；这里照这个做法：
+
+- `run()` 取回事件后，io_context 有空闲线程（`io_context_access::has_idle_threads`）且不止一个事件时，就绪的操作
+  不在锁内 perform，而是标成 `dispatched`（仍登记在 `descriptor_state::ops` 里）、把 `dispatch_frame`（手写的
+  `completion_frame`）投进执行队列；
+- 取到它的线程（`run_dispatched`）锁内核对"没被取消、描述符仍注册、代数没变"并记 `in_syscall`，**锁外**做系统
+  调用，锁内收尾：完成就经操作自己的执行器 `dispatch` 恢复协程（同一上下文就对称转移，省一次队列往返）；EAGAIN
+  （伪就绪）且期间没有新的就绪位就回到 `queued`；
+- 取消（`cancel_op` / `cancel_ops`）碰到 `dispatched` 的操作只记 `cancel_requested`，由执行它的线程以
+  `operation_aborted` 收尾（系统调用已成功则照常完成）；
+- 注销（`close()` / `release()`）先把描述符的代数加一，再**等 `in_syscall` 归零**才让调用方关闭 / 交出 fd——
+  否则 fd 号被复用后，锁外的系统调用会读写到别的描述符；关闭后重开的描述符代数不同，旧任务不会误用它；
+- `descriptor_state::wanted()` 不计 `dispatched` 的操作：电平触发的 poll / select 不会在它被执行之前反复报告同一个
+  就绪。
+
+单线程（没有空闲线程可分担）时仍在反应器锁内就地执行，路径与原来相同。效果（8 个逻辑 CPU，32 连接 64 B
+ping-pong，每轮墙钟）：epoll 4 线程 65–67 → 49–52 µs，与 Asio `io_context{4}` 的 48–50 µs 持平，加速比从约 1.4× 到
+1.8–1.9×；poll / select 68–70 → 55–56 µs；单线程与单连接往返不变。环境变量 `NET_REACTOR_FORCE_DISPATCH` 让单线程也
+派发，`tcp_tests` 借它确定地测"已派发、尚未执行时被取消 / 被关闭"与"伪就绪后回到排队"。
+
+io_uring 没有这一改动：它的完成工作（内核在任务上下文里做的 recv）跑在提交 SQE、调用 `io_uring_enter` 的那个线程
+上，同样是单线程的；4 线程 32 连接约 70 µs。要并行需要每线程一个环或 Corosio 那样的 leader / follower，留作后续。
+
 | | epoll | poll | select |
 | --- | --- | --- | --- |
 | 触发 | 边沿（一次登记 IN\|OUT\|RDHUP\|ET） | 电平 | 电平 |
@@ -159,8 +186,8 @@ mmap 三块内存），只需要 `<linux/io_uring.h>`，不依赖 liburing。
 | `begin_*` | 记缓冲区描述符 | 同；`iovec[]` 与 `msghdr` 住在操作里，钉住到 CQE 到达 |
 | `ready()` | 推测系统调用，成功则不挂起 | **自适应推测**（`speculation_state`，照 Corosio）：先试一次非阻塞系统调用；EAGAIN 后关掉该方向的推测直到一次异步完成证明就绪；读方向连续 4 次 EAGAIN 永久关闭——服务端的读、acceptor 这类"总是先等"的套接字不再白跑 `read`，直接走完成型路径。connect 除外——`IORING_OP_CONNECT` 自己处理 EINPROGRESS |
 | `suspend()` | `start_op` 排队，等就绪 | 环锁内取 SQE、`prepare`、`user_data = &op`、发布尾指针；返回 noop。进内核推迟到 `run()` |
-| 完成 | 反应器线程 `perform()` 后 `complete()` | `run()` 收 CQE → `on_complete(res)` 记 ec / bytes（`-ECANCELED` → `operation_aborted`，读到 0 → `eof`）→ `complete()` |
-| 取消 | 锁内摘下，立即 `complete(operation_aborted)` | 提交 `IORING_OP_ASYNC_CANCEL`（定时器：`TIMEOUT_REMOVE`），**等原操作的 CQE**；在延迟队列里则摘下立即完成；尚未提交则记 `cancel_requested`，`submit` 返回 false，`suspend` 直接以 aborted 恢复；多发模式下停着的 accept waiter 不在环里，由套接字自己以 aborted 完成 |
+| 完成 | 反应器线程 `perform()` 后 `complete()`；有空闲线程时派发，取到的线程锁外 `perform()` | `run()` 收 CQE → `on_complete(res)` 记 ec / bytes（`-ECANCELED` → `operation_aborted`，读到 0 → `eof`）→ `complete()` |
+| 取消 | 锁内摘下，立即 `complete(operation_aborted)`；已派发的只记 `cancel_requested`，由执行它的线程收尾 | 提交 `IORING_OP_ASYNC_CANCEL`（定时器：`TIMEOUT_REMOVE`），**等原操作的 CQE**；在延迟队列里则摘下立即完成；尚未提交则记 `cancel_requested`，`submit` 返回 false，`suspend` 直接以 aborted 恢复；多发模式下停着的 accept waiter 不在环里，由套接字自己以 aborted 完成 |
 | accept | 就绪 → `accept4` | **多发 accept**（`IORING_ACCEPT_MULTISHOT`，5.19+）：`listen()` / assign 已监听的 fd 时武装一个 SQE，不计入用户工作；每个带 `F_MORE` 的 CQE 送来一个 fd——有停着的 `accept()` 就交给它，否则进 parked 队列；`accept()` 先看 parked 队列、再投机 `accept4`（自适应关闭）、最后作为 waiter 停着**不提交 SQE**。终止 CQE 后重新武装；`-EINVAL` 退回每次 accept 一个 SQE。不取对端地址（多发下所有完成共用一块暂存会互相覆盖），由 `remote_endpoint()` 事后取。关闭 / 释放监听描述符时 `ASYNC_CANCEL` 并把操作**退役**给后端持有到终止 CQE（内核仍引用 user_data），排队的连接被关闭 |
 | `close()` | 注销 + 取消 + `::close` | 先对在飞操作请求取消再 `::close`——在飞请求持有文件引用，关闭描述符不会结束它们 |
 | 中断 | eventfd 在解复用器集合里 | eventfd 上一个常驻**多发** `POLL_ADD`（`IORING_POLL_ADD_MULTI`）：CQE 带 `F_MORE` 表示仍在武装，只在终止或内核不支持（`-EINVAL` → 退回一次性）时重新武装；`interrupt()` 只是 `write(eventfd)`，不碰环、不加锁 |

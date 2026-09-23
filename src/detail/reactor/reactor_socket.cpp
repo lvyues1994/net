@@ -15,8 +15,7 @@ namespace detail {
 
 // ---- reactor_socket_op ----
 
-bool reactor_socket_op::perform() noexcept {
-    auto const fd = owner->native_handle();
+bool reactor_socket_op::perform(int const fd) noexcept {
     switch (op_kind) {
     case kind::read: {
         auto const outcome = posix::readv(fd, read_buffers);
@@ -71,6 +70,8 @@ bool reactor_socket_op::perform() noexcept {
 }
 
 void reactor_socket_op::complete() noexcept { env->executor.post(cont); }
+
+coroutine_handle<> reactor_socket_op::complete_here() noexcept { return env->executor.dispatch(cont); }
 
 void cancel_reactor_socket_op::operator()() const noexcept {
     impl->backend().cancel_op(impl->state(), direction, impl->op_for(direction));
@@ -218,7 +219,7 @@ bool reactor_socket::ready(op_direction const direction) noexcept {
     }
     if (op.op_kind == reactor_socket_op::kind::connect) return false; // 等待可写
     // 推测执行：数据已就绪就不必挂起。
-    return op.perform();
+    return op.perform(fd_);
 }
 
 coroutine_handle<> reactor_socket::suspend(op_direction const direction, coroutine_handle<> const h,

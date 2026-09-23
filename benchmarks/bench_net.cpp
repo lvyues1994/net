@@ -275,23 +275,25 @@ void bench_backend(bench::options const& o, net::backend_kind const kind, std::v
                                      "same deadline via the when_any combinator"));
     }
 
-    {
-        // 32 条连接同时 ping-pong，4 个线程 run() 同一个 io_context：调度器交接（队列、锁、唤醒）的成本在这里。
+    for (auto const threads : {1U, 4U}) {
+        // 32 条连接同时 ping-pong，1 / 4 个线程 run() 同一个 io_context：两行之比就是多线程的加速比，
+        // 调度器交接（队列、锁、唤醒）的成本在这里。
         constexpr std::size_t connections = 32U;
-        constexpr unsigned threads = 4U;
         connected_pairs pairs{kind, connections};
-        results.push_back(bench::run(o, name + ": tcp echo 64 B, 32 conns x 4 threads", o.scale(4000U),
+        results.push_back(bench::run(o, name + ": tcp echo 64 B, 32 conns x " + std::to_string(threads) + " threads",
+                                     o.scale(4000U),
                                      [&](std::size_t n) {
                                          for (auto i = std::size_t{}; i != connections; ++i) {
                                              net::run_async(pairs.ctx.get_executor())(echo_n(pairs.servers[i].get(), 64U, n));
                                              net::run_async(pairs.ctx.get_executor())(ping_n(pairs.clients[i].get(), 64U, n));
                                          }
                                          std::vector<std::thread> workers;
-                                         for (auto t = 0U; t != threads; ++t) workers.emplace_back([&] { pairs.ctx.run(); });
+                                         for (auto t = 1U; t < threads; ++t) workers.emplace_back([&] { pairs.ctx.run(); });
+                                         pairs.ctx.run();
                                          for (auto& w : workers) w.join();
                                          pairs.ctx.restart();
                                      },
-                                     "ns per round trip per connection (wall / n)"));
+                                     "wall time per round of 32 round trips"));
     }
 
     {

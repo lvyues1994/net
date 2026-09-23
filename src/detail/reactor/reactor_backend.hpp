@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <unordered_set>
@@ -43,7 +44,8 @@ struct reactor_backend final : execution_context::service, io_backend, event_sin
     io_context& context() noexcept { return *context_; }
 
     std::error_code register_descriptor(descriptor_state& state, int fd) noexcept;
-    // 从解复用器摘除并取消两个方向的操作（以 operation_aborted 完成）。
+    // 从解复用器摘除并取消两个方向的操作（以 operation_aborted 完成）。返回时没有线程还在这个描述符上做系统
+    // 调用，调用方可以关闭 / 交出 fd；已派发的操作由执行它的线程以 operation_aborted 收尾。
     void deregister_descriptor(descriptor_state& state) noexcept;
 
     // 启动操作。就绪位命中时先在调用线程上 perform()：完成则返回 true（调用方自己恢复
@@ -73,7 +75,7 @@ struct reactor_backend final : execution_context::service, io_backend, event_sin
     };
 
     struct signal_pump final : reactor_op {
-        bool perform() noexcept override;
+        bool perform(int fd) noexcept override;
         void complete() noexcept override {}
         int fd = -1;
         void (*deliver)(int) = nullptr;
@@ -82,14 +84,20 @@ struct reactor_backend final : execution_context::service, io_backend, event_sin
     // event_sink：wait 内（锁外）只记录。
     void on_ready(descriptor_state& state, unsigned ready_bits) noexcept override;
 
-    // 锁内。
-    void process_event(descriptor_state& state, unsigned ready, std::vector<completed_op>& completed) noexcept;
+    // 锁内。distribute 为真时就绪的操作不在这里 perform，而是标成 dispatched 放进 dispatched_。
+    void process_event(descriptor_state& state, unsigned ready, bool distribute, std::vector<completed_op>& completed) noexcept;
     void refresh_interest(descriptor_state& state) noexcept;
     void detach_ops(descriptor_state& state, reactor_op* (&cancelled)[2]) noexcept;
     long long wait_timeout_ns(long limit_ms) const noexcept;
     void arm_timer_fd_locked() noexcept;
 
     void finish_cancelled(reactor_op* const (&cancelled)[2]) noexcept;
+
+    // 派发执行：dispatch_frame 的回调。锁内核对、锁外系统调用、锁内收尾，完成则经操作的执行器恢复协程。
+    static coroutine_handle<> on_dispatched(void* op) noexcept;
+    coroutine_handle<> run_dispatched(reactor_op& op) noexcept;
+    // 锁内：已派发的操作被取消 / 描述符已注销或重开时摘下它，记 operation_aborted。
+    void abandon_dispatched_locked(reactor_op& op) noexcept;
 
     io_context* context_;
     std::unique_ptr<demultiplexer> demux_;
@@ -98,11 +106,16 @@ struct reactor_backend final : execution_context::service, io_backend, event_sin
     timer_heap timers_;
     std::vector<pending_event> events_;   // 只有运行 run 的线程触碰
     std::vector<completed_op> completed_; // 同上（复用，避免每轮分配）
+    std::vector<reactor_op*> dispatched_; // 同上：本轮派发出去的操作
+    std::condition_variable syscall_done_; // descriptor_state::in_syscall 归零（注销在等）
     std::vector<timer_op*> expired_;      // 同上
     descriptor_state signal_state_;
     signal_pump signal_pump_;
     bool shut_down_ = false;
     bool waiting_ = false; // 有线程阻塞在 demux_->wait 里（锁内读写）
+    // 测试钩子：环境变量 NET_REACTOR_FORCE_DISPATCH 存在时单线程也派发，让派发执行的取消 / 关闭 / 伪就绪
+    // 路径可以确定地测到（构造时读一次）。
+    bool force_dispatch_ = false;
 
     // 定时器堆最早到期用 timerfd 送进解复用器：timerfd 是 hrtimer、不受线程 timer slack
     //（默认 50 µs）影响，而 epoll_pwait2 / ppoll / pselect 的超时会被 slack 拉长。只在最早到期

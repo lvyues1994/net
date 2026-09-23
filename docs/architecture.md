@@ -139,6 +139,10 @@ tcache malloc 比任何带原子操作的回收器都快，所以 Linux 上默�
 `is_executor<E>` 以 SFINAE 检查 P4003R3 §4.3 的七条要求。`executor_ref` 是两指针的
 非拥有视图（`detail::executor_vtable_for<E>`），`any_executor` 是拥有型的。
 
+- 不做 Corosio 的 `locking_mode`（Asio 的 `CONCURRENCY_HINT_UNSAFE` / `UNSAFE_IO`）那样的免锁档：实测把反应器锁与调度器
+  锁全部换成空操作，单连接 64 B 往返只快 1–2.5%（裸 `read_some` 行 2–3%），而免锁档要求别的线程不能请求停止（取消
+  回调在请求方线程上拿反应器锁）、解析器工作线程不能投递完成、不能跨线程加定时器——为这点收益引入这组限制不划算。
+  `net::single_thread_hint` 仍只让 io_uring 用 `SINGLE_ISSUER | DEFER_TASKRUN`。
 - `io_context`：互斥锁保护的侵入式 `continuation` 队列 + 原子工作计数 + 反应器。`run()`
   循环：有队列元素就 `safe_resume`；无工作则返回；否则一个线程进反应器
   （`epoll_wait`），其它线程等条件变量。`post` 叫醒空闲线程或（唯一的线程在
@@ -173,8 +177,9 @@ listen / setsockopt / getsockname…）直接对 `impl_->native_handle()` 做系
 `reactor_backend`（对 epoll / poll / select 相同）：
 
 - `descriptor_state`（每个描述符）：fd、两个方向各一个 `reactor_op*`、就绪位、兴趣位；
-- `reactor_op`：`perform()`（就绪时在锁内执行非阻塞系统调用，返回是否完成）、
-  `complete()`（锁外恰好一次：`env->executor.post(cont)`）；
+- `reactor_op`：`perform(fd)`（就绪时执行非阻塞系统调用，返回是否完成；单线程在反应器锁内，有空闲线程时
+  派发给取到它的线程在锁外做，见 `docs/backends.md` 第 3 节）、`complete()`（锁外恰好一次：
+  `env->executor.post(cont)`；派发路径用 `complete_here()`，经执行器 `dispatch` 直接恢复）；
 - 定时器二叉堆、信号泵（`counts_as_work = false`）、工作计数、注销后迟到事件的识别。
 
 等待机制注入为 `demultiplexer`（`add / update / remove / wait / interrupt`）：epoll 边沿

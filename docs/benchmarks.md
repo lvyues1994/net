@@ -8,7 +8,7 @@
 | 可执行文件 | 内容 |
 | --- | --- |
 | `bench_core` | 协议核心：对称转移、启动、执行器 hop、`when_all`、原生 / 抽象 / 类型擦除 `read_some`、帧分配器 |
-| `bench_net` | 四种后端（`--backend`）的 TCP 回环往返（组合算法与裸 `read_some` 两行）/ 32 连接 × 4 线程 / 吞吐 / connect+accept / 定时器 |
+| `bench_net` | 四种后端（`--backend`）的 TCP 回环往返（组合算法与裸 `read_some` 两行）/ 32 连接 × 1、4 线程 / 吞吐 / connect+accept / 定时器 |
 | `bench_tls` | TLS 握手、加密往返、吞吐（提供者由构建决定，见 `docs/tls.md`） |
 | `bench_asio` | **同样的场景用 Boost.Asio 写两遍**：callbacks（Asio 最快的写法）与 C++20 `awaitable`（与 `net::task` 模型最接近）。需要 Boost ≥ 1.75，以 C++20 编译 |
 | `bench_libuv` | 同样的 TCP 场景用 libuv 的 C 回调写一遍（pkg-config 找到 libuv 时构建）。它的定时器是毫秒分辨率、`uv_idle` 不是跨线程 post，这两行不可比 |
@@ -43,7 +43,6 @@
 | TCP 回显往返 4 KiB | 3 541 (0) | 3 472 (0) | **3 377** (0) | 3 531 (0) | 4 030 (0) |
 | TCP 吞吐 64 KiB 写 | 11 102 MiB/s | 11 340 MiB/s | — | **12 065 MiB/s** | 10 762 MiB/s |
 | TCP connect + accept | 8 510 (3) | **7 120** (1) | — | 8 867 (0) | 8 415 (2) |
-| 64 B 回显，32 连接 × 4 线程（每轮 32 个往返） | 95.0 µs | 100.0 µs | — | — | — |
 
 同一场景 64 B 往返的 CPU 拆分（usr / sys，ns）：net epoll 597 / 2 527，net io_uring 510 / 2 548，
 Asio callbacks 417 / 2 576，Asio awaitable 564 / 2 602，libuv 508 / 2 771。
@@ -72,6 +71,23 @@ Asio callbacks 417 / 2 576，Asio awaitable 564 / 2 602，libuv 508 / 2 771。
 | timerfd 懒武装：已武装在不晚于堆顶的时刻就不重武装，堆空也不解除 | 每次读套时限的 `timerfd_settime` 从每趟往返 1 次到每个超时周期 1 次（quick 基准 5 101 → 1）；每读的时限成本 +400 → +200 ns | 过早醒来一次是空转，重武装是一次系统调用；`timer expire + resume` 行不变 |
 | 内联完成预算（64 / 恢复） | 往返、吞吐**中性**（3 121 vs 3 128） | 单连接 ping-pong 每次恢复只消耗一两份；预算只在总是就绪的连接 / 内存流 / 就绪型后端的文件上生效（`tcp_tests` 有公平性断言） |
 
+第三轮（2026-09-23）：多线程 `run()`。32 条连接各自 64 B ping-pong，每轮 32 个往返的墙钟，µs；`taskset -c 4-11`
+（8 个逻辑 CPU），三遍取最小。1 线程是调用线程自己 `run()`，4 线程再加 3 个工作线程。Asio 两行都是 `io_context{4}`。
+
+| | net epoll | net poll | net select | net io_uring | Asio callbacks | Asio awaitable |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 线程 | 91.9 | 94.7 | 95.2 | 94.9 | 89.6 | 95.1 |
+| 4 线程 | **51.1** | 52.2 | 55.4 | 67.0 | **49.0** | 50.5 |
+| 加速比 | 1.80× | 1.81× | 1.72× | 1.42× | 1.83× | 1.88× |
+
+改之前（同一会话 A/B）epoll 4 线程是 65–67 µs，poll / select 68–70 µs。
+
+| 改动 | 效果 | 说明 |
+| --- | --- | --- |
+| 就绪型后端派发执行：有空闲线程时，就绪的操作排进执行队列，由取到的线程在反应器锁外做系统调用 | epoll 4 线程 **65–67 → 51–52 µs**，追平 Asio | 插桩：一次 `epoll_wait` 返回约 31 个就绪，反应器线程持锁连做 31 个 `recv`，别的线程这期间拿不到续体、`start_op` 也等这把锁，4 个线程 35% 的时间空闲。Asio 的 epoll_reactor 也是把描述符当任务排队、由取到的线程做 I/O。单线程与单连接往返不变（仍在锁内就地执行）。细节见 `docs/backends.md` 第 3 节 |
+| stop_token 在推测前生效（`await_ready(io_env const*)`） | 64 B 往返 **+10–40 ns**（< 1%） | 每个操作多一次 `stop_requested()`。正确性修复，见 `docs/architecture.md` |
+| 单线程省锁（反应器锁与调度器锁全换空操作的实验，未合入） | 往返 −1–2.5%，裸 `read_some` −2–3% | 这是免锁档的上限；代价是不能跨线程请求停止、解析器不能投递完成，不做 |
+
 ## 怎么读
 
 - **协程机制本身**（前三行）：`net::task` 的对称转移与 Asio 的 `awaitable` 同一量级（14.7 vs
@@ -86,10 +102,10 @@ Asio callbacks 417 / 2 576，Asio awaitable 564 / 2 602，libuv 508 / 2 771。
 - **吞吐**：每 64 KiB 一次完成，瓶颈是内核回环的两次拷贝，四家都在 10.8–12.1 GiB/s。
 - **connect + accept**：内核握手为主（sys 6.5–8.3 µs）。io_uring 的多发 accept 把每连接的 `accept4` 投机省掉，
   是四家最快；epoll 一侧 `adopt()` 路径不再对自己 `accept4()` 出来的描述符做四次 `fcntl`。
-- **32 连接 × 4 线程**：每轮 32 个往返 95 µs ≈ 单线程串行跑 32 个往返的时间——4 个线程在一个反应器上
-  **没有加速**：只有一个线程在 `epoll_wait` 里，其余靠条件变量交接续体（futex 唤醒几微秒），而每个续体只有
-  ~0.5 µs 用户态工作。这是就绪型单反应器设计的固有形状（Asio 同构，未测）；要吞吐得每线程一个 `io_context`。
-  列为已知问题。
+- **32 连接 × 4 线程**（第三轮表）：就绪型后端与 Asio 都是 1.8–1.9×——一个反应器、多个线程分担完成与系统调用，
+  到不了 4× 是因为每个往返的用户态工作只有 ~0.5 µs，线程之间的唤醒交接（futex）与反应器锁占了相当一部分。
+  io_uring 只有 1.4×：内核在任务上下文里做的 recv 跑在调用 `io_uring_enter` 的那一个线程上。要线性扩展得每线程
+  一个 `io_context`。之前的版本记作"没有加速"，是因为那次整套基准绑在单个 CPU（`taskset -c 6`）上，多线程行无效。
 - **io_uring 对 epoll**：往返、定时器、connect+accept 都领先 2–16%；单连接 ping-pong 本是它最不占优的场景
   （每次操作仍要一次 `io_uring_enter`，epoll 的投机 `recv` 命中时连 `epoll_wait` 都省），领先靠的是提交推迟到
   `run()`、自适应投机、`SINGLE_ISSUER | DEFER_TASKRUN`（见 `docs/backends.md`）。尚未用的：多发 recv 只在
@@ -104,7 +120,10 @@ cd build-release/benchmarks
 taskset -c 6 ./bench_core; taskset -c 6 ./bench_net --backend epoll; taskset -c 6 ./bench_net --backend io_uring
 taskset -c 6 ./bench_asio; taskset -c 6 ./bench_libuv
 strace -f -c ./bench_net --quick --backend epoll --only "round trip, 64 B"   # 数系统调用
+taskset -c 4-11 ./bench_net --only "32 conns"; taskset -c 4-11 ./bench_asio --only "32 conns"   # 多线程行
 ```
+
+多线程行不能绑单个 CPU：`taskset -c 6` 下 4 个线程只能轮流跑，数字等于单线程。
 
 A/B 一个改动：把改动前后的二进制各留一份，同一会话里交替各跑 5 次，看中位数——机器在两个频率档之间跳，
 单次读数差 20% 是常态。
